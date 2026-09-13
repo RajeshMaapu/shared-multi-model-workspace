@@ -9,6 +9,7 @@ let package = Package(
         .library(name: "WorkshopStore", targets: ["WorkshopStore"]),
         .library(name: "WorkshopService", targets: ["WorkshopService"]),
         .library(name: "WorkshopIPC", targets: ["WorkshopIPC"]),
+        .library(name: "WorkshopDaemonKit", targets: ["WorkshopDaemonKit"]),
         .executable(name: "workshop-daemon", targets: ["workshop-daemon"]),
         .executable(name: "workshop-mcp", targets: ["workshop-mcp"]),
         .executable(name: "Workshop", targets: ["WorkshopApp"]),
@@ -25,10 +26,14 @@ let package = Package(
         .target(name: "WorkshopMCP", dependencies: ["WorkshopCore", "WorkshopService"]),
         .target(name: "WorkshopAdapters",
                 dependencies: ["WorkshopCore", "WorkshopService"]),
+        .target(
+            name: "WorkshopDaemonKit",
+            dependencies: ["WorkshopCore", "WorkshopStore", "WorkshopService",
+                           "WorkshopIPC", "WorkshopAdapters"]
+        ),
         .executableTarget(
             name: "workshop-daemon",
-            dependencies: ["WorkshopCore", "WorkshopStore", "WorkshopService", "WorkshopIPC",
-                           "WorkshopAdapters"]
+            dependencies: ["WorkshopDaemonKit"]
         ),
         .executableTarget(
             name: "workshop-mcp",
@@ -45,6 +50,8 @@ let package = Package(
         .testTarget(name: "MCPTests", dependencies: ["WorkshopMCP", "WorkshopIPC", "WorkshopService", "WorkshopStore", "WorkshopCore"]),
         .testTarget(name: "AdapterContractTests",
                     dependencies: ["WorkshopAdapters", "WorkshopService", "WorkshopCore"]),
-        .testTarget(name: "LiveSmokeTests", dependencies: ["WorkshopCore"]),
+        .testTarget(name: "LiveSmokeTests",
+                    dependencies: ["WorkshopDaemonKit", "WorkshopService",
+                                   "WorkshopStore", "WorkshopCore"]),
     ]
 )

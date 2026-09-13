@@ -37,6 +37,7 @@ struct TaskPaneView: View {
                         Text("\(detail.task.phase.displayName) · \(detail.participants.count) participants · \(detail.task.state.displayName)")
                             .font(.system(size: 12))
                             .foregroundStyle(WorkshopColors.secondaryText)
+                        statusChips(detail)
                     }
                     Spacer()
                 }
@@ -53,7 +54,7 @@ struct TaskPaneView: View {
                     case .conversation: ConversationView()
                     case .board: BoardView(subtasks: detail.subtasks)
                     case .proposals: EmptyTabView(text: "Arrives in Phase 3")
-                    case .files: EmptyTabView(text: "Arrives in Phase 2")
+                    case .files: FilesView()
                     case .decisions: EmptyTabView(text: "Arrives in Phase 3")
                     case .usage: UsageView()
                     }
@@ -71,6 +72,41 @@ struct TaskPaneView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(WorkshopColors.conversationSurface)
+    }
+
+    /// Status chips derived from running turns + pending wakeups (§3.x).
+    @ViewBuilder
+    private func statusChips(_ detail: TaskDetail) -> some View {
+        let running = Set(detail.runningEngineers)
+        let queued = detail.pendingWakeups.filter { !running.contains($0.engineer) }
+        if !running.isEmpty || !queued.isEmpty {
+            HStack(spacing: 6) {
+                ForEach(detail.runningEngineers, id: \.self) { e in
+                    Chip(text: "\(e.displayName) · running",
+                         color: WorkshopColors.engineer(e))
+                }
+                ForEach(queued, id: \.engineer) { w in
+                    Chip(text: w.state == "running"
+                         ? "\(w.engineer.displayName) · waiting for tool"
+                         : "\(w.engineer.displayName) · waiting for peer",
+                         color: WorkshopColors.engineer(w.engineer).opacity(0.7))
+                }
+            }
+            .padding(.top, 4)
+        }
+    }
+}
+
+struct Chip: View {
+    let text: String
+    let color: Color
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10, weight: .medium))
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(color.opacity(0.18))
+            .foregroundStyle(WorkshopColors.primaryText)
+            .clipShape(Capsule())
     }
 }
 
@@ -145,13 +181,91 @@ struct MessageRow: View {
                                 .foregroundStyle(WorkshopColors.secondaryText)
                         }
                     }
-                    Text(message.body)
+                    Text(highlightedMentions(message.body))
                         .font(.system(size: 14))
                         .foregroundStyle(WorkshopColors.primaryText)
                         .textSelection(.enabled)
+                    if let structured = message.structured,
+                       let card = try? JSONDecoder().decode(JSONValue.self,
+                                                            from: Data(structured.utf8)) {
+                        StructuredCard(kind: message.kind, payload: card)
+                    }
                 }
                 Spacer()
             }
+        }
+    }
+
+    /// Highlight @engineer mentions in the engineer's accent color.
+    private func highlightedMentions(_ text: String) -> AttributedString {
+        var attributed = AttributedString(text)
+        for engineer in EngineerID.allCases {
+            let needle = "@\(engineer.rawValue)"
+            var searchStart = attributed.startIndex
+            while searchStart < attributed.endIndex,
+                  let range = attributed[searchStart...].range(of: needle) {
+                attributed[range].foregroundColor = WorkshopColors.engineer(engineer)
+                attributed[range].font = .system(size: 14, weight: .semibold)
+                searchStart = range.upperBound
+            }
+        }
+        return attributed
+    }
+}
+
+/// Compact card for structured message payloads (review requests, results).
+struct StructuredCard: View {
+    let kind: MessageKind
+    let payload: JSONValue
+
+    private static let fieldOrder = ["summary", "reviewer", "message",
+                                     "artifact_ids", "validation", "description"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(kind.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(WorkshopColors.secondaryText)
+            ForEach(Self.fieldOrder, id: \.self) { key in
+                if let value = payload[key] {
+                    fieldRow(key, value)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: 420, alignment: .leading)
+        .background(WorkshopColors.secondarySurface)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(WorkshopColors.divider))
+    }
+
+    @ViewBuilder
+    private func fieldRow(_ key: String, _ value: JSONValue) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(key)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(WorkshopColors.secondaryText)
+                .frame(width: 84, alignment: .leading)
+            Text(render(value))
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(WorkshopColors.primaryText)
+                .textSelection(.enabled)
+            Spacer()
+        }
+    }
+
+    private func render(_ v: JSONValue) -> String {
+        switch v {
+        case .string(let s): return s
+        case .number(let n): return n.truncatingRemainder(dividingBy: 1) == 0
+            ? String(Int(n)) : String(n)
+        case .bool(let b): return String(b)
+        case .null: return "null"
+        default:
+            if let data = try? JSONEncoder().encode(v) {
+                return String(decoding: data, as: UTF8.self)
+            }
+            return ""
         }
     }
 }
@@ -197,6 +311,11 @@ struct BoardView: View {
                                 } ?? "Unowned")
                                     .font(.system(size: 11))
                                     .foregroundStyle(WorkshopColors.secondaryText)
+                                if let lease = subtask.leaseExpiresAt {
+                                    Text("Lease expires \(lease, style: .time) (\(lease.relativeDescription))")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(WorkshopColors.secondaryText)
+                                }
                             }
                             .padding(10)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -216,44 +335,170 @@ struct BoardView: View {
     }
 }
 
+/// Artifacts tab: hash-named files with provenance + a bounded preview.
+struct FilesView: View {
+    @EnvironmentObject var state: AppState
+    @State private var selected: Artifact?
+
+    var body: some View {
+        if state.artifacts.isEmpty {
+            EmptyTabView(text: "No artifacts published yet.")
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(state.artifacts) { artifact in
+                        Button { selected = artifact } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(name(of: artifact))
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(WorkshopColors.primaryText)
+                                Text("sha256 \(artifact.contentHash.prefix(12))… · "
+                                     + "\(artifact.producer) · \(artifact.validation) · "
+                                     + artifact.createdAt.relativeDescription)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(WorkshopColors.secondaryText)
+                            }
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(WorkshopColors.secondarySurface)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(16)
+            }
+            .sheet(item: $selected) { artifact in
+                ArtifactPreview(artifact: artifact,
+                                path: state.workshopHome + "/" + artifact.relativePath)
+            }
+        }
+    }
+
+    private func name(of a: Artifact) -> String {
+        (a.relativePath as NSString).lastPathComponent
+    }
+}
+
+/// Preview of one artifact: text or PNG, bounded to 1 MiB.
+struct ArtifactPreview: View {
+    let artifact: Artifact
+    let path: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text((artifact.relativePath as NSString).lastPathComponent)
+                    .font(.system(size: 14, weight: .semibold))
+                Spacer()
+                Button("Close") { dismiss() }
+            }
+            preview
+        }
+        .padding(16)
+        .frame(minWidth: 480, minHeight: 360)
+    }
+
+    @ViewBuilder
+    private var preview: some View {
+        if let data = loadData() {
+            if path.lowercased().hasSuffix(".png"),
+               let image = NSImage(data: data) {
+                Image(nsImage: image).resizable().scaledToFit()
+            } else if let text = String(data: data, encoding: .utf8) {
+                ScrollView {
+                    Text(text)
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+            } else {
+                Text("Binary content — \(data.count) bytes")
+                    .foregroundStyle(WorkshopColors.secondaryText)
+            }
+        } else {
+            Text("Cannot read file (missing or over 1 MiB).")
+                .foregroundStyle(WorkshopColors.secondaryText)
+        }
+    }
+
+    private func loadData() -> Data? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = attrs[.size] as? Int, size <= 1024 * 1024 else { return nil }
+        return FileManager.default.contents(atPath: path)
+    }
+}
+
+/// Per-engineer usage table plus totals (nil counters shown as "unknown").
 struct UsageView: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
-        VStack(spacing: 12) {
-            if let usage = state.detail?.usage {
-                HStack(spacing: 24) {
-                    UsageStat(label: "Input tokens",
-                              value: usage.input.map(String.init) ?? "unknown")
-                    UsageStat(label: "Output tokens",
-                              value: usage.output.map(String.init) ?? "unknown")
-                    UsageStat(label: "Cache read",
-                              value: usage.cacheRead.map(String.init) ?? "unknown")
-                    UsageStat(label: "Cache write",
-                              value: usage.cacheWrite.map(String.init) ?? "unknown")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                if state.usageRows.isEmpty {
+                    Text("No usage recorded yet.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(WorkshopColors.secondaryText)
+                } else {
+                    ForEach(EngineerID.allCases, id: \.self) { engineer in
+                        let rows = state.usageRows.filter { $0.engineerID == engineer }
+                        if !rows.isEmpty {
+                            Text(engineer.displayName)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(WorkshopColors.secondaryText)
+                            ForEach(rows.indices, id: \.self) { i in
+                                usageRow(rows[i])
+                            }
+                        }
+                    }
+                    totals
                 }
-                Text("Source: \(usage.source) · measured at turn end")
-                    .font(.system(size: 11))
-                    .foregroundStyle(WorkshopColors.secondaryText)
-            } else {
-                Text("No usage recorded yet.")
-                    .font(.system(size: 13))
-                    .foregroundStyle(WorkshopColors.secondaryText)
             }
+            .padding(20)
         }
-        .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
-}
 
-struct UsageStat: View {
-    let label: String
-    let value: String
-    var body: some View {
-        VStack(spacing: 4) {
-            Text(value).font(.system(size: 15, weight: .semibold, design: .monospaced))
-            Text(label).font(.system(size: 11)).foregroundStyle(WorkshopColors.secondaryText)
+    private func usageRow(_ row: UsageSampleRecord) -> some View {
+        HStack(spacing: 16) {
+            Text(row.observedAt, style: .time)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(WorkshopColors.secondaryText)
+                .frame(width: 70, alignment: .leading)
+            Group {
+                Text(cell(row.sample.input))
+                Text(cell(row.sample.output))
+                Text(cell(row.sample.cacheRead))
+                Text(cell(row.sample.cacheWrite))
+            }
+            .font(.system(size: 11, design: .monospaced))
+            Text(row.sample.source)
+                .font(.system(size: 10))
+                .foregroundStyle(WorkshopColors.secondaryText)
+            Spacer()
         }
+    }
+
+    private func cell(_ v: Int?) -> String { v.map(String.init) ?? "unknown" }
+
+    private var totals: some View {
+        let rows = state.usageRows
+        func sum(_ key: (UsageSample) -> Int?) -> String {
+            let values = rows.compactMap { key($0.sample) }
+            return values.isEmpty ? "unknown" : String(values.reduce(0, +))
+        }
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("Totals")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(WorkshopColors.secondaryText)
+            Text("in \(sum(\.input)) · out \(sum(\.output)) · "
+                 + "cache r \(sum(\.cacheRead)) · cache w \(sum(\.cacheWrite))")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(WorkshopColors.primaryText)
+        }
+        .padding(.top, 8)
     }
 }
 

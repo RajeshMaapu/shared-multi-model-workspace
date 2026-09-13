@@ -12,6 +12,14 @@ public final class AppState: ObservableObject {
     @Published public var detail: TaskDetail?
     @Published public var messages: [Message] = []
     @Published public var engineers: [AdapterProbe] = []
+    @Published public var artifacts: [Artifact] = []
+    @Published public var usageRows: [UsageSampleRecord] = []
+
+    /// WORKSHOP_HOME for resolving artifact paths (previews read local files).
+    public var workshopHome: String {
+        ProcessInfo.processInfo.environment["WORKSHOP_HOME"]
+            ?? NSHomeDirectory() + "/Library/Application Support/Workshop"
+    }
     @Published public var serviceUnavailable = false
     /// Incremented by menu commands; views focus the matching field.
     @Published public var composerFocusRequest = 0
@@ -93,6 +101,13 @@ public final class AppState: ObservableObject {
         messages = (try? await client.call(WorkshopProtocol.readMessages,
                                            params: .object(["task_id": .string(id.rawValue)]),
                                            as: [Message].self)) ?? messages
+        let taskParams: JSONValue = .object(["task_id": .string(id.rawValue)])
+        artifacts = (try? await client.call(WorkshopProtocol.listArtifacts,
+                                            params: taskParams,
+                                            as: [Artifact].self)) ?? []
+        usageRows = (try? await client.call(WorkshopProtocol.listUsage,
+                                            params: taskParams,
+                                            as: [UsageSampleRecord].self)) ?? []
     }
 
     private func startNotifications() {

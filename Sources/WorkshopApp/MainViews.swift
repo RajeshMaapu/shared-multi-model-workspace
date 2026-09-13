@@ -138,8 +138,22 @@ struct SidebarItem: View {
 }
 
 struct EngineerRow: View {
+    @EnvironmentObject var state: AppState
     let probe: AdapterProbe
+    @State private var showCard = false
+
     var body: some View {
+        Button { showCard.toggle() } label: { rowBody }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showCard, arrowEdge: .trailing) {
+                EngineerCard(probe: probe,
+                             assignments: state.detail?.subtasks
+                                 .filter { $0.ownerID == probe.engineer } ?? [])
+            }
+            .accessibilityLabel("\(probe.engineer.displayName), \(probe.health.label)")
+    }
+
+    private var rowBody: some View {
         HStack(spacing: 8) {
             Circle()
                 .fill(WorkshopColors.health(probe.health.kind))
@@ -157,6 +171,5 @@ struct EngineerRow: View {
             Spacer()
         }
         .padding(.horizontal, 16).padding(.vertical, 4)
-        .accessibilityLabel("\(probe.engineer.displayName), \(probe.health.label)")
     }
 }

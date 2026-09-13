@@ -392,6 +392,28 @@ public final class WorkshopRepository {
             }
     }
 
+    /// All usage samples for a task, oldest first.
+    public func usageSamples(_ taskID: TaskID) throws -> [UsageSampleRecord] {
+        try db.query("""
+            SELECT * FROM usage_samples WHERE task_id=? ORDER BY id
+            """, [.text(taskID.rawValue)]).map { r in
+                UsageSampleRecord(
+                    taskID: taskID,
+                    engineerID: EngineerID(rawValue: r["engineer_id"]!.text!) ?? .devin,
+                    provider: r["provider"]!.text!,
+                    model: r["model"]?.text,
+                    nativeSessionID: r["native_session_id"]?.text,
+                    turnID: r["turn_id"]?.text,
+                    sample: UsageSample(
+                        input: r["input"]?.int.map(Int.init),
+                        output: r["output"]?.int.map(Int.init),
+                        cacheRead: r["cache_read"]?.int.map(Int.init),
+                        cacheWrite: r["cache_write"]?.int.map(Int.init),
+                        source: r["source"]!.text!),
+                    observedAt: WorkshopTime.date(r["observed_at"]!.text!))
+            }
+    }
+
     // MARK: - Wakeups
 
     public struct Wakeup {
@@ -400,6 +422,7 @@ public final class WorkshopRepository {
         public let engineerID: EngineerID
         public let reason: String
         public let triggerSeq: Int64?
+        public let state: String
     }
 
     @discardableResult
@@ -420,11 +443,20 @@ public final class WorkshopRepository {
             ? "SELECT * FROM wakeups WHERE state='pending' ORDER BY id"
             : "SELECT * FROM wakeups WHERE state='pending' AND task_id=? ORDER BY id"
         let args: [SQLiteValue?] = taskID.map { [.text($0.rawValue)] } ?? []
-        return try db.query(sql, args).map { r in
-            Wakeup(id: r["id"]!.int ?? 0, taskID: TaskID(r["task_id"]!.text!),
-                   engineerID: EngineerID(rawValue: r["engineer_id"]!.text!) ?? .devin,
-                   reason: r["reason"]!.text!, triggerSeq: r["trigger_seq"]?.int)
-        }
+        return try db.query(sql, args).map(wakeupFrom)
+    }
+
+    /// All wakeup rows for a task, any state, oldest first.
+    public func wakeups(_ taskID: TaskID) throws -> [Wakeup] {
+        try db.query("SELECT * FROM wakeups WHERE task_id=? ORDER BY id",
+                     [.text(taskID.rawValue)]).map(wakeupFrom)
+    }
+
+    private func wakeupFrom(_ r: Row) -> Wakeup {
+        Wakeup(id: r["id"]!.int ?? 0, taskID: TaskID(r["task_id"]!.text!),
+               engineerID: EngineerID(rawValue: r["engineer_id"]!.text!) ?? .devin,
+               reason: r["reason"]!.text!, triggerSeq: r["trigger_seq"]?.int,
+               state: r["state"]!.text ?? "pending")
     }
 
     public func setWakeupState(_ id: Int64, _ state: String, at now: Date) throws {

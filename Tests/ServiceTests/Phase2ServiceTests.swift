@@ -153,7 +153,8 @@ final class Phase2ServiceTests: XCTestCase {
         // A symlink inside the workspace pointing outside.
         try? FileManager.default.createSymbolicLink(
             atPath: ws + "/link.txt", withDestinationPath: dir + "/secret.txt")
-        for path in ["../secret.txt", "/etc/passwd", "link.txt"] {
+        for path in ["../secret.txt", "/etc/passwd", "link.txt",
+                     dir + "/secret.txt"] {
             do {
                 _ = try await svc.callTool("workshop_publish_artifact",
                     args: .object([
@@ -163,6 +164,13 @@ final class Phase2ServiceTests: XCTestCase {
                 XCTFail("expected workspaceEscape for \(path)")
             } catch WorkshopError.workspaceEscape {}
         }
+        // An absolute path that resolves inside the workspace is accepted.
+        let artifact = try await svc.callTool("workshop_publish_artifact",
+            args: .object([
+                "task_id": .string(taskID.rawValue),
+                "path": .string(ws + "/out.txt"), "description": .string("abs")]),
+            principal: .engineer(.devin))
+        XCTAssertEqual(try artifact.decode(as: Artifact.self).producer, "devin")
     }
 
     // MARK: - capacity

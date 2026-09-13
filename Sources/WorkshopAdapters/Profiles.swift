@@ -10,10 +10,13 @@ public enum ProfileBuilder {
         public var devinBinary: String
         public var kimiBinary: String
         public var mcpBridge: String     // workshop-mcp executable path
+        /// Runtime dir holding service.sock; forwarded to the bridge env.
+        public var runtimeDir: String?
         public init(home: String, devinBinary: String, kimiBinary: String,
-                    mcpBridge: String) {
+                    mcpBridge: String, runtimeDir: String? = nil) {
             self.home = home; self.devinBinary = devinBinary
             self.kimiBinary = kimiBinary; self.mcpBridge = mcpBridge
+            self.runtimeDir = runtimeDir
         }
     }
 
@@ -140,7 +143,8 @@ public enum ProfileBuilder {
         var env = strippedEnv(profile: profile)
         env["WORKSHOP_MCP_PATH"] = paths.mcpBridge
         env["WORKSHOP_TOKEN_DEVIN"] = profile + "/token"
-        let spec = HarnessLaunchSpec(
+        if let rt = paths.runtimeDir { env["WORKSHOP_RUNTIME_DIR"] = rt }
+        var spec = HarnessLaunchSpec(
             engineer: .devin,
             executable: "/usr/bin/sandbox-exec",
             args: ["-f", sb, paths.devinBinary,
@@ -149,6 +153,7 @@ public enum ProfileBuilder {
             env: env, cwd: worktree, sandboxProfilePath: sb,
             mcpInjection: .devinProjectConfigFile,
             qualifiedVersion: "3000.10.21", modelSelection: model)
+        spec.versionProbePath = paths.devinBinary
         return (spec, sb)
     }
 
@@ -165,6 +170,7 @@ public enum ProfileBuilder {
         env["KIMI_CODE_HOME"] = profile
         env["WORKSHOP_MCP_PATH"] = paths.mcpBridge
         env["WORKSHOP_TOKEN_KIMI"] = profile + "/token"
+        if let rt = paths.runtimeDir { env["WORKSHOP_RUNTIME_DIR"] = rt }
         return HarnessLaunchSpec(
             engineer: .kimi, executable: paths.kimiBinary, args: ["acp"],
             env: env, cwd: worktree,

@@ -25,6 +25,8 @@ public struct HarnessLaunchSpec: Sendable {
     public var qualifiedVersion: String
     /// Human-readable model selector for probe reporting.
     public var modelSelection: String?
+    /// Binary to version-probe when `executable` is a launcher (sandbox-exec).
+    public var versionProbePath: String?
 
     /// argv for spawning: [executable] + args.
     public var argv: [String] { [executable] + args }
@@ -42,6 +44,7 @@ public struct HarnessLaunchSpec: Sendable {
         self.mcpInjection = mcpInjection
         self.qualifiedVersion = qualifiedVersion
         self.modelSelection = modelSelection
+        self.versionProbePath = nil
     }
 }
 
@@ -56,6 +59,9 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     private var client: ACPClient?
     private var sessionID: String?
     private var lastActivity = Date.distantPast
+    /// Notes produced outside a turn stream (e.g. session/load fallback);
+    /// emitted as `.uncertain` at the start of the next sendTurn.
+    private var pendingNotes: [String] = []
     private let log = Logger(subsystem: "ai.maapu.workshop", category: "adapter")
 
     public init(spec: HarnessLaunchSpec,
@@ -71,12 +77,13 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
 
     /// Probe binary presence + version. Never reports auth health from files.
     public nonisolated func probe() async -> AdapterProbe {
-        guard FileManager.default.isExecutableFile(atPath: spec.executable) else {
+        let probePath = spec.versionProbePath ?? spec.executable
+        guard FileManager.default.isExecutableFile(atPath: probePath) else {
             return AdapterProbe(engineer: engineer,
-                                health: .unavailable("binary not found: \(spec.executable)"),
+                                health: .unavailable("binary not found: \(probePath)"),
                                 tested: false)
         }
-        guard let version = versionProbe(spec.executable) else {
+        guard let version = versionProbe(probePath) else {
             return AdapterProbe(engineer: engineer,
                                 health: .unavailable("version probe failed"),
                                 tested: false)
@@ -133,6 +140,11 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                 sessionID = native
             } catch {
                 sessionID = try await newSession(client: client, cwd: cwd)
+                lock.lock()
+                pendingNotes.append(
+                    "Native session for \(engineer.rawValue) could not be loaded; "
+                    + "started a new session (no checkpoint available yet)")
+                lock.unlock()
             }
         } else if sessionID == nil {
             sessionID = try await newSession(client: client, cwd: cwd)
@@ -154,35 +166,50 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         spec.cwd
     }
 
+    /// Bridge path + token file: the launch spec's env first (set by
+    /// ProfileBuilder), then the process env (tests / manual runs).
+    private func bridgeArgs() -> [JSONValue] {
+        let env = spec.env
+        let tokenKey = "WORKSHOP_TOKEN_\(engineer.rawValue.uppercased())"
+        guard let bridge = env["WORKSHOP_MCP_PATH"]
+                ?? ProcessInfo.processInfo.environment["WORKSHOP_MCP_PATH"],
+              let tokenFile = env[tokenKey]
+                ?? ProcessInfo.processInfo.environment[tokenKey] else {
+            return []
+        }
+        return [.string("--engineer"), .string(engineer.rawValue),
+                .string("--token-file"), .string(tokenFile)]
+    }
+
+    private func bridgeCommand() -> String? {
+        spec.env["WORKSHOP_MCP_PATH"]
+            ?? ProcessInfo.processInfo.environment["WORKSHOP_MCP_PATH"]
+    }
+
     /// mcpServers param for session/new (empty for Devin; populated for Kimi).
     private func mcpServersParam() -> [JSONValue] {
         guard spec.mcpInjection == .acpSessionParam,
-              let bridge = ProcessInfo.processInfo.environment["WORKSHOP_MCP_PATH"],
-              let tokenFile = ProcessInfo.processInfo.environment[
-                "WORKSHOP_TOKEN_\(engineer.rawValue.uppercased())"] else {
+              let bridge = bridgeCommand(),
+              !bridgeArgs().isEmpty else {
             return []
         }
         return [.object([
             "name": .string("workshop"),
             "command": .string(bridge),
-            "args": .array([.string("--engineer"), .string(engineer.rawValue),
-                            .string("--token-file"), .string(tokenFile)]),
+            "args": .array(bridgeArgs()),
             "env": .array([]),
         ])]
     }
 
     /// Devin resolves MCP tools only from `<cwd>/.devin/mcp_config.local.json`.
     private func writeDevinMCPConfig(cwd: String) {
-        guard let bridge = ProcessInfo.processInfo.environment["WORKSHOP_MCP_PATH"],
-              let tokenFile = ProcessInfo.processInfo.environment[
-                "WORKSHOP_TOKEN_\(engineer.rawValue.uppercased())"] else { return }
+        guard let bridge = bridgeCommand(), !bridgeArgs().isEmpty else { return }
         let dir = cwd + "/.devin"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let config: [String: JSONValue] = ["mcpServers": .object([
             "workshop": .object([
                 "command": .string(bridge),
-                "args": .array([.string("--engineer"), .string(engineer.rawValue),
-                                .string("--token-file"), .string(tokenFile)]),
+                "args": .array(bridgeArgs()),
                 "transport": .string("stdio"),
             ]),
         ])]
@@ -224,6 +251,10 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         let sid = ref.nativeSessionID
         let packet = context.packetText(for: engineer)
         let source = "acp:" + engineer.rawValue
+        lock.lock()
+        let notes = pendingNotes
+        pendingNotes.removeAll()
+        lock.unlock()
         return AsyncThrowingStream { continuation in
             Task {
                 guard let client else {
@@ -231,6 +262,9 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                     return
                 }
                 continuation.yield(.turnStarted)
+                for note in notes {
+                    continuation.yield(.uncertain(note))
+                }
                 // The sink runs inside the client's read loop: session/update
                 // notifications emitted mid-prompt are yielded before the
                 // prompt result resumes this task (ordering, not racing).

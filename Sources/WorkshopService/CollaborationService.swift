@@ -29,6 +29,13 @@ public actor CollaborationService {
     /// (task, engineer) pairs with a turn currently running.
     private var runningTurns: Set<String> = []
 
+    /// Test hook: called with the rendered context packet before each sendTurn.
+    public var packetInspector: (@Sendable (EngineerID, String) -> Void)?
+
+    public func setPacketInspector(_ f: (@Sendable (EngineerID, String) -> Void)?) {
+        packetInspector = f
+    }
+
     private let log = Logger(subsystem: "ai.maapu.workshop", category: "service")
 
     /// Run a repo/db mutation, logging failures instead of silently swallowing them.
@@ -166,10 +173,29 @@ public actor CollaborationService {
                                                    from: Data(event.payload.utf8)) {
             usage = payload.usage
         }
+        let running = runningTurns
+            .filter { $0.hasPrefix(id.rawValue + ":") }
+            .compactMap { EngineerID(rawValue: String($0.split(separator: ":")[1])) }
+        let wakeups = (try repo.wakeups(id))
+            .filter { $0.state == "pending" || $0.state == "running" }
+            .map { WakeupInfo(engineer: $0.engineerID, reason: $0.reason,
+                              state: $0.state) }
         return TaskDetail(task: task,
                           participants: try repo.participants(id),
                           subtasks: try repo.subtasks(id),
-                          usage: usage)
+                          usage: usage,
+                          runningEngineers: running,
+                          pendingWakeups: wakeups)
+    }
+
+    /// Artifact rows for a task (workshop.listArtifacts).
+    public func listArtifacts(_ taskID: TaskID) throws -> [Artifact] {
+        try repo.artifacts(taskID)
+    }
+
+    /// All usage samples for a task (workshop.listUsage).
+    public func listUsage(_ taskID: TaskID) throws -> [UsageSampleRecord] {
+        try repo.usageSamples(taskID)
     }
 
     public func readMessages(_ taskID: TaskID, afterSeq: Int64 = 0, limit: Int = 500) throws -> [Message] {
@@ -649,16 +675,29 @@ public actor CollaborationService {
                                                   { try repo.task(group.taskID) }) ?? nil
                 guard let adapter = adapters[group.engineer], let task else {
                     for id in group.rows {
-                        _ = attempt("wakeupDone",
-                                    { try repo.setWakeupState(id, "done", at: now()) })
+                        _ = attempt("wakeupSuppressed",
+                                    { try repo.setWakeupState(id, "suppressed",
+                                                              at: now()) })
                     }
                     continue
                 }
                 let probe = await adapter.probe()
                 guard probe.health.kind == .available else {
                     for id in group.rows {
-                        _ = attempt("wakeupDone",
-                                    { try repo.setWakeupState(id, "done", at: now()) })
+                        _ = attempt("wakeupSuppressed",
+                                    { try repo.setWakeupState(id, "suppressed",
+                                                              at: now()) })
+                    }
+                    let timestamp = now()
+                    _ = attempt("wakeupUnavailableEvent") {
+                        try repo.insertMessage(Message(
+                            id: MessageID(newID("msg")), taskID: task.id,
+                            seq: try repo.nextMessageSeq(task.id), author: .system,
+                            kind: .systemEvent,
+                            body: "\(group.engineer.rawValue.capitalized) was "
+                                + "mentioned but is \(probe.health.detail); not woken",
+                            deliveryState: .committed, createdAt: timestamp,
+                            updatedAt: timestamp))
                     }
                     continue
                 }
@@ -992,6 +1031,7 @@ public actor CollaborationService {
                                   recentMessages: recent,
                                   wakeReason: wakeReason,
                                   truncatedNote: truncatedNote)
+        packetInspector?(engineer, context.packetText(for: engineer))
         let turnID = newID("turn")
         let stream = adapter.sendTurn(ref: ref, turnID: turnID, context: context,
                                       deadline: timestamp.addingTimeInterval(300))
@@ -1014,6 +1054,15 @@ public actor CollaborationService {
                                                    model: bound.modelSelection,
                                                    nativeSessionID: ref.nativeSessionID,
                                                    turnID: turnID, sample: usage, at: now())
+                    }
+                case .uncertain(let note):
+                    _ = attempt("uncertainNote") {
+                        let t = now()
+                        try repo.insertMessage(Message(
+                            id: MessageID(newID("msg")), taskID: task.id,
+                            seq: try repo.nextMessageSeq(task.id), author: .system,
+                            kind: .systemEvent, body: note,
+                            deliveryState: .committed, createdAt: t, updatedAt: t))
                     }
                 case .turnCompleted:
                     sawCompletion = true

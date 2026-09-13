@@ -14,6 +14,8 @@ public enum WorkshopProtocol {
     public static let subscribe = "workshop.subscribe"
     /// Bind a connection to an engineer principal via its capability token.
     public static let authenticate = "workshop.authenticate"
+    public static let listArtifacts = "workshop.listArtifacts"
+    public static let listUsage = "workshop.listUsage"
 
     // Collaboration tool methods (spec §8.3); callable over IPC with an
     // authenticated engineer principal.

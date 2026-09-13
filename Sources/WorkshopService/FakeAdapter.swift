@@ -112,15 +112,17 @@ final class Locked<Value>: @unchecked Sendable {
 /// Adapter used when no real adapter is configured: probes as unavailable, never runs turns.
 public struct UnconfiguredAdapter: EngineerAdapter {
     public let engineer: EngineerID
+    private let reason: String
 
-    public init(engineer: EngineerID) {
+    public init(engineer: EngineerID, reason: String = "adapter not configured") {
         self.engineer = engineer
+        self.reason = reason
     }
 
     public func probe() async -> AdapterProbe {
         AdapterProbe(
             engineer: engineer,
-            health: .unavailable("adapter not configured"),
+            health: .unavailable(reason),
             versions: [:],
             effectiveModel: nil,
             capabilities: []

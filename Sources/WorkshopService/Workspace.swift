@@ -66,10 +66,12 @@ public enum WorkspaceManager {
             .resolvingSymlinksInPath
         // Reject ".." components outright — they can never escape legitimately.
         let components = path.split(separator: "/", omittingEmptySubsequences: true)
-        if components.contains("..") || path.hasPrefix("/") {
+        if components.contains("..") {
             throw WorkshopError.workspaceEscape(path)
         }
-        let real = ((rootReal + "/" + path) as NSString).resolvingSymlinksInPath
+        // Absolute paths are accepted and checked against the same root.
+        let joined = path.hasPrefix("/") ? path : rootReal + "/" + path
+        let real = (joined as NSString).resolvingSymlinksInPath
         guard real == rootReal || real.hasPrefix(rootReal + "/") else {
             throw WorkshopError.workspaceEscape(path)
         }

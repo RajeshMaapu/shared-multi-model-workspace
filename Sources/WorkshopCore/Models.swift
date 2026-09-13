@@ -174,6 +174,19 @@ public struct UsageSample: Codable, Equatable, Sendable {
     }
 }
 
+/// One wakeup row for status display (queued/running/suppressed/done).
+public struct WakeupInfo: Codable, Equatable, Sendable {
+    public var engineer: EngineerID
+    public var reason: String
+    public var state: String
+
+    public init(engineer: EngineerID, reason: String, state: String) {
+        self.engineer = engineer
+        self.reason = reason
+        self.state = state
+    }
+}
+
 /// Task detail returned by getTask.
 public struct TaskDetail: Codable, Equatable, Sendable {
     public var task: WorkshopTask
@@ -181,13 +194,45 @@ public struct TaskDetail: Codable, Equatable, Sendable {
     public var subtasks: [Subtask]
     /// Latest recorded usage sample for the task, if any.
     public var usage: UsageSample?
+    /// Engineers with a turn currently running on this task.
+    public var runningEngineers: [EngineerID]
+    /// Pending/running wakeup rows for this task (status chips).
+    public var pendingWakeups: [WakeupInfo]
 
     public init(task: WorkshopTask, participants: [Participant], subtasks: [Subtask],
-                usage: UsageSample? = nil) {
+                usage: UsageSample? = nil, runningEngineers: [EngineerID] = [],
+                pendingWakeups: [WakeupInfo] = []) {
         self.task = task
         self.participants = participants
         self.subtasks = subtasks
         self.usage = usage
+        self.runningEngineers = runningEngineers
+        self.pendingWakeups = pendingWakeups
+    }
+}
+
+/// A persisted usage_samples row (listUsage).
+public struct UsageSampleRecord: Codable, Equatable, Sendable {
+    public var taskID: TaskID
+    public var engineerID: EngineerID
+    public var provider: String
+    public var model: String?
+    public var nativeSessionID: String?
+    public var turnID: String?
+    public var sample: UsageSample
+    public var observedAt: Date
+
+    public init(taskID: TaskID, engineerID: EngineerID, provider: String,
+                model: String? = nil, nativeSessionID: String? = nil,
+                turnID: String? = nil, sample: UsageSample, observedAt: Date) {
+        self.taskID = taskID
+        self.engineerID = engineerID
+        self.provider = provider
+        self.model = model
+        self.nativeSessionID = nativeSessionID
+        self.turnID = turnID
+        self.sample = sample
+        self.observedAt = observedAt
     }
 }
 

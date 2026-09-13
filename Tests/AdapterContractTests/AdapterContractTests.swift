@@ -169,6 +169,9 @@ final class AdapterContractTests: XCTestCase {
             case "session/new":
                 return [#"{"jsonrpc":"2.0","id":"# + encode(id)
                     + #","result":{"sessionId":"fresh-1"}}"#]
+            case "session/prompt":
+                return [#"{"jsonrpc":"2.0","id":"# + encode(id)
+                    + #","result":{"stopReason":"end_turn"}}"#]
             default:
                 return []
             }
@@ -176,6 +179,20 @@ final class AdapterContractTests: XCTestCase {
         let adapter = ACPHarnessAdapter(spec: spec(), transportFactory: { _ in transport })
         let ref = try await adapter.openTaskSession(binding: binding(native: "stale-1"))
         XCTAssertEqual(ref.nativeSessionID, "fresh-1")
+        // The fallback is surfaced as an .uncertain note at the start of the
+        // next sendTurn stream (fix 3 — no longer silent).
+        let task = WorkshopTask(id: TaskID("task_x"), channel: "main", title: "T",
+                                brief: "b", phase: .execution, state: .working,
+                                budgetPolicyRef: nil, createdAt: Date(), updatedAt: Date())
+        var events: [AdapterEvent] = []
+        let stream = adapter.sendTurn(
+            ref: ref, turnID: "t1",
+            context: TurnContext(task: task, subtask: nil, recentMessages: []),
+            deadline: Date().addingTimeInterval(5))
+        for try await e in stream { events.append(e) }
+        XCTAssertTrue(events.contains(.uncertain(
+            "Native session for kimi could not be loaded; "
+            + "started a new session (no checkpoint available yet)")))
     }
 
     func testKimiSessionNewCarriesMCPServers() async throws {
