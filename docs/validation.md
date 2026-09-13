@@ -272,15 +272,20 @@ macOS / hardware / toolchain: macOS 15.6.1 / arm64 / Xcode 26.3 / Swift 6.2.4
 Harness versions:             devin 3000.10.21 / codex CLI 0.147.0
 Effective model selectors:    live adapters for the packaged daemon during the
                               Codex run (deepseek only); fake adapters elsewhere
-Tests run:                    ./scripts/test.sh — exit 0 — ~17 s
-                              117 tests, 110 passed, 7 skipped (opt-in live),
+Tests run:                    ./scripts/test.sh — exit 0 — ~16.3 s
+                              119 tests, 112 passed, 7 skipped (opt-in live),
                               0 failures
-                              New: CodexBridgeTests (7) — codex token auth,
-                              T01 duplicate receipt, T02 idempotency conflict
+                              New: CodexBridgeTests (8) — codex token auth,
+                              T01 duplicate receipt, T01-via-Codex key
+                              normalization (64-hex and 32-hex forms of one
+                              hash → one task), T02 idempotency conflict
                               (-32009, "idempotency conflict"), T27 forbidden
                               actions (-32005 incl. injected approve/accept),
                               via=codex message + owner wakeup, T35 offline
-                              bridge isError text.
+                              bridge isError text. Phase3ServiceTests gained
+                              testToolOnlyTurnLeavesNoEmptyMessage (tool-only
+                              turn drops the placeholder instead of
+                              committing an empty row).
 Binary T35 check:             .build/debug/workshop-mcp --principal codex with
                               no daemon → tools/list answered, tools/call →
                               isError "Workshop service is not running. Open
@@ -300,7 +305,11 @@ lsregister:                   -f ~/Applications/Workshop.app exit 0;
 Deep link:                    open "workshop://task/<redacted-task-id>" launches
                               the app and selects the task; unknown id shows
                               an in-app notice. Cold-launch race handled by a
-                              bounded retry (6 s).
+                              bounded retry (6 s). Screenshot re-captured
+                              after the tool-only-empty-message fix: the
+                              DeepSeek tool-only row no longer renders, and
+                              via=codex messages no longer show a "via codex"
+                              structured card (author label suffices).
 Fresh install:                open Workshop.app → creates
                               ~/Library/Application Support/Workshop tree,
                               profiles/codex/token (0600), bin/workshop-mcp
@@ -332,9 +341,13 @@ Codex run results:            run 1 created <redacted-task-id> via
                               Run 2 (same brief): model emitted the FULL
                               64-char sha (skill says truncate to 32) →
                               distinct idempotency key → second task
-                              <redacted-task-id> created. Service dedupe is
-                              exact-key; the divergence is prompt-following,
-                              not service logic — deterministic T01 passes.
+                              <redacted-task-id> created. FIXED defensively in
+                              rc1: the skill now prescribes an exact
+                              `shasum -a 256 | cut -c1-32` recipe (key MUST
+                              be 38 chars) and the service normalizes
+                              `codex-<33-64 hex>` keys to the 32-hex form for
+                              the codex principal (ADR 0015); deterministic
+                              normalization test added.
                               Run 3 (follow-up): workshop_post_message → seq 6,
                               author user, via=codex, owner wakeup dispatched.
 Screenshots:                  docs/evidence/phase5/ — deeplink-task.png

@@ -49,3 +49,12 @@ the authority the spec keeps in the app (§9.3).
   and created a second task. Service-side dedupe is exact-key only — callers
   that truncate inconsistently get distinct operations (documented in
   validation.md; not a service defect).
+
+## Idempotency-key normalization
+
+Codex occasionally emits the full 64-hex SHA-256 instead of the 32-hex recipe
+in the team skill. `createTask` therefore normalizes, for principal `codex`
+only, any key matching `codex-<33-64 hex>` to `codex-` + the first 32 hex
+characters before hashing and storing it — both spellings of the same brief
+dedupe to one task. Keys outside that shape are used verbatim; user-principal
+keys are never rewritten. Covered by `CodexBridgeTests.testCreateTaskKeyNormalization`.

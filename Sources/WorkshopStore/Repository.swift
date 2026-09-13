@@ -227,6 +227,10 @@ public final class WorkshopRepository {
         ])
     }
 
+    public func deleteMessage(_ id: MessageID) throws {
+        try db.execute("DELETE FROM messages WHERE id=?", [.text(id.rawValue)])
+    }
+
     public func updateMessageDelivery(_ id: MessageID, _ state: DeliveryState, at now: Date) throws {
         try db.execute("UPDATE messages SET delivery_state=?, updated_at=? WHERE id=?", [
             .text(state.rawValue), .text(WorkshopTime.string(now)), .text(id.rawValue),

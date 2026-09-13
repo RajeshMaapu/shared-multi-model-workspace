@@ -69,6 +69,36 @@ final class CodexBridgeTests: XCTestCase {
         XCTAssertEqual(tasks.count, 1)
     }
 
+    /// T01-via-Codex normalization: a codex key carrying the full 64-hex
+    /// digest and the correct 32-hex form of the same hash map to one task.
+    func testCreateTaskKeyNormalization() async throws {
+        let hex64 = String(repeating: "0123456789abcdef", count: 4)
+        let full = try await service.callTool(
+            "workshop_create_task", args: createArgs(key: "codex-" + hex64),
+            principal: codex)
+        let short = try await service.callTool(
+            "workshop_create_task",
+            args: createArgs(key: "codex-" + String(hex64.prefix(32))),
+            principal: codex)
+        XCTAssertEqual(full["task_id"], short["task_id"])
+        let tasks = try await service.listTasks()
+        XCTAssertEqual(tasks.count, 1)
+        // A key that does not match codex-<33-64 hex> is used verbatim.
+        _ = try await service.callTool(
+            "workshop_create_task",
+            args: createArgs(key: "codex-" + hex64 + "ff"), // 66 hex → verbatim
+            principal: codex)
+        var count = try await service.listTasks().count
+        XCTAssertEqual(count, 2)
+        // User principal keys are never rewritten.
+        _ = try await service.callTool(
+            "workshop_create_task",
+            args: createArgs(key: "codex-" + hex64),
+            principal: .user)
+        count = try await service.listTasks().count
+        XCTAssertEqual(count, 3)
+    }
+
     /// T02: same idempotency key, different payload → idempotency conflict.
     func testCreateTaskIdempotencyConflict() async throws {
         _ = try await service.callTool(

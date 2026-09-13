@@ -322,9 +322,26 @@ public actor CollaborationService {
 
     /// Create a task: idempotent on `idempotency_key`; single commit for task + root
     /// message + participants + root subtask + outbox (spec §8.4/§8.5, T01/T02).
+    /// Codex sometimes emits the full 64-hex digest instead of the 32-char
+    /// recipe (ADR 0015). A `codex-<33-64 hex>` key is normalized to
+    /// `codex-` + the first 32 hex chars so both forms of the same hash
+    /// dedupe to one task; anything else is used verbatim.
+    static func normalizeCodexKey(_ key: String, principal: Principal) -> String {
+        guard principal == .codex, key.hasPrefix("codex-") else { return key }
+        let hex = key.dropFirst("codex-".count)
+        guard hex.count > 32, hex.count <= 64,
+              hex.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+            return key
+        }
+        return "codex-" + hex.prefix(32)
+    }
+
     public func createTask(_ request: CreateTaskRequest,
                            principal: Principal = .user) throws -> CreateTaskReceipt {
         try checkStorage()
+        var request = request
+        request.idempotencyKey = Self.normalizeCodexKey(request.idempotencyKey,
+                                                      principal: principal)
         guard !request.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw WorkshopError.invalidRequest("title must not be empty")
         }
@@ -1649,6 +1666,7 @@ public actor CollaborationService {
         var usage = UsageSample(source: "unknown")
         var failedReason: String?
         var sawCompletion = false
+        var sawUncertain = false
         // A pending stop request (pause/cancel/quota-stop) asks the turn to
         // end with a checkpoint — only while a turn is running (§6.3).
         let wantsCheckpoint = checkpointRequested.remove(engineer) != nil
@@ -1724,6 +1742,7 @@ public actor CollaborationService {
                                                    turnID: turnID, sample: usage, at: now())
                     }
                 case .uncertain(let note):
+                    sawUncertain = true
                     _ = attempt("uncertainNote") {
                         let t = now()
                         try repo.insertMessage(Message(
@@ -1761,17 +1780,25 @@ public actor CollaborationService {
         reconcileReservation(reservationID, usage: usage, at: endTime)
         _ = attempt("commitTurn") {
             try repo.db.transaction {
-                try repo.updateMessageBody(messageID, body: body, at: endTime)
-                // F1: the placeholder takes its real seq now, so tool-posted
-                // messages from the same turn keep their earlier seqs.
-                try repo.reassignMessageSeq(messageID,
-                                            seq: try repo.nextMessageSeq(task.id),
-                                            at: endTime)
-                try repo.updateMessageDelivery(messageID, .committed, at: endTime)
-                try repo.insertOutbox(taskID: task.id, eventType: "message.committed",
-                                      payload: #"{"message_id":""# + messageID.rawValue
-                                          + #"","task_id":""# + task.id.rawValue + #""}"#,
-                                      deliveryState: "pending", at: endTime)
+                if body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   failedReason == nil, !sawUncertain {
+                    // Tool-only turn produced nothing to show; drop the
+                    // placeholder rather than committing an empty row.
+                    try repo.deleteMessage(messageID)
+                } else {
+                    try repo.updateMessageBody(messageID, body: body, at: endTime)
+                    // F1: the placeholder takes its real seq now, so
+                    // tool-posted messages from the same turn keep their
+                    // earlier seqs.
+                    try repo.reassignMessageSeq(messageID,
+                                                seq: try repo.nextMessageSeq(task.id),
+                                                at: endTime)
+                    try repo.updateMessageDelivery(messageID, .committed, at: endTime)
+                    try repo.insertOutbox(taskID: task.id, eventType: "message.committed",
+                                          payload: #"{"message_id":""# + messageID.rawValue
+                                              + #"","task_id":""# + task.id.rawValue + #""}"#,
+                                          deliveryState: "pending", at: endTime)
+                }
                 if failedReason == nil, sawCompletion {
                     try repo.setLastReadSeq(task.id, engineer, seq: maxSeq, at: endTime)
                 }

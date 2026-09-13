@@ -29,7 +29,7 @@ Commit: see `git log main`; tag `v0.1.0-rc1`.
 
 ## Tested
 
-Deterministic (`./scripts/test.sh`, 117 tests, 0 failures, ~17 s):
+Deterministic (`./scripts/test.sh`, 119 tests, 0 failures, ~16 s):
 create/dedupe/conflict, claim CAS, pre-dispatch crash recovery, fenced stale
 generations, interrupted-turn reconcile + checkpoint resume, capacity
 block/unknown, lease CAS + takeover, cancel states, storage guard, paging,
@@ -64,8 +64,9 @@ Live (approved calls only):
 - None outstanding. Non-blocking known issues: `codex exec` needed
   `-m gpt-5.6-luna` (configured `gpt-6-astra` requires a newer CLI); the
   second Codex run emitted the untruncated 64-char idempotency hash and
-  created a second task — prompt-following variance, service dedupe is
-  exact-key and correct; overwriting the app bundle in place SIGKILLs a
+  created a second task — fixed defensively (exact `shasum` recipe in the
+  team skill + service-side `codex-<33-64 hex>` → 32-hex normalization,
+  ADR 0015); overwriting the app bundle in place SIGKILLs a
   running daemon (install = rm/move then copy, ADR 0016).
 
 ## Acceptance matrix
@@ -75,7 +76,7 @@ by the XCTest suite; "passed-live" = observed against real provider/CLI.
 
 | Row | Status | Evidence |
 |-----|--------|----------|
-| T01 create idempotent | passed-deterministic (live partial — see note) | ServiceTests.testT01IdempotentCreate; CodexBridgeTests.testCreateTaskIdempotentDuplicate; live transcript 2 created a second task because the model used the full hash — key fidelity, not dedupe failure |
+| T01 create idempotent | passed-deterministic | ServiceTests.testT01IdempotentCreate; CodexBridgeTests.testCreateTaskIdempotentDuplicate + testCreateTaskKeyNormalization (64-hex and 32-hex `codex-` forms of one hash → one task); live transcript 2 pre-dated the normalization fix |
 | T02 idempotency conflict | passed-deterministic | ServiceTests.testT02IdempotencyConflict; CodexBridgeTests.testCreateTaskIdempotencyConflict (-32009, "idempotency conflict") |
 | T03 pre-dispatch crash | passed-deterministic | ServiceTests.testT03PreDispatchCrashRecovery |
 | T04 atomic claim | passed-deterministic | ServiceTests.testT04AtomicClaimSingleWinner; StoreTests.testCASClaim |

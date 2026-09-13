@@ -10,8 +10,9 @@
 - `live/codex-transcript-3.txt` — follow-up post_message: seq 6 committed,
   author user + via=codex, owner wakeup dispatched.
 - `deeplink-task.png` — `open workshop://task/<redacted-task-id>` selected the
-  Codex-created task in the packaged app (1508×1028 capture of a 1440×960
-  window).
+  Codex-created task in the packaged app. Re-captured on the rc1 rebuild:
+  the tool-only DeepSeek turn no longer leaves an empty row and via=codex
+  messages no longer show a "via codex" structured card.
 - `update-banner.png` — installed app (0.1.0-rc1) against a daemon running
   from a 0.1.0-test99 bundle: build-mismatch banner.
 - `update-banner-1440x960.png` — same banner rendered deterministically via

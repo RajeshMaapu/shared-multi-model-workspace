@@ -46,6 +46,13 @@ public enum JSONValue: Codable, Equatable, Sendable {
         return nil
     }
 
+    /// True when the object carries only the `via` provenance marker — the
+    /// author label already conveys it, so no structured card is warranted.
+    public var isViaOnly: Bool {
+        if case .object(let o) = self { return !o.isEmpty && o.keys.allSatisfy { $0 == "via" } }
+        return false
+    }
+
     public subscript(key: String) -> JSONValue? {
         if case .object(let o) = self { return o[key] }
         return nil

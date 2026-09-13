@@ -585,6 +585,37 @@ final class Phase3ServiceTests: XCTestCase {
         await svc.shutdown()
     }
 
+    /// A tool-only turn commits no empty placeholder row (Phase 5 polish).
+    func testToolOnlyTurnLeavesNoEmptyMessage() async throws {
+        let adapters = [FakeAdapter(engineer: .devin, delayPerDelta: .zero)]
+        let svc = try CollaborationService(
+            databasePath: dir + "/toolonly.sqlite", adapters: adapters,
+            dispatcherEnabled: true, homeDir: dir, wakeupCoalescence: .zero,
+            researchDeadline: 0, reviewDeadline: 0)
+        adapters[0].script = { context in
+            [.toolCall("workshop_post_message", .object([
+                "task_id": .string(context.task.id.rawValue),
+                "body": .string("TOOL_ONLY_MARKER")]))]
+        }
+        adapters[0].toolRunner = { name, args, principal in
+            try await svc.callTool(name, args: args, principal: principal)
+        }
+        let receipt = try await svc.createTask(CreateTaskRequest(
+            idempotencyKey: "toolonly", title: "T", objective: "o",
+            phase: .execution, participants: [.devin]))
+        await svc.start()
+        let done = await waitFor {
+            try await svc.getTask(receipt.taskID).task.state == .verifying
+        }
+        XCTAssertTrue(done)
+        let messages = try await svc.readMessages(receipt.taskID)
+        XCTAssertTrue(messages.contains { $0.body == "TOOL_ONLY_MARKER" })
+        XCTAssertFalse(messages.contains {
+            $0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        })
+        await svc.shutdown()
+    }
+
     func testRecoveryMessageReflectsOutcome() async throws {
         // Case 1: task was working → blocked.
         let svcA = try makeService(adapters: fakes(), file: "ra.sqlite")

@@ -269,7 +269,8 @@ struct MessageRow: View {
                         .textSelection(.enabled)
                     if let structured = message.structured,
                        let card = try? JSONDecoder().decode(JSONValue.self,
-                                                            from: Data(structured.utf8)) {
+                                                            from: Data(structured.utf8)),
+                       !card.isViaOnly {
                         StructuredCard(kind: message.kind, payload: card)
                     }
                 }
