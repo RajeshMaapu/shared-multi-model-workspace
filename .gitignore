@@ -6,3 +6,14 @@ docs/evidence/**/tmp/
 .DS_Store
 xcuserdata/
 dist/
+# Private raw evidence and local secrets stay out of the repo.
+docs/evidence/**/live/
+docs/evidence/**/raw/
+*.log
+*.sock
+*.lock
+**/token
+**/.devin/
+Configuration/*.local.json
+*.bundle
+.swiftpm/

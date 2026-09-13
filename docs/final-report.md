@@ -41,8 +41,8 @@ Live (approved calls only):
 - Phase 4 DeepSeek `/user/balance` probe (available, USD).
 - Phase 5: `codex exec` ×3 (create, duplicate brief, follow-up) — task
   created via MCP with receipt + deep link, DeepSeek turn ran, `via=codex`
-  follow-up posted and woke the owner. Transcripts:
-  `docs/evidence/phase5/live/codex-transcript-{1,2,3}.txt`.
+  follow-up posted and woke the owner. Codex transcripts — raw evidence
+  retained privately (see `docs/evidence/README.md`).
 - Binary-level: offline `workshop-mcp` isError text; `lsregister` +
   `LSCopyDefaultHandlerForURLScheme` → `ai.maapu.workshop`;
   `open workshop://task/<id>` selects the task; packaged daemon lifecycle
@@ -86,7 +86,7 @@ by the XCTest suite; "passed-live" = observed against real provider/CLI.
 | T08 report invalidation | passed-deterministic | Phase3ServiceTests (stale revision -32008) |
 | T09 one engineer executes | passed-deterministic | ServiceTests.testT09OneEngineerDoesWork |
 | T10 user reply wakes owner | passed-deterministic | Phase2/3 wakeup tests + CodexBridgeTests.testCodexPostMessageVia |
-| T11 research produces proposals | passed-deterministic + passed-live | Phase3ServiceTests; L6 evidence docs/evidence/phase3/live/ |
+| T11 research produces proposals | passed-deterministic + passed-live | Phase3ServiceTests; L6 summary docs/evidence/phase3/live-l6.md (raw retained privately) |
 | T12 draft privacy | passed-deterministic | Phase3ServiceTests |
 | T13 critical capacity blocks | passed-deterministic | Phase4ServiceTests.testT13CriticalCapacityBlocksDispatch |
 | T14 unknown ≠ 0 ≠ unlimited | passed-deterministic | Phase4ServiceTests.testT14UnknownCapacityDistinct |
@@ -111,7 +111,7 @@ by the XCTest suite; "passed-live" = observed against real provider/CLI.
 | T33 notifications on events | manual-only | NotificationPoster posts; banner not captured headlessly (validation.md Phase 5) |
 | T34 multi-window state | passed-deterministic | AppState shared across windows; earlier phases |
 | T35 daemon down via bridge | passed-deterministic + passed-live | CodexBridgeTests.testOfflineBridgeStillServesTools; binary run output |
-| T36 codex handoff e2e | passed-live | docs/evidence/phase5/live/codex-transcript-{1,3}.txt; DB rows |
+| T36 codex handoff e2e | passed-live | docs/evidence/phase5/report.md; DB rows; raw transcripts retained privately |
 | T37 package install e2e | passed-live | ~/Applications/Workshop.app; lsregister + scheme verify; lifecycle tests |
 | T38 backup/restore | passed-deterministic | Phase4ServiceTests.testT38BackupWhileWriting; scripts/restore.sh |
 | T39 settings/preferences | manual-only | Settings window (helper toggle, mute, send-on-enter); settings.png |

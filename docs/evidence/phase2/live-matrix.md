@@ -1,7 +1,8 @@
 # Phase 2 live integration matrix
 
 Date: 2026-09-13. Command: `WORKSHOP_LIVE=1 swift test --filter LiveSmokeTests`
-(exit 0, 5 tests, ~70 s). Evidence JSONs: `docs/evidence/phase2/live/*.json`.
+(exit 0, 5 tests, ~70 s). Raw evidence JSONs retained privately (see
+`docs/evidence/README.md`).
 
 | Engineer | Binary / CLI | Model selector | Reasoning | Capabilities verified live | Usage / cache | Wall |
 |---|---|---|---|---|---|---|
@@ -32,5 +33,5 @@ memory proven for Devin and Kimi.
 
 ## Secret scan
 
-`docs/evidence/phase2/live/` was grepped for `Bearer`, `api_key`, `sk-`, and
-the first six characters of the DeepSeek key: no matches.
+The raw live evidence (retained privately) was grepped for `Bearer`,
+`api_key`, `sk-`, and the first six characters of the DeepSeek key: no matches.

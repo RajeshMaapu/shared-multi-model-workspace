@@ -67,8 +67,8 @@ Deterministic tests:          ./scripts/test.sh — exit 0 — ~7.7 s
                               opt-in), 0 failures
 Live tests:                   WORKSHOP_LIVE=1 swift test --filter LiveSmokeTests
                               — exit 0 — ~70 s — 5/5 passed
-                              Evidence: docs/evidence/phase2/live/*.json,
-                              docs/evidence/phase2/live-matrix.md
+                              Evidence: docs/evidence/phase2/live-matrix.md
+                              (raw JSONs retained privately)
 
 Live coverage:                L1 Devin ACP: session/new, project-file MCP,
                               permission allow_once, tool-posted marker in DB,
@@ -136,8 +136,8 @@ Deterministic tests:          ./scripts/test.sh — exit 0 — ~8.8 s
 Live tests:                   WORKSHOP_LIVE=1 swift test --filter
                               testL6ResearchApprovalAllocation — exit 0 —
                               231.5 s — passed
-                              Evidence: docs/evidence/phase3/live/l6.json,
-                              docs/evidence/phase3/live/live-l6.md
+                              Evidence: docs/evidence/phase3/live-l6.md
+                              (raw l6.json retained privately)
 
 Phase 3 coverage:             T12 draft privacy (peers see published + own
                               draft only; get_task exposes counts), publish-
@@ -331,8 +331,8 @@ Update mismatch:              daemon running from a preserved 0.1.0-test99
 Live calls (approved scope):  3 × codex exec (create, duplicate brief,
                               follow-up) + the DeepSeek turns they triggered
                               (create-task turn + follow-up wakeup turn).
-                              Transcripts: docs/evidence/phase5/live/
-                              codex-transcript-{1,2,3}.txt (no secrets).
+                              Transcripts retained privately (no secrets);
+                              summary in docs/evidence/phase5/report.md.
 Codex run results:            run 1 created <redacted-task-id> via
                               workshop_create_task — receipt task_id,
                               committed_seq 2, state queued, deep_link present
