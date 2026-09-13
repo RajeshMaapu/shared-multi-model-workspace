@@ -46,3 +46,20 @@ stale-revision protection, arbiter allocation with dependency gating and
 disputes, proportional verification, and pause/resume/cancel/escalate/convert
 task actions — plus Proposals/Decisions tabs, a six-column board, and task
 actions in the UI. Live evidence: `docs/evidence/phase3/` (L6).
+
+Phase 4 adds resilience and resource policy: schema v4 (turns, leases,
+reservations, outbox cursors, checkpoints), tool-boundary fencing with a
+fenced-artifact quarantine, capacity model (unknown ≠ 0 ≠ unlimited),
+cancellation states, storage guard, redaction, DeepSeek managed-history
+compaction, diagnostics, FTS5 search, task export, online backup +
+`scripts/restore.sh`, and 500-message paging. Runbook: `docs/recovery.md`.
+
+Phase 5 (release candidate `v0.1.0-rc1`) adds the Codex handoff and packaging:
+a `codex` principal with five allowed tools (approvals stay in the app),
+`workshop-mcp --principal codex` that keeps serving tools while the daemon is
+down, `~/Library/Application Support/Workshop/bin/workshop-mcp` stable symlink,
+`~/Applications/Workshop.app` (`ai.maapu.workshop`, `workshop://task/<id>` deep
+links, `workshop.stopBackground`, menu-bar extra, SMAppService helper,
+notifications, build-mismatch banner). Package with `./scripts/package.sh`
+and install per `docs/verification-checklist.md`. Final status:
+`docs/final-report.md`, `docs/validation.md` Phase 5, ADRs 0015–0016.

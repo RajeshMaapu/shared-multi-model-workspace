@@ -98,7 +98,10 @@ struct WorkshopApp: App {
     }
 
     private func startUp() async {
-        UNUserNotificationCenter.current().delegate = notificationDelegate
+        // Unbundled dev builds have no notification center (bundleProxy nil).
+        if NotificationPoster.usable {
+            UNUserNotificationCenter.current().delegate = notificationDelegate
+        }
         NotificationCenter.default.addObserver(
             forName: NotificationPoster.openTaskNotification, object: nil,
             queue: .main) { note in
@@ -107,6 +110,17 @@ struct WorkshopApp: App {
                     await state.openTaskFromNotification(id)
                 }
             }
+        }
+        // §4.5: Quit is UI-only — the daemon persists while background mode is
+        // on (helper registered); with it off, quitting stops background work.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil,
+            queue: .main) { _ in
+            guard !UserDefaults.standard
+                .bool(forKey: "runHelperInBackground") else { return }
+            // Fire the request and give it ~1 s before process teardown.
+            Task { _ = try? await state.client.call(WorkshopProtocol.stopBackground) }
+            RunLoop.main.run(until: Date().addingTimeInterval(1.0))
         }
         await state.bootstrap()
         await state.checkBuildMismatch()
@@ -224,10 +238,10 @@ struct WorkshopApp: App {
         // When WORKSHOP_OPEN_CARD / WORKSHOP_OPEN_DIAGNOSTICS is set, capture
         // the popover/secondary window — it is not part of the main
         // contentView.
-        let wantSecondary = ProcessInfo.processInfo
-            .environment["WORKSHOP_OPEN_CARD"] != nil
-            || ProcessInfo.processInfo
-                .environment["WORKSHOP_OPEN_DIAGNOSTICS"] == "1"
+        let env = ProcessInfo.processInfo.environment
+        let wantSecondary = env["WORKSHOP_OPEN_CARD"] != nil
+            || env["WORKSHOP_OPEN_DIAGNOSTICS"] == "1"
+            || env["WORKSHOP_OPEN_SETTINGS"] == "1"
         let window = wantSecondary ? (NSApp.windows.last ?? NSApp.windows.first)
                                    : NSApp.windows.first
         guard let window else { return }

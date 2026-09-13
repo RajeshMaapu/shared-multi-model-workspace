@@ -9,7 +9,7 @@ public enum NotificationPoster {
 
     /// UNUserNotificationCenter requires a signed bundle; in `swift run` dev
     /// builds the center throws, so posting is best-effort there.
-    private static var usable: Bool { Bundle.main.bundleIdentifier != nil }
+    public static var usable: Bool { Bundle.main.bundleIdentifier != nil }
 
     public static func post(taskID: String, title: String, body: String) {
         guard usable else { return }

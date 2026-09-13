@@ -262,3 +262,99 @@ Known limitations:            task-row capacity indicator uses the selected
                               registered by the daemon, simulated in tests.
 Independent reviewer:         none (builder self-check only)
 ```
+
+# Validation report — Phase 5 (release candidate)
+
+```text
+Commit / build ID:            see git log; packaged bundle CFBundleVersion
+                              0.1.0-rc1 (git tag v0.1.0-rc1)
+macOS / hardware / toolchain: macOS 15.6.1 / arm64 / Xcode 26.3 / Swift 6.2.4
+Harness versions:             devin 3000.10.21 / codex CLI 0.147.0
+Effective model selectors:    live adapters for the packaged daemon during the
+                              Codex run (deepseek only); fake adapters elsewhere
+Tests run:                    ./scripts/test.sh — exit 0 — ~17 s
+                              117 tests, 110 passed, 7 skipped (opt-in live),
+                              0 failures
+                              New: CodexBridgeTests (7) — codex token auth,
+                              T01 duplicate receipt, T02 idempotency conflict
+                              (-32009, "idempotency conflict"), T27 forbidden
+                              actions (-32005 incl. injected approve/accept),
+                              via=codex message + owner wakeup, T35 offline
+                              bridge isError text.
+Binary T35 check:             .build/debug/workshop-mcp --principal codex with
+                              no daemon → tools/list answered, tools/call →
+                              isError "Workshop service is not running. Open
+                              Workshop.app (or start the background helper).
+                              Nothing was submitted." (exit output captured
+                              in session log)
+Packaging:                    scripts/package.sh 0.1.0-rc1 — exit 0
+                              codesign --verify --deep --strict: PASS (silent)
+                              spctl --assess --type execute: REJECTED —
+                              signed with local "Maapu LLC" identity (no Apple
+                              TeamID), not notarized. Known limitation:
+                              local builds run; downloaded copies are blocked
+                              by Gatekeeper until notarized.
+lsregister:                   -f ~/Applications/Workshop.app exit 0;
+                              LSCopyDefaultHandlerForURLScheme("workshop") →
+                              ai.maapu.workshop (verified via swift script)
+Deep link:                    open "workshop://task/<redacted-task-id>" launches
+                              the app and selects the task; unknown id shows
+                              an in-app notice. Cold-launch race handled by a
+                              bounded retry (6 s).
+Fresh install:                open Workshop.app → creates
+                              ~/Library/Application Support/Workshop tree,
+                              profiles/codex/token (0600), bin/workshop-mcp
+                              symlink → packaged binary; daemon PID observed.
+Lifecycle:                    graceful quit (osascript quit) with helper off →
+                              daemon logged "stop background work requested;
+                              exiting" and terminated. SIGTERM on a directly
+                              exec'd binary does not run AppKit teardown —
+                              documented. SMAppService toggle exists in
+                              Settings; status observed: notRegistered
+                              (interactive register not exercised — manual).
+Update mismatch:              daemon running from a preserved 0.1.0-test99
+                              bundle + installed app at 0.1.0-rc1 → health
+                             .build mismatch → banner rendered. NOTE:
+                              overwriting ~/Applications/Workshop.app in
+                              place while the daemon ran SIGKILLed it
+                              (CODESIGNING Invalid Page) — installs must
+                              rm/move the old bundle first (ADR 0016).
+Live calls (approved scope):  3 × codex exec (create, duplicate brief,
+                              follow-up) + the DeepSeek turns they triggered
+                              (create-task turn + follow-up wakeup turn).
+                              Transcripts: docs/evidence/phase5/live/
+                              codex-transcript-{1,2,3}.txt (no secrets).
+Codex run results:            run 1 created <redacted-task-id> via
+                              workshop_create_task — receipt task_id,
+                              committed_seq 2, state queued, deep_link present
+                              (scheme verified by daemon). DeepSeek posted
+                              CODEX_SMOKE_<nonce> + done; task verifying.
+                              Run 2 (same brief): model emitted the FULL
+                              64-char sha (skill says truncate to 32) →
+                              distinct idempotency key → second task
+                              <redacted-task-id> created. Service dedupe is
+                              exact-key; the divergence is prompt-following,
+                              not service logic — deterministic T01 passes.
+                              Run 3 (follow-up): workshop_post_message → seq 6,
+                              author user, via=codex, owner wakeup dispatched.
+Screenshots:                  docs/evidence/phase5/ — deeplink-task.png
+                              (1440×960 window), update-banner.png +
+                              update-banner-1440x960.png (dev-hook render),
+                              menubar-item.png (status item 35×24),
+                              menubar-menu.png (extra popup ~500×500),
+                              settings.png (settings window ~500×500).
+                              Notifications: not capturable headlessly —
+                              posted text is "Workshop / <title> /
+                              <reason>" for awaiting_architecture_approval,
+                              blocked, verifying (see NotificationPoster).
+Failure injections:           daemon-down bridge (offline caller), codex
+                              approve/accept injection (-32005), idempotency
+                              key conflict, unbundled-notification-center
+                              crash (fixed: guarded by bundleIdentifier).
+Known limitations:            spctl rejection (above); SMAppService
+                              registration is manual-only; notification
+                              banner not captured; SIGTERM-quit doesn't run
+                              the lifecycle hook; debug daemon leftover on
+                              a throwaway runtime (PID noted in report).
+Independent reviewer:         pending — user
+```

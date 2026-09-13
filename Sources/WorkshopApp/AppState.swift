@@ -390,7 +390,13 @@ public final class AppState: ObservableObject {
             ? url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             : url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard !id.isEmpty else { return }
-        if tasks.isEmpty { await refresh() }
+        // Cold launch: the URL can arrive before bootstrap finishes — retry
+        // briefly so a valid link still lands on its task.
+        for _ in 0..<20 where !tasks.contains(where: { $0.id.rawValue == id }) {
+            if tasks.isEmpty { await refresh() }
+            try? await Task.sleep(for: .milliseconds(300))
+            if tasks.isEmpty { await refresh() }
+        }
         if let match = tasks.first(where: { $0.id.rawValue == id }) {
             selectedTaskID = match.id
             deepLinkNotice = nil

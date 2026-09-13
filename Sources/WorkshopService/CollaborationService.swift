@@ -322,7 +322,8 @@ public actor CollaborationService {
 
     /// Create a task: idempotent on `idempotency_key`; single commit for task + root
     /// message + participants + root subtask + outbox (spec §8.4/§8.5, T01/T02).
-    public func createTask(_ request: CreateTaskRequest) throws -> CreateTaskReceipt {
+    public func createTask(_ request: CreateTaskRequest,
+                           principal: Principal = .user) throws -> CreateTaskReceipt {
         try checkStorage()
         guard !request.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw WorkshopError.invalidRequest("title must not be empty")
@@ -396,7 +397,8 @@ public actor CollaborationService {
             let r = CreateTaskReceipt(taskID: taskID, committedSeq: seq, state: .queued,
                                       status: .created, deepLink: nil)
             let receiptJSON = String(data: try JSONEncoder().encode(r), encoding: .utf8)!
-            try repo.insertOperation(key: request.idempotencyKey, principal: "user",
+            try repo.insertOperation(key: request.idempotencyKey,
+                                     principal: principal.kind,
                                      payloadHash: payloadHash, resultJSON: receiptJSON,
                                      at: timestamp)
             receipt = r
@@ -808,7 +810,7 @@ public actor CollaborationService {
                     "workshop_create_task requires idempotency_key, title, "
                         + "objective, phase")
             }
-            let receipt = try createTask(request)
+            let receipt = try createTask(request, principal: principal)
             // status = the task's dispatch position right now (§8.4):
             // created | queued | running.
             let current = try repo.task(receipt.taskID)?.state ?? receipt.state

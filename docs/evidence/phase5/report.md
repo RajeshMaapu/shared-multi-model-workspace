@@ -1,0 +1,27 @@
+# Phase 5 evidence index
+
+- `live/codex-transcript-1.txt` — codex exec create-task run (receipt
+  <redacted-task-id>, committed_seq 2, queued,
+  deep link present). Model: gpt-5.6-luna (configured gpt-6-astra needed a
+  newer CLI).
+- `live/codex-transcript-2.txt` — same brief re-run: model used the
+  untruncated 64-char sha → different idempotency key → second task
+  created (<redacted-task-id>). Documented in validation.md.
+- `live/codex-transcript-3.txt` — follow-up post_message: seq 6 committed,
+  author user + via=codex, owner wakeup dispatched.
+- `deeplink-task.png` — `open workshop://task/<redacted-task-id>` selected the
+  Codex-created task in the packaged app (1508×1028 capture of a 1440×960
+  window).
+- `update-banner.png` — installed app (0.1.0-rc1) against a daemon running
+  from a 0.1.0-test99 bundle: build-mismatch banner.
+- `update-banner-1440x960.png` — same banner rendered deterministically via
+  the WORKSHOP_FAKE_UPDATE_BANNER dev hook.
+- `menubar-item.png` — status item (35×24, natural size).
+- `menubar-menu.png` — menu-bar extra popup (~500×500).
+- `settings.png` — Settings window with helper toggle/status + mute (~500×500,
+  natural size).
+- Notifications: banner delivery not capturable headlessly; posted content is
+  `Workshop / <task title> / <reason>` for awaiting_architecture_approval,
+  blocked, and verifying states — see NotificationPoster.swift. The
+  packaged daemon's follow-up wakeup turn is exactly such a transition
+  (verifying).
