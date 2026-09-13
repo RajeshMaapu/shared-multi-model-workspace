@@ -3,9 +3,16 @@ import WorkshopCore
 
 /// Deterministic scripted adapter shared by tests and the daemon (WORKSHOP_ADAPTERS=fake).
 public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
+    /// Thrown when `failAfterDeltas` injects a mid-turn failure.
+    public struct InjectedFailure: Error, Equatable {
+        public let afterDeltas: Int
+    }
+
     public let engineer: EngineerID
     /// Delay between streamed deltas. 0 in tests.
     public var delayPerDelta: Duration
+    /// If set, the stream throws after emitting this many deltas.
+    public var failAfterDeltas: Int?
     private let scriptedHealth: EngineerHealth
 
     private struct State {
@@ -16,9 +23,11 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
     private let state = Locked(State())
 
     public init(engineer: EngineerID, delayPerDelta: Duration = .milliseconds(40),
-                health: EngineerHealth = .available("Fake adapter ready")) {
+                health: EngineerHealth = .available("Fake adapter ready"),
+                failAfterDeltas: Int? = nil) {
         self.engineer = engineer
         self.delayPerDelta = delayPerDelta
+        self.failAfterDeltas = failAfterDeltas
         self.scriptedHealth = health
     }
 
@@ -46,6 +55,7 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
             $0.contexts.append(context)
         }
         let delay = delayPerDelta
+        let failAfter = failAfterDeltas
         let title = context.task.title
         let engineerName = engineer.displayName
         return AsyncThrowingStream { continuation in
@@ -57,11 +67,17 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
                 let words = reply.split(separator: " ").map(String.init)
                 let chunkCount = 6
                 let perChunk = max(1, (words.count + chunkCount - 1) / chunkCount)
+                var emitted = 0
                 for start in stride(from: 0, to: words.count, by: perChunk) {
+                    if let failAfter, emitted >= failAfter {
+                        continuation.finish(throwing: InjectedFailure(afterDeltas: failAfter))
+                        return
+                    }
                     let end = min(start + perChunk, words.count)
                     var chunk = words[start..<end].joined(separator: " ")
                     if end < words.count { chunk += " " }
                     continuation.yield(.messageDelta(chunk))
+                    emitted += 1
                     if delay > .zero {
                         try? await Task.sleep(for: delay)
                     }

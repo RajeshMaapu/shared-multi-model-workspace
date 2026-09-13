@@ -124,16 +124,64 @@ public struct Subtask: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// Measured usage counters. Missing telemetry stays null, never zero (§6.4/§10.1).
+public struct UsageSample: Codable, Equatable, Sendable {
+    public var input: Int?
+    public var output: Int?
+    public var cacheRead: Int?
+    public var cacheWrite: Int?
+    public var source: String
+
+    enum CodingKeys: String, CodingKey {
+        case input, output
+        case cacheRead = "cache_read"
+        case cacheWrite = "cache_write"
+        case source
+    }
+
+    public init(input: Int? = nil, output: Int? = nil, cacheRead: Int? = nil,
+                cacheWrite: Int? = nil, source: String) {
+        self.input = input
+        self.output = output
+        self.cacheRead = cacheRead
+        self.cacheWrite = cacheWrite
+        self.source = source
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        input = try c.decodeIfPresent(Int.self, forKey: .input)
+        output = try c.decodeIfPresent(Int.self, forKey: .output)
+        cacheRead = try c.decodeIfPresent(Int.self, forKey: .cacheRead)
+        cacheWrite = try c.decodeIfPresent(Int.self, forKey: .cacheWrite)
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? "unknown"
+    }
+
+    // Encoded explicitly so missing telemetry stays JSON null, never absent or zero.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        if let input { try c.encode(input, forKey: .input) } else { try c.encodeNil(forKey: .input) }
+        if let output { try c.encode(output, forKey: .output) } else { try c.encodeNil(forKey: .output) }
+        if let cacheRead { try c.encode(cacheRead, forKey: .cacheRead) } else { try c.encodeNil(forKey: .cacheRead) }
+        if let cacheWrite { try c.encode(cacheWrite, forKey: .cacheWrite) } else { try c.encodeNil(forKey: .cacheWrite) }
+        try c.encode(source, forKey: .source)
+    }
+}
+
 /// Task detail returned by getTask.
 public struct TaskDetail: Codable, Equatable, Sendable {
     public var task: WorkshopTask
     public var participants: [Participant]
     public var subtasks: [Subtask]
+    /// Latest recorded usage sample for the task, if any.
+    public var usage: UsageSample?
 
-    public init(task: WorkshopTask, participants: [Participant], subtasks: [Subtask]) {
+    public init(task: WorkshopTask, participants: [Participant], subtasks: [Subtask],
+                usage: UsageSample? = nil) {
         self.task = task
         self.participants = participants
         self.subtasks = subtasks
+        self.usage = usage
     }
 }
 

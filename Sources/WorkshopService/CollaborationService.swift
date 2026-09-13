@@ -1,4 +1,5 @@
 import Foundation
+import os
 import WorkshopCore
 import WorkshopStore
 
@@ -16,6 +17,16 @@ public actor CollaborationService {
     private var eventContinuations: [UUID: AsyncStream<OutboxEvent>.Continuation] = [:]
     private var lastPublishedSeq: Int64 = 0
     private var isShutdown = false
+
+    private let log = Logger(subsystem: "ai.maapu.workshop", category: "service")
+
+    /// Run a repo/db mutation, logging failures instead of silently swallowing them.
+    private func attempt<T>(_ label: String, _ body: () throws -> T) -> T? {
+        do { return try body() } catch {
+            log.error("\(label, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
 
     public init(database: Database, adapters: [EngineerAdapter],
                 dispatcherEnabled: Bool = true,
@@ -51,7 +62,7 @@ public actor CollaborationService {
         while dispatcherScheduled || inflightTurns > 0 {
             try? await Task.sleep(for: .milliseconds(5))
         }
-        if let pending = try? repo.pendingOutbox(eventType: Self.dispatchRequested),
+        if let pending = attempt("pendingOutbox", { try repo.pendingOutbox(eventType: Self.dispatchRequested) }),
            !pending.isEmpty, dispatcherEnabled, !isShutdown {
             scheduleDispatch()
             while dispatcherScheduled || inflightTurns > 0 {
@@ -78,7 +89,7 @@ public actor CollaborationService {
     }
 
     private func publishCommitted() {
-        guard let rows = try? repo.outboxEvents(afterSeq: lastPublishedSeq) else { return }
+        guard let rows = attempt("outboxEvents", { try repo.outboxEvents(afterSeq: lastPublishedSeq) }) else { return }
         for row in rows {
             lastPublishedSeq = max(lastPublishedSeq, row.seq)
             for continuation in eventContinuations.values {
@@ -104,9 +115,16 @@ public actor CollaborationService {
 
     public func getTask(_ id: TaskID) throws -> TaskDetail {
         guard let task = try repo.task(id) else { throw WorkshopError.taskNotFound(id) }
+        var usage: UsageSample?
+        if let event = try repo.latestOutboxEvent(taskID: id, eventType: "task.state_changed"),
+           let payload = try? JSONDecoder().decode(StateChangedPayload.self,
+                                                   from: Data(event.payload.utf8)) {
+            usage = payload.usage
+        }
         return TaskDetail(task: task,
                           participants: try repo.participants(id),
-                          subtasks: try repo.subtasks(id))
+                          subtasks: try repo.subtasks(id),
+                          usage: usage)
     }
 
     public func readMessages(_ taskID: TaskID, afterSeq: Int64 = 0, limit: Int = 500) throws -> [Message] {
@@ -232,24 +250,38 @@ public actor CollaborationService {
 
     // MARK: - Recovery
 
-    /// Mark messages left `streaming` by a previous process as committed + uncertain.
+    /// Mark messages left `streaming` by a previous process as committed + uncertain,
+    /// and block the owning subtask/task for reconciliation.
     private func recoverInterruptedStreams() {
-        guard let interrupted = try? repo.streamingMessages(), !interrupted.isEmpty else { return }
+        guard let interrupted = attempt("streamingMessages", { try repo.streamingMessages() }),
+              !interrupted.isEmpty else { return }
         let timestamp = now()
         for message in interrupted {
-            try? repo.db.transaction {
-                try repo.updateMessageBody(
-                    message.id,
-                    body: message.body
-                        + "\n\n[stream interrupted by service restart; marked uncertain]",
-                    at: timestamp)
-                try repo.updateMessageDelivery(message.id, .committed, at: timestamp)
-                try repo.insertMessage(Message(
-                    id: MessageID(newID("msg")), taskID: message.taskID,
-                    seq: try repo.nextMessageSeq(message.taskID), author: .system,
-                    kind: .systemEvent,
-                    body: "Interrupted stream marked uncertain after service restart.",
-                    deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+            _ = attempt("recoverInterruptedStream") {
+                try repo.db.transaction {
+                    try repo.updateMessageBody(
+                        message.id,
+                        body: message.body
+                            + "\n\n[stream interrupted by service restart; marked uncertain]",
+                        at: timestamp)
+                    try repo.updateMessageDelivery(message.id, .committed, at: timestamp)
+                    if let authorID = message.author.engineerID,
+                       let subtask = try repo.latestOwnedSubtask(taskID: message.taskID,
+                                                               owner: authorID) {
+                        try repo.updateSubtaskState(subtask.id, .blocked, at: timestamp)
+                    }
+                    if let task = try repo.task(message.taskID), task.state == .working {
+                        try transition(message.taskID, from: .working, to: .blocked,
+                                       at: timestamp)
+                    }
+                    try repo.insertMessage(Message(
+                        id: MessageID(newID("msg")), taskID: message.taskID,
+                        seq: try repo.nextMessageSeq(message.taskID), author: .system,
+                        kind: .systemEvent,
+                        body: "Interrupted stream marked uncertain after service restart; "
+                            + "task blocked pending reconciliation (Phase 4)",
+                        deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+                }
             }
         }
         publishCommitted()
@@ -265,9 +297,17 @@ public actor CollaborationService {
 
     private func dispatchLoop() async {
         while !isShutdown {
-            guard let rows = try? repo.pendingOutbox(eventType: Self.dispatchRequested),
+            guard let rows = attempt("pendingOutbox",
+                                     { try repo.pendingOutbox(eventType: Self.dispatchRequested) }),
                   let row = rows.first else { break }
-            await handleDispatch(row)
+            if let failure = await handleDispatch(row) {
+                let marked = attempt("markOutboxFailed") {
+                    try repo.db.transaction {
+                        try repo.markOutboxFailed(row.seq, reason: failure, at: now())
+                    }
+                }
+                if marked == nil { break } // cannot mark — do not spin on the row
+            }
         }
         dispatcherScheduled = false
     }
@@ -284,36 +324,54 @@ public actor CollaborationService {
                               leaseExpiresAt: now().addingTimeInterval(300), at: now())
     }
 
-    /// Test hook: leave an uncommitted streaming message behind, as a crashed turn would.
+    /// Test hook: simulate a crashed mid-turn state — claimed subtask, working task,
+    /// and an uncommitted streaming message.
     public func insertStreamingMessageForTest() throws {
         guard let task = try repo.listTasks().first else { return }
         let timestamp = now()
-        try repo.insertMessage(Message(
-            id: MessageID(newID("msg")), taskID: task.id,
-            seq: try repo.nextMessageSeq(task.id), author: .engineer(.devin),
-            kind: .text, body: "partial reply", deliveryState: .streaming,
-            createdAt: timestamp, updatedAt: timestamp))
+        try repo.db.transaction {
+            if let subtask = try repo.subtasks(task.id).first {
+                _ = try repo.claimSubtask(subtask.id, owner: .devin,
+                                          expectedGeneration: subtask.generation,
+                                          leaseExpiresAt: timestamp.addingTimeInterval(300),
+                                          at: timestamp)
+            }
+            var state = task.state
+            for next in [TaskState.ready, .working] where state != next {
+                try transition(task.id, from: state, to: next, at: timestamp)
+                state = next
+            }
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: task.id,
+                seq: try repo.nextMessageSeq(task.id), author: .engineer(.devin),
+                kind: .text, body: "partial reply", deliveryState: .streaming,
+                createdAt: timestamp, updatedAt: timestamp))
+        }
     }
 
-    private func handleDispatch(_ row: OutboxEvent) async {
+    /// Test hook: insert a raw pending dispatch.requested row (e.g. a poisoned payload).
+    public func insertOutboxForTest(eventType: String, taskID: TaskID?, payload: String) throws {
+        _ = try repo.insertOutbox(taskID: taskID, eventType: eventType, payload: payload,
+                                  deliveryState: "pending", at: now())
+    }
+
+    /// Returns nil on success, or a failure reason for the outbox row.
+    private func handleDispatch(_ row: OutboxEvent) async -> String? {
         guard let payload = try? JSONDecoder().decode(JSONValue.self,
                                                       from: Data(row.payload.utf8)),
               let taskIDRaw = payload["task_id"]?.stringValue,
               let subtaskIDRaw = payload["subtask_id"]?.stringValue else {
-            try? repo.db.transaction { try repo.markOutboxDelivered(row.seq, at: now()) }
-            publishCommitted()
-            return
+            return "invalid dispatch payload"
         }
         let taskID = TaskID(taskIDRaw)
         let subtaskID = SubtaskID(subtaskIDRaw)
         let preferredOwner = payload["preferred_owner"]?.stringValue
             .flatMap(EngineerID.init(rawValue:))
 
-        guard let task = try? repo.task(taskID),
-              var subtask = try? repo.subtask(subtaskID) else {
-            try? repo.db.transaction { try repo.markOutboxDelivered(row.seq, at: now()) }
-            publishCommitted()
-            return
+        guard let taskOpt = attempt("task", { try repo.task(taskID) }), let task = taskOpt,
+              let subOpt = attempt("subtask", { try repo.subtask(subtaskID) }),
+              var subtask = subOpt else {
+            return "task or subtask not found"
         }
 
         // Eligible engineers: participants whose probe reports available (spec §5.2).
@@ -322,7 +380,8 @@ public actor CollaborationService {
             order.remove(at: index)
             order.insert(preferredOwner, at: 0)
         }
-        let participantIDs = (try? repo.participants(taskID))?.map(\.engineerID) ?? []
+        let participantIDs = attempt("participants", { try repo.participants(taskID) })?
+            .map(\.engineerID) ?? []
         var winner: EngineerID?
         for engineer in order where participantIDs.contains(engineer) {
             guard let adapter = adapters[engineer] else { continue }
@@ -336,57 +395,66 @@ public actor CollaborationService {
         guard let winner, let adapter = adapters[winner] else {
             // No eligible engineer: blocked, system event, no retry storm (T15-lite).
             let timestamp = now()
-            try? repo.db.transaction {
-                try transition(taskID, from: task.state, to: .ready, at: timestamp)
-                try transition(taskID, from: .ready, to: .working, at: timestamp)
-                try transition(taskID, from: .working, to: .blocked, at: timestamp)
-                try repo.insertMessage(Message(
-                    id: MessageID(newID("msg")), taskID: taskID,
-                    seq: try repo.nextMessageSeq(taskID), author: .system,
-                    kind: .systemEvent, body: "No eligible engineer available",
-                    deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
-                try repo.insertOutbox(taskID: taskID, eventType: "task.state_changed",
-                                      payload: #"{"task_id":""# + taskID.rawValue
-                                          + #"","state":"blocked"}"#,
-                                      deliveryState: "pending", at: timestamp)
-                try repo.markOutboxDelivered(row.seq, at: timestamp)
+            let ok = attempt("noEligibleCommit") {
+                try repo.db.transaction {
+                    try transition(taskID, from: task.state, to: .ready, at: timestamp)
+                    try transition(taskID, from: .ready, to: .working, at: timestamp)
+                    try transition(taskID, from: .working, to: .blocked, at: timestamp)
+                    try repo.insertMessage(Message(
+                        id: MessageID(newID("msg")), taskID: taskID,
+                        seq: try repo.nextMessageSeq(taskID), author: .system,
+                        kind: .systemEvent, body: "No eligible engineer available",
+                        deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+                    try repo.insertOutbox(taskID: taskID, eventType: "task.state_changed",
+                                          payload: #"{"task_id":""# + taskID.rawValue
+                                              + #"","state":"blocked"}"#,
+                                          deliveryState: "pending", at: timestamp)
+                    try repo.markOutboxDelivered(row.seq, at: timestamp)
+                }
             }
             publishCommitted()
-            return
+            return ok == nil ? "no-eligible commit failed" : nil
         }
 
         // Atomic CAS claim; changes()==1 is the single winner (T04).
         let timestamp = now()
         let lease = timestamp.addingTimeInterval(300)
         var claimed = false
-        try? repo.db.transaction {
-            claimed = try repo.claimSubtask(subtaskID, owner: winner,
-                                          expectedGeneration: subtask.generation,
-                                          leaseExpiresAt: lease, at: timestamp)
-            guard claimed else { return }
-            try repo.markOutboxDelivered(row.seq, at: timestamp)
-            try transition(taskID, from: task.state, to: .ready, at: timestamp)
-            try transition(taskID, from: .ready, to: .working, at: timestamp)
-            try repo.insertMessage(Message(
-                id: MessageID(newID("msg")), taskID: taskID,
-                seq: try repo.nextMessageSeq(taskID), author: .system, kind: .systemEvent,
-                body: "\(winner.displayName) claimed \(subtask.title) (generation \(subtask.generation + 1))",
-                deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
-            try repo.insertOutbox(taskID: taskID, eventType: "subtask.claimed",
-                                  payload: #"{"subtask_id":""# + subtaskID.rawValue
-                                      + #"","owner":""# + winner.rawValue
-                                      + #"","generation":\#(subtask.generation + 1)}"#,
-                                  deliveryState: "pending", at: timestamp)
+        let ok = attempt("claimCommit") {
+            try repo.db.transaction {
+                claimed = try repo.claimSubtask(subtaskID, owner: winner,
+                                              expectedGeneration: subtask.generation,
+                                              leaseExpiresAt: lease, at: timestamp)
+                guard claimed else { return }
+                try repo.markOutboxDelivered(row.seq, at: timestamp)
+                try transition(taskID, from: task.state, to: .ready, at: timestamp)
+                try transition(taskID, from: .ready, to: .working, at: timestamp)
+                try repo.insertMessage(Message(
+                    id: MessageID(newID("msg")), taskID: taskID,
+                    seq: try repo.nextMessageSeq(taskID), author: .system, kind: .systemEvent,
+                    body: "\(winner.displayName) claimed \(subtask.title) (generation \(subtask.generation + 1))",
+                    deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+                try repo.insertOutbox(taskID: taskID, eventType: "subtask.claimed",
+                                      payload: #"{"subtask_id":""# + subtaskID.rawValue
+                                          + #"","owner":""# + winner.rawValue
+                                          + #"","generation":\#(subtask.generation + 1)}"#,
+                                      deliveryState: "pending", at: timestamp)
+            }
         }
         publishCommitted()
-        guard claimed else { return }
+        guard ok != nil else { return "claim transaction failed" }
+        guard claimed else { return "claim lost or subtask already owned" }
 
-        subtask = (try? repo.subtask(subtaskID)) ?? subtask
+        if let reloaded: Subtask? = attempt("subtaskReload", { try repo.subtask(subtaskID) }),
+           let reloaded {
+            subtask = reloaded
+        }
 
         // Run the turn outside the claim transaction.
         inflightTurns += 1
         defer { inflightTurns -= 1 }
         await runTurn(adapter: adapter, engineer: winner, task: task, subtask: subtask)
+        return nil
     }
 
     /// Transition helper: verifies the §8.2 edge, no-op when already at `to`.
@@ -398,26 +466,40 @@ public actor CollaborationService {
         try repo.updateTaskState(taskID, to, at: timestamp)
     }
 
+    /// Payload of a task.state_changed outbox event; usage nulls stay null.
+    private struct StateChangedPayload: Codable {
+        var task_id: String
+        var state: String
+        var usage: UsageSample?
+    }
+
     private func runTurn(adapter: EngineerAdapter, engineer: EngineerID,
                          task: WorkshopTask, subtask: Subtask) async {
         let timestamp = now()
         let binding = SessionBinding(taskID: task.id, engineerID: engineer, role: "owner",
                                      workerID: "main")
-        guard let ref = try? await adapter.openTaskSession(binding: binding) else { return }
+        guard let ref = try? await adapter.openTaskSession(binding: binding) else {
+            log.error("openTaskSession failed for \(engineer.rawValue, privacy: .public)")
+            return
+        }
 
         // Streaming placeholder message in its own transaction.
         let messageID = MessageID(newID("msg"))
-        try? repo.db.transaction {
-            try repo.insertMessage(Message(
-                id: messageID, taskID: task.id, seq: try repo.nextMessageSeq(task.id),
-                author: .engineer(engineer), kind: .text, body: "",
-                deliveryState: .streaming, createdAt: timestamp, updatedAt: timestamp))
+        _ = attempt("insertStreamingMessage") {
+            try repo.db.transaction {
+                try repo.insertMessage(Message(
+                    id: messageID, taskID: task.id, seq: try repo.nextMessageSeq(task.id),
+                    author: .engineer(engineer), kind: .text, body: "",
+                    deliveryState: .streaming, createdAt: timestamp, updatedAt: timestamp))
+            }
         }
 
         var body = ""
-        var usage: (input: Int?, output: Int?, cacheRead: Int?, cacheWrite: Int?)? = nil
+        var usage = UsageSample(source: "unknown")
+        var failedReason: String?
         let context = TurnContext(task: task, subtask: subtask,
-                                  recentMessages: (try? repo.messages(task.id)) ?? [])
+                                  recentMessages: attempt("recentMessages",
+                                                          { try repo.messages(task.id) }) ?? [])
         let stream = adapter.sendTurn(ref: ref, turnID: newID("turn"), context: context,
                                       deadline: timestamp.addingTimeInterval(300))
         do {
@@ -425,48 +507,68 @@ public actor CollaborationService {
                 switch event {
                 case .messageDelta(let delta):
                     body += delta
-                    try? repo.updateMessageBody(messageID, body: body, at: now())
+                    _ = attempt("updateMessageBody",
+                                { try repo.updateMessageBody(messageID, body: body, at: now()) })
                     publishTransient(taskID: task.id, type: "message.delta",
                                      payload: #"{"message_id":""# + messageID.rawValue
                                          + #"","task_id":""# + task.id.rawValue + #""}"#)
-                case .usageSample(let input, let output, let cacheRead, let cacheWrite, _):
-                    usage = (input, output, cacheRead, cacheWrite)
+                case .usageSample(let input, let output, let cacheRead, let cacheWrite, let source):
+                    usage = UsageSample(input: input, output: output, cacheRead: cacheRead,
+                                        cacheWrite: cacheWrite, source: source)
                 default:
                     break
                 }
             }
         } catch {
-            // Turn failed mid-stream: mark uncertain truthfully.
-            body += "\n\n[turn failed: \(error.localizedDescription); marked uncertain]"
+            failedReason = error.localizedDescription
+            body += "\n\n[turn failed: \(failedReason!); marked uncertain]"
         }
 
-        // Commit the completed turn.
+        // Commit the turn outcome. A failed stream never reports completion.
         let endTime = now()
-        try? repo.db.transaction {
-            try repo.updateMessageBody(messageID, body: body, at: endTime)
-            try repo.updateMessageDelivery(messageID, .committed, at: endTime)
-            try repo.updateSubtaskState(subtask.id, .review, at: endTime)
-            if let current = try repo.task(task.id) {
-                try transition(task.id, from: current.state, to: .verifying, at: endTime)
+        _ = attempt("commitTurn") {
+            try repo.db.transaction {
+                try repo.updateMessageBody(messageID, body: body, at: endTime)
+                try repo.updateMessageDelivery(messageID, .committed, at: endTime)
+                try repo.insertOutbox(taskID: task.id, eventType: "message.committed",
+                                      payload: #"{"message_id":""# + messageID.rawValue
+                                          + #"","task_id":""# + task.id.rawValue + #""}"#,
+                                      deliveryState: "pending", at: endTime)
+                if let failedReason {
+                    try repo.updateSubtaskState(subtask.id, .blocked, at: endTime)
+                    if let current = try repo.task(task.id), current.state == .working {
+                        try transition(task.id, from: .working, to: .blocked, at: endTime)
+                    }
+                    try repo.insertMessage(Message(
+                        id: MessageID(newID("msg")), taskID: task.id,
+                        seq: try repo.nextMessageSeq(task.id), author: .system,
+                        kind: .systemEvent,
+                        body: "Turn failed: \(failedReason). Result uncertain; "
+                            + "awaiting reconciliation.",
+                        deliveryState: .committed, createdAt: endTime, updatedAt: endTime))
+                    let payload = try JSONEncoder().encode(StateChangedPayload(
+                        task_id: task.id.rawValue, state: "blocked", usage: usage))
+                    try repo.insertOutbox(taskID: task.id, eventType: "task.state_changed",
+                                          payload: String(decoding: payload, as: UTF8.self),
+                                          deliveryState: "pending", at: endTime)
+                } else {
+                    try repo.updateSubtaskState(subtask.id, .review, at: endTime)
+                    if let current = try repo.task(task.id) {
+                        try transition(task.id, from: current.state, to: .verifying, at: endTime)
+                    }
+                    try repo.insertMessage(Message(
+                        id: MessageID(newID("msg")), taskID: task.id,
+                        seq: try repo.nextMessageSeq(task.id), author: .system,
+                        kind: .systemEvent,
+                        body: "Owner reported complete; verification pending",
+                        deliveryState: .committed, createdAt: endTime, updatedAt: endTime))
+                    let payload = try JSONEncoder().encode(StateChangedPayload(
+                        task_id: task.id.rawValue, state: "verifying", usage: usage))
+                    try repo.insertOutbox(taskID: task.id, eventType: "task.state_changed",
+                                          payload: String(decoding: payload, as: UTF8.self),
+                                          deliveryState: "pending", at: endTime)
+                }
             }
-            try repo.insertMessage(Message(
-                id: MessageID(newID("msg")), taskID: task.id,
-                seq: try repo.nextMessageSeq(task.id), author: .system, kind: .systemEvent,
-                body: "Owner reported complete; verification pending",
-                deliveryState: .committed, createdAt: endTime, updatedAt: endTime))
-            try repo.insertOutbox(taskID: task.id, eventType: "message.committed",
-                                  payload: #"{"message_id":""# + messageID.rawValue
-                                      + #"","task_id":""# + task.id.rawValue + #""}"#,
-                                  deliveryState: "pending", at: endTime)
-            var statePayload = #"{"task_id":""# + task.id.rawValue + #"","state":"verifying""#
-            if let usage {
-                statePayload += #",\"usage\":{\"input\":\#(usage.input ?? 0)"#
-                    + #",\"output\":\#(usage.output ?? 0)}"#
-            }
-            statePayload += "}"
-            try repo.insertOutbox(taskID: task.id, eventType: "task.state_changed",
-                                  payload: statePayload, deliveryState: "pending",
-                                  at: endTime)
         }
         publishCommitted()
     }

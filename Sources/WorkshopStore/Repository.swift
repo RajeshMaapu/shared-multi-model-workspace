@@ -282,6 +282,29 @@ public final class WorkshopRepository {
         ])
     }
 
+    /// Mark a row permanently failed; reason appended to the payload text.
+    public func markOutboxFailed(_ seq: Int64, reason: String, at now: Date) throws {
+        try db.execute("""
+            UPDATE outbox SET delivery_state='failed',
+                payload = payload || ' [error: ' || ? || ']', delivered_at=?
+            WHERE seq=?
+            """, [.text(reason), .text(WorkshopTime.string(now)), .integer(seq)])
+    }
+
+    public func latestOutboxEvent(taskID: TaskID, eventType: String) throws -> OutboxEvent? {
+        try db.query("""
+            SELECT * FROM outbox WHERE task_id=? AND event_type=? ORDER BY seq DESC LIMIT 1
+            """, [.text(taskID.rawValue), .text(eventType)]).first.map(outboxFrom)
+    }
+
+    /// The latest-generation subtask owned by an engineer on a task.
+    public func latestOwnedSubtask(taskID: TaskID, owner: EngineerID) throws -> Subtask? {
+        try db.query("""
+            SELECT * FROM subtasks WHERE task_id=? AND owner_id=?
+            ORDER BY generation DESC, created_at DESC LIMIT 1
+            """, [.text(taskID.rawValue), .text(owner.rawValue)]).first.map(subtaskFrom)
+    }
+
     private func outboxFrom(_ r: Row) -> OutboxEvent {
         OutboxEvent(
             seq: r["seq"]!.int ?? 0,

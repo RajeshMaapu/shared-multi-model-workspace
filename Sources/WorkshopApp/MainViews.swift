@@ -148,7 +148,9 @@ struct EngineerRow: View {
                 Text(probe.engineer.displayName)
                     .font(.system(size: 13))
                     .foregroundStyle(.white.opacity(0.9))
-                Text(probe.health.kind == .available ? probe.health.label : "\(probe.health.label): \(probe.health.detail)")
+                Text(probe.health.detail.isEmpty
+                     ? probe.health.label
+                     : "\(probe.health.label) · \(probe.health.detail)")
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.55))
             }

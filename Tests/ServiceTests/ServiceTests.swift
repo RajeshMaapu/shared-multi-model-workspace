@@ -191,7 +191,8 @@ final class ServiceTests: XCTestCase {
         }
         let svc2 = try service(adapters: fakes(), file: path)
         await svc2.start()
-        let messages = try await svc2.readMessages(try await svc2.listTasks().first!.id)
+        let taskID = try await svc2.listTasks().first!.id
+        let messages = try await svc2.readMessages(taskID)
         XCTAssertTrue(messages.contains {
             $0.body.contains("[stream interrupted by service restart; marked uncertain]")
                 && $0.deliveryState == .committed
@@ -199,5 +200,62 @@ final class ServiceTests: XCTestCase {
         XCTAssertTrue(messages.contains {
             $0.kind == .systemEvent && $0.body.contains("Interrupted stream")
         })
+        // The interrupted turn's subtask and task are blocked pending reconciliation.
+        let detail = try await svc2.getTask(taskID)
+        XCTAssertEqual(detail.task.state, .blocked)
+        XCTAssertEqual(detail.subtasks.first?.state, .blocked)
+    }
+
+    func testUsageSampleKeepsUnknownCache() async throws {
+        let svc = try service(adapters: fakes())
+        _ = try await svc.createTask(request(key: "usage"))
+        await svc.start()
+        await svc.awaitIdle()
+        let events = try await svc.outboxEvents(afterSeq: 0)
+        let stateChanged = try XCTUnwrap(events.last { $0.eventType == "task.state_changed" })
+        XCTAssertTrue(stateChanged.payload.contains(#""cache_read":null"#),
+                      stateChanged.payload)
+        XCTAssertTrue(stateChanged.payload.contains(#""input":812"#), stateChanged.payload)
+        XCTAssertTrue(stateChanged.payload.contains(#""source":"fake""#))
+    }
+
+    func testFailedTurnDoesNotReportComplete() async throws {
+        let failing = FakeAdapter(engineer: .devin, delayPerDelta: .zero,
+                                  failAfterDeltas: 2)
+        let adapters: [EngineerAdapter] = [failing] + EngineerID.allCases.dropFirst().map {
+            FakeAdapter(engineer: $0, delayPerDelta: .zero)
+        }
+        let svc = try service(adapters: adapters)
+        let receipt = try await svc.createTask(request(key: "fail-turn"))
+        await svc.start()
+        await svc.awaitIdle()
+        let detail = try await svc.getTask(receipt.taskID)
+        XCTAssertEqual(detail.task.state, .blocked)
+        XCTAssertEqual(detail.subtasks.first?.state, .blocked)
+        let messages = try await svc.readMessages(receipt.taskID)
+        XCTAssertFalse(messages.contains { $0.body == "Owner reported complete; verification pending" })
+        XCTAssertTrue(messages.contains {
+            $0.kind == .systemEvent && $0.body.hasPrefix("Turn failed:")
+                && $0.body.contains("awaiting reconciliation")
+        })
+        XCTAssertTrue(messages.contains { $0.body.contains("[turn failed:") })
+    }
+
+    func testPoisonedDispatchRowFailsAndLoopContinues() async throws {
+        let svc = try service(adapters: fakes())
+        // A dispatch.requested row with no subtask_id can never be handled.
+        try await svc.insertOutboxForTest(eventType: CollaborationService.dispatchRequested,
+                                        taskID: nil, payload: #"{"task_id":"task_missing"}"#)
+        await svc.processPendingDispatches()
+        let rows = try await svc.outboxEvents(afterSeq: 0)
+        let poisoned = try XCTUnwrap(rows.last { $0.eventType == CollaborationService.dispatchRequested })
+        XCTAssertEqual(poisoned.deliveryState, "failed")
+        XCTAssertTrue(poisoned.payload.contains("[error:"))
+        // The loop exited and a real task still dispatches.
+        _ = try await svc.createTask(request(key: "after-poison"))
+        await svc.start()
+        await svc.awaitIdle()
+        let detail = try await svc.getTask(try await svc.listTasks().first!.id)
+        XCTAssertEqual(detail.task.state, .verifying)
     }
 }

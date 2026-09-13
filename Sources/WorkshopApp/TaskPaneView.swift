@@ -217,16 +217,29 @@ struct BoardView: View {
 }
 
 struct UsageView: View {
+    @EnvironmentObject var state: AppState
+
     var body: some View {
         VStack(spacing: 12) {
-            HStack(spacing: 24) {
-                UsageStat(label: "Input tokens", value: "812")
-                UsageStat(label: "Output tokens", value: "140")
-                UsageStat(label: "Cache", value: "cache: unknown")
+            if let usage = state.detail?.usage {
+                HStack(spacing: 24) {
+                    UsageStat(label: "Input tokens",
+                              value: usage.input.map(String.init) ?? "unknown")
+                    UsageStat(label: "Output tokens",
+                              value: usage.output.map(String.init) ?? "unknown")
+                    UsageStat(label: "Cache read",
+                              value: usage.cacheRead.map(String.init) ?? "unknown")
+                    UsageStat(label: "Cache write",
+                              value: usage.cacheWrite.map(String.init) ?? "unknown")
+                }
+                Text("Source: \(usage.source) · measured at turn end")
+                    .font(.system(size: 11))
+                    .foregroundStyle(WorkshopColors.secondaryText)
+            } else {
+                Text("No usage recorded yet.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(WorkshopColors.secondaryText)
             }
-            Text("Fake adapter sample · measured at turn end")
-                .font(.system(size: 11))
-                .foregroundStyle(WorkshopColors.secondaryText)
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -299,6 +312,8 @@ struct ComposerField: View {
     @ViewBuilder
     private var editor: some View {
         let base = TextEditor(text: $text)
+            .scrollContentBackground(.hidden)
+            .background(.clear)
             .font(.system(size: 13))
             .frame(minHeight: 38, maxHeight: 120)
             .fixedSize(horizontal: false, vertical: true)

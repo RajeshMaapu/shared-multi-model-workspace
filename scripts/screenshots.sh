@@ -6,10 +6,10 @@ swift build
 EVIDENCE=docs/evidence/phase1
 mkdir -p "$EVIDENCE"
 APP=.build/Workshop.app
-if [ ! -d "$APP" ]; then
-    mkdir -p "$APP/Contents/MacOS"
-    cp .build/debug/Workshop "$APP/Contents/MacOS/Workshop"
-    cp .build/debug/workshop-daemon "$APP/Contents/MacOS/workshop-daemon"
+mkdir -p "$APP/Contents/MacOS"
+cp .build/debug/Workshop "$APP/Contents/MacOS/Workshop"
+cp .build/debug/workshop-daemon "$APP/Contents/MacOS/workshop-daemon"
+if [ ! -f "$APP/Contents/Info.plist" ]; then
     cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -30,8 +30,8 @@ if [ ! -d "$APP" ]; then
 </dict>
 </plist>
 PLIST
-    codesign --force --sign - "$APP"
 fi
+codesign --force --sign - "$APP"
 
 THROWAWAY_HOME=$(mktemp -d /tmp/workshop-home.XXXXXX)
 THROWAWAY_RUNTIME=$(mktemp -d /tmp/wsrt.XXXXXX)
