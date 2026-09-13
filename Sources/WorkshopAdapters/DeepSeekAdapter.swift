@@ -188,6 +188,18 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
                        "messages": .array(messages),
                        "tools": .array(Self.toolSchemas()),
                        "max_tokens": .number(Double(maxTokens))])
+            if status != 200, let dir =
+                ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"] {
+                let p = dir + "/deepseek-errors.log"
+                let line = "HTTP \(status): "
+                    + String(decoding: (try? JSONEncoder().encode(body)) ?? Data(),
+                             as: UTF8.self).prefix(500) + "\n"
+                if let fh = FileHandle(forWritingAtPath: p) {
+                    fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
+                } else {
+                    FileManager.default.createFile(atPath: p, contents: Data(line.utf8))
+                }
+            }
             switch status {
             case 401: throw Failure.auth
             case 402, 429: throw Failure.quota
@@ -245,6 +257,13 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
                     "content": .string(result)]))
                 continuation.yield(.toolActivity(title: name, status: "completed"))
             }
+            // Persist incrementally (reasoning stripped) so a later failure
+            // still leaves a resumable session file.
+            saveHistory(ref, messages.map { m -> JSONValue in
+                guard case .object(var o) = m else { return m }
+                o.removeValue(forKey: "reasoning_content")
+                return .object(o)
+            })
         }
         throw Failure.transport("tool loop iteration cap reached")
     }

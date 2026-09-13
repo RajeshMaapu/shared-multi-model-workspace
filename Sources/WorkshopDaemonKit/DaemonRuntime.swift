@@ -185,6 +185,17 @@ public final class DaemonRuntime: @unchecked Sendable {
                 sessionsDir: home + "/sessions/deepseek",
                 keyReader: { try DeepSeekAdapter.readCredential() },
                 toolExecutor: { name, args in
+                    if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
+                       let data = try? JSONEncoder().encode(
+                        JSONValue.object(["tool": .string(name), "args": args])) {
+                        let p = dir + "/tool-calls.log"
+                        let line = String(decoding: data, as: UTF8.self) + "\n"
+                        if let fh = FileHandle(forWritingAtPath: p) {
+                            fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
+                        } else {
+                            FileManager.default.createFile(atPath: p, contents: Data(line.utf8))
+                        }
+                    }
                     guard WorkshopToolCatalog.method(for: name) != nil else {
                         return #"{"error":"unknown tool"}"#
                     }

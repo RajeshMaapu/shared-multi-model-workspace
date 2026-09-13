@@ -34,5 +34,6 @@ sigSrc.setEventHandler {
 }
 sigSrc.resume()
 
-// Park the main thread; the accept/reader threads do the work.
-dispatchMain()
+// Park; the accept/reader threads do the work. dispatchMain() traps in an
+// async main context, so sleep forever instead.
+while true { try? await Task.sleep(for: .seconds(3600)) }

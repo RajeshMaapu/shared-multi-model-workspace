@@ -54,10 +54,16 @@ do {
 }
 
 // stdout must carry only protocol; everything else goes to stderr.
+// The closures must be nonisolated: top-level code here is @MainActor, and a
+// main-actor async toolCaller would deadlock — awaiting it hops to the main
+// thread, which is blocked in runStdio.
+func makeToolCaller(_ client: WorkshopClient)
+    -> (String, JSONValue) async throws -> JSONValue {
+    { method, args in try await client.call(method, params: args) }
+}
 let lock = NSLock()
-let bridge = MCPBridge(engineer: engineer, toolCaller: { method, args in
-    try await client.call(method, params: args)
-}, output: { line in
+let bridge = MCPBridge(engineer: engineer, toolCaller: makeToolCaller(client),
+                       output: { line in
     lock.lock()
     FileHandle.standardOutput.write(Data(line.utf8))
     FileHandle.standardOutput.write(Data("\n".utf8))

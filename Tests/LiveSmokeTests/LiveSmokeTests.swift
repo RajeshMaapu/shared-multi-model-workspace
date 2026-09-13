@@ -49,6 +49,7 @@ final class LiveSmokeTests: XCTestCase {
         }
         Self.home = String(cString: homeBuf)
         Self.runtimeDir = String(cString: rtBuf)
+        setenv("WORKSHOP_DIAG_DIR", Self.home + "/diagnostics", 1)
         var env = ProcessInfo.processInfo.environment
         env["WORKSHOP_ADAPTERS"] = "live"
         env["WORKSHOP_MCP_PATH"] = Self.bridgePath
@@ -132,6 +133,15 @@ final class LiveSmokeTests: XCTestCase {
                     && $0.body.contains(marker)
             }
         }
+        // The tool-posted marker lands mid-turn; usage rows are written when the
+        // prompt result arrives, so give the turn a short grace period.
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline {
+            if let u = try? await usageEvidence(runtime, taskID: receipt.taskID,
+                                                engineer: engineer),
+               u["row_count"] != nil { break }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
         let detail = try await runtime.service.getTask(receipt.taskID)
         let usage = try await usageEvidence(runtime, taskID: receipt.taskID,
                                             engineer: engineer)
@@ -180,9 +190,15 @@ final class LiveSmokeTests: XCTestCase {
         let started = Date()
         let runtime = try await boot()
         let nonce = Self.nonce()
-        let brief = "Devin: post a message via workshop_post_message that mentions "
-            + "@kimi and asks Kimi to reply with `KIMI_ACK_\(nonce)` and mention "
-            + "@deepseek asking for `DEEPSEEK_ACK_\(nonce)`. Do nothing else."
+        let brief = "Follow these instructions exactly. "
+            + "Devin: use the workshop_post_message tool to post a message whose "
+            + "body mentions @kimi and asks Kimi to reply with `KIMI_ACK_\(nonce)`. "
+            + "Kimi: when woken, use workshop_post_message to post a reply whose "
+            + "body contains `KIMI_ACK_\(nonce)` AND the mention @deepseek, asking "
+            + "DeepSeek to reply with `DEEPSEEK_ACK_\(nonce)`. "
+            + "DeepSeek: when woken, use workshop_post_message to post a reply "
+            + "whose body contains `DEEPSEEK_ACK_\(nonce)`. "
+            + "Everyone: do nothing else."
         let receipt = try await runtime.service.createTask(CreateTaskRequest(
             idempotencyKey: "live-peer-\(nonce)",
             title: "Live peer roundtrip", objective: brief,
@@ -267,21 +283,30 @@ final class LiveSmokeTests: XCTestCase {
                 ms.contains {
                     $0.author == .engineer(engineer)
                         && $0.deliveryState == .committed
+                        && $0.seq > maxSeq + 1 // newer than the user reply
                         && $0.body.contains(nonce) }
             }
             packetLock.lock()
             let packet = packets[engineer]
             packetLock.unlock()
             recalledBy[engineer] = recalled
+            // The nonce alone appears verbatim in the task brief, so the
+            // meaningful check is that the earlier posted message line
+            // ("[seq] <name>: <marker>") is absent from the packet.
+            let marker = "WORKSHOP_LIVE_\(engineer.rawValue.uppercased())_OK_\(nonce)"
+            let leaked = packet?.contains(": \(marker)") ?? false
             results[engineer.rawValue] = .object([
                 "nonce": .string(nonce),
                 "recalled": .bool(recalled),
-                "packet_omitted_nonce": .bool(packet?.contains(nonce) == false),
+                "packet_captured": .bool(packet != nil),
+                "packet_omitted_prior_message": .bool(packet != nil && !leaked),
             ])
-            // Packet must not contain the nonce (native memory is being tested).
-            XCTAssertNotNil(packet)
-            XCTAssertFalse(packet!.contains(nonce),
-                           "packet leaked the nonce — test is vacuous")
+            if let packet {
+                XCTAssertFalse(leaked,
+                               "packet contains the earlier posted message — test is vacuous")
+            } else {
+                XCTFail("no turn ran for \(engineer.rawValue) after restart")
+            }
         }
         record("L-restart", results)
         for engineer in subjects {

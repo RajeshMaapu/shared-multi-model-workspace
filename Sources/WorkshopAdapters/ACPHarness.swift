@@ -27,6 +27,9 @@ public struct HarnessLaunchSpec: Sendable {
     public var modelSelection: String?
     /// Binary to version-probe when `executable` is a launcher (sandbox-exec).
     public var versionProbePath: String?
+    /// Per-task worktree root (<home>/worktrees); when set the session cwd is
+    /// <worktreeRoot>/<task_id>, created on demand.
+    public var worktreeRoot: String?
 
     /// argv for spawning: [executable] + args.
     public var argv: [String] { [executable] + args }
@@ -45,6 +48,7 @@ public struct HarnessLaunchSpec: Sendable {
         self.qualifiedVersion = qualifiedVersion
         self.modelSelection = modelSelection
         self.versionProbePath = nil
+        self.worktreeRoot = nil
     }
 }
 
@@ -53,7 +57,7 @@ public struct HarnessLaunchSpec: Sendable {
 public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     public let engineer: EngineerID
     private let spec: HarnessLaunchSpec
-    private let transportFactory: @Sendable (HarnessLaunchSpec) throws -> ACPTransport
+    private let transportFactory: @Sendable (HarnessLaunchSpec, String) throws -> ACPTransport
     private let versionProbe: @Sendable (String) -> String?
     private let lock = NSLock()
     private var client: ACPClient?
@@ -65,8 +69,8 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     private let log = Logger(subsystem: "ai.maapu.workshop", category: "adapter")
 
     public init(spec: HarnessLaunchSpec,
-                transportFactory: @escaping @Sendable (HarnessLaunchSpec) throws -> ACPTransport
-                    = { try ProcessACPTransport(argv: $0.argv, env: $0.env, cwd: $0.cwd) },
+                transportFactory: @escaping @Sendable (HarnessLaunchSpec, String) throws -> ACPTransport
+                    = { try ProcessACPTransport(argv: $0.argv, env: $0.env, cwd: $1) },
                 versionProbe: @escaping @Sendable (String) -> String?
                     = ACPHarnessAdapter.defaultVersionProbe) {
         self.engineer = spec.engineer
@@ -124,9 +128,9 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     }
 
     public func openTaskSession(binding: SessionBinding) async throws -> SessionRef {
-        try await ensureClient()
-        guard let client else { throw WorkshopError.adapterUnavailable(engineer) }
         let cwd = sessionCwd(for: binding)
+        try await ensureClient(cwd: cwd)
+        guard let client else { throw WorkshopError.adapterUnavailable(engineer) }
         if spec.mcpInjection == .devinProjectConfigFile {
             writeDevinMCPConfig(cwd: cwd)
         }
@@ -161,9 +165,16 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         return id
     }
 
-    /// Directory the harness session runs in; the task worktree when known.
+    /// Directory the harness session runs in: the per-task worktree when a
+    /// worktree root is configured, else the spec cwd.
     private func sessionCwd(for binding: SessionBinding) -> String {
-        spec.cwd
+        guard let root = spec.worktreeRoot else { return spec.cwd }
+        let home = (root as NSString).deletingLastPathComponent
+        if let (path, _) = try? WorkspaceManager.prepareWorkspace(
+            homeDir: home, taskID: binding.taskID, workspaceRef: nil) {
+            return path
+        }
+        return spec.cwd
     }
 
     /// Bridge path + token file: the launch spec's env first (set by
@@ -225,7 +236,7 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         }
     }
 
-    private func ensureClient() async throws {
+    private func ensureClient(cwd: String) async throws {
         // Terminate a warm process after the idle bound.
         lock.lock()
         let stale = client != nil && Date().timeIntervalSince(lastActivity) > 600
@@ -235,7 +246,7 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
             lock.lock(); client = nil; sessionID = nil; lock.unlock()
         }
         guard client == nil else { return }
-        let transport = try transportFactory(spec)
+        let transport = try transportFactory(spec, cwd)
         let c = ACPClient(transport: transport)
         client = c
         _ = try await c.call("initialize", params: .object([
@@ -257,6 +268,7 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         lock.unlock()
         return AsyncThrowingStream { continuation in
             Task {
+                var usageEmitted = false
                 guard let client else {
                     continuation.finish(throwing: WorkshopError.adapterUnavailable(engineer))
                     return
@@ -270,6 +282,16 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                 // prompt result resumes this task (ordering, not racing).
                 await client.setEventSink { event in
                     if case .sessionUpdate(let u) = event {
+                        if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
+                           let data = try? JSONEncoder().encode(u) {
+                            let p = dir + "/acp-updates-\(self.engineer.rawValue).log"
+                            let line = String(decoding: data, as: UTF8.self) + "\n"
+                            if let fh = FileHandle(forWritingAtPath: p) {
+                                fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
+                            } else {
+                                FileManager.default.createFile(atPath: p, contents: Data(line.utf8))
+                            }
+                        }
                         switch u["sessionUpdate"]?.stringValue {
                         case "agent_message_chunk":
                             if let t = u["content"]?["text"]?.stringValue {
@@ -298,13 +320,32 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                         "prompt": .array([.object([
                             "type": .string("text"), "text": .string(packet)])]),
                     ]))
+                    if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
+                       let data = try? JSONEncoder().encode(result) {
+                        let p = dir + "/acp-prompt-result-\(self.engineer.rawValue).log"
+                        let line = String(decoding: data, as: UTF8.self) + "\n"
+                        if let fh = FileHandle(forWritingAtPath: p) {
+                            fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
+                        } else {
+                            FileManager.default.createFile(atPath: p, contents: Data(line.utf8))
+                        }
+                    }
                     if let usage = result["usage"] {
+                        usageEmitted = true
                         continuation.yield(.usageSample(
                             input: usage["inputTokens"]?.intValue.map(Int.init),
                             output: usage["outputTokens"]?.intValue.map(Int.init),
                             cacheRead: usage["cachedReadTokens"]?.intValue.map(Int.init),
                             cacheWrite: usage["cachedWriteTokens"]?.intValue.map(Int.init),
                             source: source))
+                    }
+                    if !usageEmitted {
+                        // Some ACP servers (Kimi) report no usage; still record
+                        // a row so callers can distinguish "unmeasured" from
+                        // "turn never ran".
+                        continuation.yield(.usageSample(
+                            input: nil, output: nil, cacheRead: nil,
+                            cacheWrite: nil, source: source))
                     }
                     continuation.yield(.turnCompleted)
                     continuation.finish()

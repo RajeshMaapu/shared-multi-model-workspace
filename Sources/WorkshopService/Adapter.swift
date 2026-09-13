@@ -67,6 +67,7 @@ public struct TurnContext: Sendable {
             + "local macOS community workspace: Devin, Kimi, and DeepSeek.")
         lines.append("Use workshop_post_message to speak; mention @devin, @kimi, or "
             + "@deepseek to wake a peer. Do not post secrets.")
+        lines.append("The task_id for Workshop tool calls is \(task.id.rawValue).")
         if let subtask {
             lines.append("You are owner/participant of subtask \(subtask.id.rawValue) "
                 + "\"\(subtask.title)\" (generation \(subtask.generation)).")

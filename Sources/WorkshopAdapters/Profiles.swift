@@ -154,6 +154,7 @@ public enum ProfileBuilder {
             mcpInjection: .devinProjectConfigFile,
             qualifiedVersion: "3000.10.21", modelSelection: model)
         spec.versionProbePath = paths.devinBinary
+        spec.worktreeRoot = paths.home + "/worktrees"
         return (spec, sb)
     }
 
@@ -171,10 +172,12 @@ public enum ProfileBuilder {
         env["WORKSHOP_MCP_PATH"] = paths.mcpBridge
         env["WORKSHOP_TOKEN_KIMI"] = profile + "/token"
         if let rt = paths.runtimeDir { env["WORKSHOP_RUNTIME_DIR"] = rt }
-        return HarnessLaunchSpec(
+        var spec = HarnessLaunchSpec(
             engineer: .kimi, executable: paths.kimiBinary, args: ["acp"],
             env: env, cwd: worktree,
             mcpInjection: .acpSessionParam,
             qualifiedVersion: "0.42.0", modelSelection: "kimi-code/k3")
+        spec.worktreeRoot = paths.home + "/worktrees"
+        return spec
     }
 }

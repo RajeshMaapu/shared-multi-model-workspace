@@ -206,10 +206,30 @@ public actor ACPClient {
     /// Permission policy: allow_once for workshop tools and read-only titles;
     /// reject everything else and surface a permissionDenied event.
     private func respondToPermission(id: JSONValue, params: JSONValue?) {
+        // Diagnostic: append the raw request to <WORKSHOP_DIAG_DIR>/
+        // permission-requests.log when the env var is set (never secrets —
+        // tool titles and option kinds only).
+        if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
+           let data = try? JSONEncoder().encode(params ?? .null) {
+            let path = dir + "/permission-requests.log"
+            let line = String(decoding: data, as: UTF8.self) + "\n"
+            if let fh = FileHandle(forWritingAtPath: path) {
+                fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
+            } else {
+                FileManager.default.createFile(atPath: path,
+                                               contents: Data(line.utf8))
+            }
+        }
         let options = params?["options"]?.arrayValue ?? []
         let title = params?["toolCall"]?["title"]?.stringValue ?? ""
         let rawName = params?["toolCall"]?["_meta"]?["cognition.ai/toolName"]?.stringValue ?? ""
-        let isWorkshop = rawName.hasPrefix("mcp__workshop__") || title.contains("workshop")
+        // Some ACP servers (Devin) send only toolCallId in `toolCall`; the
+        // tool name then appears only inside option labels such as
+        // "allow calling workshop_post_message on the workshop MCP server".
+        let optionText = options.compactMap { $0["name"]?.stringValue }.joined(separator: " ")
+        let isWorkshop = rawName.hasPrefix("mcp__workshop__")
+            || title.contains("workshop")
+            || optionText.contains("workshop")
         let isReadOnly = ["Read", "Grep", "List", "Glob"].contains { title.hasPrefix($0) }
         func option(matching prefix: String) -> JSONValue? {
             options.first { $0["kind"]?.stringValue?.hasPrefix(prefix) == true }

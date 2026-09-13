@@ -995,6 +995,16 @@ public actor CollaborationService {
             }
         } catch {
             log.error("openTaskSession failed for \(engineer.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            _ = attempt("openFailedEvent") {
+                try repo.insertMessage(Message(
+                    id: MessageID(newID("msg")), taskID: task.id,
+                    seq: try repo.nextMessageSeq(task.id), author: .system,
+                    kind: .systemEvent,
+                    body: "Turn could not start for \(engineer.displayName): "
+                        + error.localizedDescription,
+                    deliveryState: .committed, createdAt: timestamp,
+                    updatedAt: timestamp))
+            }
             return
         }
 

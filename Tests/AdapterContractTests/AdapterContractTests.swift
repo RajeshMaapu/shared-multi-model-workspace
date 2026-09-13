@@ -89,7 +89,7 @@ final class AdapterContractTests: XCTestCase {
     func testStreamMappingToAdapterEvents() async throws {
         let transport = FakeACPTransport(responder: happyResponder())
         let adapter = ACPHarnessAdapter(
-            spec: spec(), transportFactory: { _ in transport })
+            spec: spec(), transportFactory: { _, _ in transport })
         let ref = try await adapter.openTaskSession(binding: binding())
         XCTAssertEqual(ref.nativeSessionID, "sess-1")
         let task = WorkshopTask(id: TaskID("task_x"), channel: "main", title: "T",
@@ -176,7 +176,7 @@ final class AdapterContractTests: XCTestCase {
                 return []
             }
         }
-        let adapter = ACPHarnessAdapter(spec: spec(), transportFactory: { _ in transport })
+        let adapter = ACPHarnessAdapter(spec: spec(), transportFactory: { _, _ in transport })
         let ref = try await adapter.openTaskSession(binding: binding(native: "stale-1"))
         XCTAssertEqual(ref.nativeSessionID, "fresh-1")
         // The fallback is surfaced as an .uncertain note at the start of the
@@ -199,7 +199,7 @@ final class AdapterContractTests: XCTestCase {
         let transport = FakeACPTransport(responder: happyResponder())
         let adapter = ACPHarnessAdapter(
             spec: spec(injection: .acpSessionParam, engineer: .kimi),
-            transportFactory: { _ in transport })
+            transportFactory: { _, _ in transport })
         _ = try await adapter.openTaskSession(binding: binding())
         let sessionNew = transport.sentLines
             .first { self.json($0)["method"]?.stringValue == "session/new" }
@@ -212,7 +212,7 @@ final class AdapterContractTests: XCTestCase {
         let transport = FakeACPTransport(responder: happyResponder())
         let adapter = ACPHarnessAdapter(
             spec: spec(injection: .devinProjectConfigFile, engineer: .devin),
-            transportFactory: { _ in transport })
+            transportFactory: { _, _ in transport })
         _ = try await adapter.openTaskSession(binding: binding())
         let path = dir + "/.devin/mcp_config.local.json"
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
@@ -235,7 +235,7 @@ final class AdapterContractTests: XCTestCase {
     }
 
     func testProbeUntestedVersionReported() async throws {
-        let adapter = ACPHarnessAdapter(spec: spec()) { _ in
+        let adapter = ACPHarnessAdapter(spec: spec()) { _, _ in
             FakeACPTransport(responder: self.happyResponder())
         } versionProbe: { _ in "9.9.9" }
         let probe = await adapter.probe()
