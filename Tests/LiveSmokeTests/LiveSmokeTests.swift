@@ -1,5 +1,6 @@
 import XCTest
 import WorkshopDaemonKit
+import WorkshopAdapters
 import WorkshopService
 import WorkshopStore
 import WorkshopCore
@@ -442,6 +443,23 @@ final class LiveSmokeTests: XCTestCase {
                                                       with: "phase3")
         try? md.write(toFile: dir + "/live-l6.md", atomically: true,
                       encoding: .utf8)
+    }
+
+    /// L7 (Phase 4): the single approved live call — one bounded DeepSeek
+    /// balance query. Records availability + currency only; no account ids,
+    /// no balance figure.
+    func testL7DeepSeekBalance() async throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["WORKSHOP_LIVE"] == "1",
+            "WORKSHOP_LIVE not set")
+        let snapshot = await DeepSeekAdapter.balanceProbe(
+            home: NSTemporaryDirectory(), observedAt: Date())
+        record("deepseek-balance", [
+            "available": .string(snapshot?.availability ?? "unreachable"),
+            "currency": snapshot?.unit.map(JSONValue.string) ?? .null,
+            "source": .string(snapshot?.source ?? "deepseek:/user/balance"),
+        ], phase: "phase4")
+        XCTAssertNotNil(snapshot, "balance probe returned nothing")
     }
 
     override class func tearDown() {

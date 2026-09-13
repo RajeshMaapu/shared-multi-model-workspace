@@ -96,7 +96,10 @@ final class MCPTests: XCTestCase {
         XCTAssertTrue(names.contains("workshop_submit_report"))
         XCTAssertTrue(names.contains("workshop_assign_subtask"))
         XCTAssertTrue(names.contains("workshop_escalate_task"))
-        XCTAssertEqual(names.count, 17)
+        XCTAssertTrue(names.contains("workshop_acquire_lease"))
+        XCTAssertTrue(names.contains("workshop_renew_lease"))
+        XCTAssertTrue(names.contains("workshop_release_lease"))
+        XCTAssertEqual(names.count, 20)
     }
 
     func testUnknownToolIsError() async {

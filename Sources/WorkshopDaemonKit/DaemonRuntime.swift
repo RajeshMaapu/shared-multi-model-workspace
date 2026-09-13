@@ -24,6 +24,15 @@ public final class DaemonRuntime: @unchecked Sendable {
         public var qualified_binary_version: String?
         public var model_selection: String?
         public var executable: String?
+        /// §10 capacity policy (ADR 0012).
+        public var budget: Budget?
+    }
+    public struct Budget: Codable {
+        public var daily_token_cap: Int?
+        public var reserve_per_turn: Int?
+        public var low_pct: Int?
+        public var critical_pct: Int?
+        public var hysteresis_pct: Int?
     }
     public struct EngineersFile: Codable {
         public var schema_version: Int?
@@ -172,12 +181,31 @@ public final class DaemonRuntime: @unchecked Sendable {
                     ?? UnconfiguredAdapter(engineer: $0))
         }
         self.adapters = built
+        self.adaptersModeLive = Set(EngineerID.allCases.filter { !isFake($0) })
 
         let dbPath = home + "/db/workshop.sqlite"
+        var policies: [EngineerID: CapacityPolicy] = [:]
+        for engineer in EngineerID.allCases {
+            if let b = engineersConfig.engineer(engineer)?.budget {
+                policies[engineer] = CapacityPolicy(
+                    dailyTokenCap: b.daily_token_cap,
+                    reservePerTurn: b.reserve_per_turn ?? 30_000,
+                    lowPct: b.low_pct ?? 20, criticalPct: b.critical_pct ?? 10,
+                    hysteresisPct: b.hysteresis_pct ?? 5)
+            }
+        }
         let service = try CollaborationService(databasePath: dbPath,
-                                               adapters: built, homeDir: home)
+                                               adapters: built, homeDir: home,
+                                               capacityPolicies: policies)
         self.service = service
         Self.log("opened database at \(dbPath)")
+
+        // Register the resolved DeepSeek key with the Redactor (compare-only;
+        // never logged).
+        if let key = try? DeepSeekAdapter.readCredential() {
+            Redactor.shared.registerSecret(key)
+        }
+        self.pendingHome = home
 
         // DeepSeek executes Workshop tools directly against the service.
         if !isFake(.deepseek) {
@@ -208,6 +236,13 @@ public final class DaemonRuntime: @unchecked Sendable {
                         return #"{"error":"\#(error.message)"}"#
                     }
                 })
+            // Managed-history compaction summary comes from the latest valid
+            // checkpoint — no model call.
+            bound.checkpointSummary = { taskID in
+                guard let cp = try? await service.loadValidCheckpoint(
+                    taskID: taskID, engineerID: .deepseek) else { return nil }
+                return cp.content
+            }
             // Rebind without blocking init; the caller awaits readiness.
             self.deepseekRebind = bound
         }
@@ -306,6 +341,42 @@ public final class DaemonRuntime: @unchecked Sendable {
                     taskID: TaskID(params?["task_id"]?.stringValue ?? ""),
                     principal: principal)
                 return .object(["ok": .bool(true)])
+            case WorkshopProtocol.reassignSubtask:
+                let sub = SubtaskID(params?["subtask_id"]?.stringValue ?? "")
+                guard let ownerRaw = params?["owner"]?.stringValue,
+                      let owner = EngineerID(rawValue: ownerRaw) else {
+                    throw WorkshopError.invalidRequest("owner required")
+                }
+                try await service.reassignSubtask(subtaskID: sub, newOwner: owner,
+                                                  principal: principal)
+                return .object(["ok": .bool(true)])
+            case WorkshopProtocol.diagnostics:
+                return await service.diagnostics()
+            case WorkshopProtocol.readMessagePage:
+                let id = TaskID(params?["task_id"]?.stringValue ?? "")
+                let beforeSeq = params?["before_seq"]?.intValue
+                let limit = Int(params?["limit"]?.intValue ?? 500)
+                return try .from(try await service.readMessagePage(
+                    id, beforeSeq: beforeSeq, limit: limit))
+            case WorkshopProtocol.recoverySummary:
+                let id = TaskID(params?["task_id"]?.stringValue ?? "")
+                return try await service.recoverySummary(taskID: id)
+                    .map(JSONValue.string) ?? .null
+            case WorkshopProtocol.search:
+                let query = params?["query"]?.stringValue ?? ""
+                let limit = Int(params?["limit"]?.intValue ?? 50)
+                return try .from(try await service.search(query: query, limit: limit))
+            case WorkshopProtocol.exportTask:
+                let id = TaskID(params?["task_id"]?.stringValue ?? "")
+                guard let dest = params?["dest_dir"]?.stringValue else {
+                    throw WorkshopError.invalidRequest("dest_dir required")
+                }
+                return try await service.exportTask(taskID: id, destDir: dest)
+            case WorkshopProtocol.backup:
+                guard let dest = params?["dest_dir"]?.stringValue else {
+                    throw WorkshopError.invalidRequest("dest_dir required")
+                }
+                return try await service.backup(destDir: dest)
             default:
                 if method.hasPrefix("workshop_"),
                    WorkshopToolCatalog.method(for: method) != nil
@@ -366,10 +437,26 @@ public final class DaemonRuntime: @unchecked Sendable {
 
     /// Listen on the socket, bind the DeepSeek adapter, broadcast events, and
     /// start service recovery/dispatch.
+    private var pendingHome: String?
+    private var adaptersModeLive: Set<EngineerID> = []
+
     public func start() async throws {
         if let bound = deepseekRebind {
             await service.registerAdapter(bound)
             deepseekRebind = nil
+        }
+        if let home = pendingHome {
+            // Bounded balance probe (one GET /user/balance, ≤ every 10 min).
+            await service.setBalanceProbe { engineer in
+                guard engineer == .deepseek else { return nil }
+                return await DeepSeekAdapter.balanceProbe(home: home,
+                                                        observedAt: Date())
+            }
+            pendingHome = nil
+        }
+        await service.installSleepWakeHooks()
+        if adaptersModeLive.contains(.deepseek) {
+            await service.refreshDeepSeekBalance()
         }
         try server.start()
         Self.log("listening on \(socketPath)")

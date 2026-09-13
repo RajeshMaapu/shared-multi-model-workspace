@@ -35,6 +35,7 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
 
     private struct State {
         var turnCount = 0
+        var probeCount = 0
         var contexts: [TurnContext] = []
         var cancelledTurns: [String] = []
     }
@@ -52,8 +53,11 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
     public var turnCount: Int { state.with { $0.turnCount } }
     public var receivedContexts: [TurnContext] { state.with { $0.contexts } }
 
+    public var probeCount: Int { state.with { $0.probeCount } }
+
     public func probe() async -> AdapterProbe {
-        AdapterProbe(
+        state.with { $0.probeCount += 1 }
+        return AdapterProbe(
             engineer: engineer,
             health: scriptedHealth,
             versions: ["adapter": "fake-1"],
@@ -137,8 +141,12 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
         }
     }
 
-    public func cancelTurn(ref: SessionRef, turnID: String) async {
+    /// When false, cancelTurn reports uncertain (no acknowledgement) — T23.
+    public var cancelAcknowledged = true
+
+    public func cancelTurn(ref: SessionRef, turnID: String) async -> Bool {
         state.with { $0.cancelledTurns.append(turnID) }
+        return cancelAcknowledged
     }
 }
 
@@ -183,5 +191,5 @@ public struct UnconfiguredAdapter: EngineerAdapter {
         AsyncThrowingStream { $0.finish(throwing: WorkshopError.adapterUnavailable(engineer)) }
     }
 
-    public func cancelTurn(ref: SessionRef, turnID: String) async {}
+    public func cancelTurn(ref: SessionRef, turnID: String) async -> Bool { false }
 }

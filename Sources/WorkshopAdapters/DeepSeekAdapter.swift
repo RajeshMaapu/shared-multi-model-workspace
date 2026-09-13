@@ -9,17 +9,24 @@ public protocol HTTPTransport: Sendable {
 }
 
 public struct URLSessionHTTPTransport: HTTPTransport {
-    public init() {}
+    private let session: URLSession
+    public init(session: URLSession = URLSession(configuration: .ephemeral)) {
+        self.session = session
+    }
     public func postJSON(url: URL, headers: [String: String],
                          body: [String: JSONValue]) async throws -> (status: Int, body: JSONValue) {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
         request.httpBody = try JSONEncoder().encode(JSONValue.object(body))
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         let json = (try? JSONDecoder().decode(JSONValue.self, from: data)) ?? .null
         return (status, json)
+    }
+    /// Cancels in-flight requests (T23 cancellation acknowledgement).
+    public func cancelAll() async {
+        await session.allTasks.forEach { $0.cancel() }
     }
 }
 
@@ -37,6 +44,9 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
     private let endpoint: URL
     private let maxIterations = 8
     private let maxTokens = 4000
+    /// Checkpoint-derived summary provider for managed-history compaction
+    /// (§6.3); wired by the daemon, nil in bare adapter tests.
+    public var checkpointSummary: (@Sendable (TaskID) async -> String?)?
 
     /// `keyReader` returns the API key at request time (credential reference);
     /// `toolExecutor` runs a workshop tool and returns result JSON text.
@@ -127,6 +137,25 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
         return arr
     }
 
+    /// Managed-history compaction: beyond 60 messages or ~200k chars, drop
+    /// everything older than the last 20 and prepend a checkpoint-derived
+    /// summary (NO model call). Returns the compacted history plus whether
+    /// compaction ran.
+    func compactedHistory(_ history: [JSONValue], taskID: TaskID) async -> ([JSONValue], Bool) {
+        let chars = history.reduce(0) {
+            $0 + ((try? JSONEncoder().encode($1))?.count ?? 0)
+        }
+        guard history.count > 60 || chars > 200_000 else { return (history, false) }
+        var kept = Array(history.suffix(20))
+        let summary = (await checkpointSummary?(taskID))
+            ?? "Earlier turns compacted; re-read the task state via workshop_get_task."
+        kept.insert(.object([
+            "role": .string("system"),
+            "content": .string("[Workshop compaction summary] " + summary),
+        ]), at: 0)
+        return (kept, true)
+    }
+
     private func saveHistory(_ ref: SessionRef, _ messages: [JSONValue]) {
         let path = historyPath(ref)
         try? FileManager.default.createDirectory(
@@ -164,6 +193,14 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
         async throws {
         let key = try keyReader()
         var history = loadHistory(ref)
+        let (compacted, didCompact) = await compactedHistory(history,
+                                                             taskID: context.task.id)
+        if didCompact {
+            history = compacted
+            saveHistory(ref, history)
+            continuation.yield(.uncertain(
+                "DeepSeek session compacted (cache prefix reset)"))
+        }
         var messages: [JSONValue] = history
         if messages.isEmpty {
             messages.append(.object([
@@ -268,7 +305,37 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
         throw Failure.transport("tool loop iteration cap reached")
     }
 
-    public func cancelTurn(ref: SessionRef, turnID: String) async {
-        // URLSession tasks are bounded by the turn deadline; nothing persistent.
+    /// Bounded balance probe (§10): GET /user/balance → a quota snapshot with
+    /// remaining = total_balance and unit = currency. Availability only; no
+    /// account ids are read or stored. 10 s timeout.
+    public static func balanceProbe(home: String, observedAt: Date) async -> QuotaSnapshot? {
+        guard let key = try? readCredential() else { return nil }
+        var request = URLRequest(url: URL(string: "https://api.deepseek.com/user/balance")!)
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 10
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONDecoder().decode(JSONValue.self, from: data),
+              let info = json["balance_infos"]?.arrayValue?.first,
+              let balance = info["total_balance"]?.stringValue else {
+            return QuotaSnapshot(bucket: "deepseek", remaining: "unknown",
+                                 source: "deepseek:/user/balance",
+                                 observedAt: observedAt, availability: "unknown")
+        }
+        let currency = info["currency"]?.stringValue
+        let available: Bool
+        if case .bool(let b) = info["is_available"] { available = b } else { available = true }
+        return QuotaSnapshot(bucket: "deepseek", remaining: balance,
+                             unit: currency, source: "deepseek:/user/balance",
+                             observedAt: observedAt,
+                             availability: available ? "available" : "limited")
+    }
+
+    /// T23: cancelling the in-flight URLSession task is the acknowledgement.
+    public func cancelTurn(ref: SessionRef, turnID: String) async -> Bool {
+        if let urlTransport = transport as? URLSessionHTTPTransport {
+            await urlTransport.cancelAll()
+        }
+        return true
     }
 }

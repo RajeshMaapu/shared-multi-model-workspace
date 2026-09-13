@@ -28,6 +28,14 @@ public enum WorkshopProtocol {
     public static let cancelTask = "workshop.cancelTask"
     public static let acceptTask = "workshop.acceptTask"
     public static let convertToResearch = "workshop.convertToResearch"
+    // Phase 4: resilience + inspectability (§9.2, §10, §14.1–14.5).
+    public static let reassignSubtask = "workshop.reassignSubtask"
+    public static let diagnostics = "workshop.diagnostics"
+    public static let search = "workshop.search"
+    public static let readMessagePage = "workshop.readMessagePage"
+    public static let recoverySummary = "workshop.recoverySummary"
+    public static let exportTask = "workshop.exportTask"
+    public static let backup = "workshop.backup"
 
     // Collaboration tool methods (spec §8.3); callable over IPC with an
     // authenticated engineer principal.
@@ -62,8 +70,11 @@ public enum WorkshopProtocol {
         public static let idempotencyConflict = -32009
         /// Engineer principal is not a participant of the task.
         public static let notAParticipant = -32003
-        /// Caller is not the current owner of the subtask.
+        /// Caller is not the current owner of the subtask, or the supplied
+        /// ownership generation is stale (T05 fencing).
         public static let notOwner = -32004
+        /// Storage critically low; write refused (T30).
+        public static let storageLow = -32010
         /// Action reserved to the user principal (or the allocation arbiter).
         public static let userAuthorityRequired = -32005
         /// Substantial task: implementation requires a current approval.

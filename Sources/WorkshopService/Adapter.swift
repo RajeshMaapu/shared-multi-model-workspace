@@ -50,16 +50,19 @@ public struct TurnContext: Sendable {
     public var wakeDetail: String?
     /// Note about omitted older messages, if the context was truncated.
     public var truncatedNote: String?
+    /// Ask the turn to end with workshop_save_checkpoint (§6.3 stop-request).
+    public var checkpointRequest: Bool
 
     public init(task: WorkshopTask, subtask: Subtask?, recentMessages: [Message],
                 wakeReason: String? = nil, wakeDetail: String? = nil,
-                truncatedNote: String? = nil) {
+                truncatedNote: String? = nil, checkpointRequest: Bool = false) {
         self.task = task
         self.subtask = subtask
         self.recentMessages = recentMessages
         self.wakeReason = wakeReason
         self.wakeDetail = wakeDetail
         self.truncatedNote = truncatedNote
+        self.checkpointRequest = checkpointRequest
     }
 
     /// Render the turn context packet (spec §G): stable header, task brief,
@@ -75,6 +78,9 @@ public struct TurnContext: Sendable {
         if let subtask {
             lines.append("You are owner/participant of subtask \(subtask.id.rawValue) "
                 + "\"\(subtask.title)\" (generation \(subtask.generation)).")
+            lines.append("ownership_generation: \(subtask.generation) — pass this as "
+                + "\"generation\" to workshop_report_result and "
+                + "workshop_publish_artifact; stale generations are fenced.")
         } else {
             lines.append("You are a participant of this task (no owned subtask).")
         }
@@ -147,12 +153,24 @@ public struct TurnContext: Sendable {
             case "changes_requested":
                 lines.append("Verification requested changes on your subtask; "
                     + "address them and report again via workshop_report_result.")
+            case "resume_from_checkpoint":
+                lines.append("Your previous turn was interrupted. The wake detail "
+                    + "carries your last valid checkpoint JSON — re-read the task's "
+                    + "artifacts via workshop_get_task before editing anything, then "
+                    + "continue from next_action.")
             default: lines.append("Wakeup reason: \(wakeReason)")
             }
             if let wakeDetail, !wakeDetail.isEmpty {
                 lines.append("")
                 lines.append(wakeDetail)
             }
+        }
+        if checkpointRequest {
+            lines.append("")
+            lines.append("Stop requested: end this turn by saving your working state "
+                + "via workshop_save_checkpoint (schema_version 1: objective, "
+                + "completed, decisions, artifacts, validation, unresolved, "
+                + "next_action, last_read_message_seq).")
         }
         return lines.joined(separator: "\n")
     }
@@ -183,5 +201,10 @@ public protocol EngineerAdapter: Sendable {
     func openTaskSession(binding: SessionBinding) async throws -> SessionRef
     func sendTurn(ref: SessionRef, turnID: String, context: TurnContext,
                   deadline: Date) -> AsyncThrowingStream<AdapterEvent, Error>
-    func cancelTurn(ref: SessionRef, turnID: String) async
+    /// Request cancellation of a running turn (T23).
+    /// Returns true when the harness acknowledged (prompt ended with a
+    /// cancelled stop reason / HTTP task cancelled); false when the turn's
+    /// outcome is uncertain (caller escalates to process-group kill).
+    @discardableResult
+    func cancelTurn(ref: SessionRef, turnID: String) async -> Bool
 }

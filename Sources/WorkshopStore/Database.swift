@@ -33,8 +33,11 @@ public typealias Row = [String: SQLiteValue]
 /// Thin SQLite wrapper. NOT thread-safe: must be owned by a single actor.
 public final class Database {
     private var handle: OpaquePointer?
+    /// File path (":memory:" for in-memory test databases).
+    public let path: String
 
     public init(path: String) throws {
+        self.path = path
         var h: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(path, &h, flags, nil) == SQLITE_OK, let h else {
@@ -45,7 +48,11 @@ public final class Database {
         handle = h
         sqlite3_busy_timeout(h, 5000)
         try execute("PRAGMA journal_mode=WAL")
-        try execute("PRAGMA synchronous=FULL")
+        // Shipped config is FULL. NORMAL exists only for the latency bench's
+        // comparison run (§10.3) — never set it in production paths.
+        let syncNormal = ProcessInfo.processInfo
+            .environment["WORKSHOP_BENCH_SYNC_NORMAL"] == "1"
+        try execute("PRAGMA synchronous=\(syncNormal ? "NORMAL" : "FULL")")
         try execute("PRAGMA foreign_keys=ON")
     }
 

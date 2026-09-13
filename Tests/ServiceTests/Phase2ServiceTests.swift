@@ -97,6 +97,7 @@ final class Phase2ServiceTests: XCTestCase {
             _ = try await svc.callTool("workshop_report_result", args: .object([
                 "task_id": .string(taskID.rawValue),
                 "subtask_id": .string(subID.rawValue),
+                "generation": .number(1),
                 "summary": .string("done")]), principal: .engineer(.kimi))
             XCTFail("expected notOwner")
         } catch WorkshopError.notOwner {}
@@ -109,6 +110,7 @@ final class Phase2ServiceTests: XCTestCase {
             "task_id": .string(taskID.rawValue),
             "subtask_id": .string(subID.rawValue),
             "summary": .string("all done"),
+            "generation": .number(1),
             "artifact_ids": .array([.string("art_1")]),
             "validation": .array([.object(["command": .string("swift test"),
                                            "result": .string("pass")])]),
@@ -296,7 +298,11 @@ final class Phase2ServiceTests: XCTestCase {
         let result = try await svc.callTool("workshop_save_checkpoint", args: .object([
             "task_id": .string(taskID.rawValue),
             "schema_version": .number(1),
-            "content": .object(["note": .string("halfway")]),
+            "objective": .string("halfway"),
+            "completed": .array([]), "decisions": .array([]),
+            "artifacts": .array([]), "validation": .array([]),
+            "unresolved": .array([]), "next_action": .string("continue"),
+            "last_read_message_seq": .number(0),
         ]), principal: .engineer(.kimi))
         XCTAssertNotNil(result["checkpoint_id"]?.intValue)
     }

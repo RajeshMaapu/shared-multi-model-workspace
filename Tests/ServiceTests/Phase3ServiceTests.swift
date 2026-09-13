@@ -416,6 +416,7 @@ final class Phase3ServiceTests: XCTestCase {
         _ = try await svc.callTool("workshop_report_result", args: .object([
             "task_id": .string(taskID.rawValue),
             "subtask_id": .string(write.id.rawValue),
+            "generation": .number(1),
             "summary": .string("note written")]), principal: .engineer(.kimi))
         let verify = try await svc.wakeupsForTest(taskID)
             .filter { $0.reason.hasPrefix("verify_result") }

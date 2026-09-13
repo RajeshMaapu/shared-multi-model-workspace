@@ -63,6 +63,10 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     private var client: ACPClient?
     private var sessionID: String?
     private var lastActivity = Date.distantPast
+    /// turnID → waiter resumed when the in-flight session/prompt call returns
+    /// (T23 cancel acknowledgement) and turns whose prompt already finished.
+    private var promptWaiters: [String: CheckedContinuation<Void, Never>] = [:]
+    private var promptFinished: Set<String> = []
     /// Notes produced outside a turn stream (e.g. session/load fallback);
     /// emitted as `.uncertain` at the start of the next sendTurn.
     private var pendingNotes: [String] = []
@@ -356,6 +360,29 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                     continuation.finish(throwing: error)
                 }
                 self.touchActivity()
+                self.finishPrompt(turnID: turnID)
+            }
+        }
+    }
+
+    private func finishPrompt(turnID: String) {
+        lock.lock()
+        promptFinished.insert(turnID)
+        let waiter = promptWaiters.removeValue(forKey: turnID)
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    /// Resolves when the turn's session/prompt call returns (any outcome).
+    private func awaitPromptFinish(turnID: String) async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if promptFinished.contains(turnID) {
+                lock.unlock()
+                c.resume()
+            } else {
+                promptWaiters[turnID] = c
+                lock.unlock()
             }
         }
     }
@@ -364,10 +391,27 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         lock.lock(); lastActivity = Date(); lock.unlock()
     }
 
-    public func cancelTurn(ref: SessionRef, turnID: String) async {
-        // ACP cancellation lands with session/cancel when supported; always safe.
-        _ = try? await client?.call("session/cancel", params: .object([
+    /// T23: send session/cancel, then wait ≤10 s for the prompt call to
+    /// return. No response → kill the process group and report uncertain.
+    public func cancelTurn(ref: SessionRef, turnID: String) async -> Bool {
+        guard let client else { return false }
+        _ = try? await client.call("session/cancel", params: .object([
             "sessionId": .string(ref.nativeSessionID)]))
+        let acknowledged = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { await self.awaitPromptFinish(turnID: turnID); return true }
+            group.addTask { try? await Task.sleep(for: .seconds(10)); return false }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
+        if !acknowledged {
+            await client.close()
+            lock.lock()
+            self.client = nil
+            self.sessionID = nil
+            lock.unlock()
+        }
+        return acknowledged
     }
 }
 

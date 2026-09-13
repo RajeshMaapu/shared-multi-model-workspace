@@ -34,7 +34,7 @@ final class StoreTests: XCTestCase {
             try Migrations.all.migrate(db)
             let count = try db.query("SELECT COUNT(*) AS c FROM schema_migrations")
                 .first?["c"]?.int
-            XCTAssertEqual(count, 3)
+            XCTAssertEqual(count, 4)
         }
     }
 
@@ -139,6 +139,44 @@ final class MigrationV2Tests: XCTestCase {
             for table in ["artifacts", "usage_samples", "wakeups", "checkpoints"] {
                 _ = try db.query("SELECT COUNT(*) AS c FROM \(table)")
             }
+        }
+    }
+
+    func testV3ToV4PreservesData() throws {
+        let path = dir + "/mig34.sqlite"
+        do {
+            let db = try Database(path: path)
+            try Migrator(migrations: [Migrations.v1, Migrations.v2,
+                                      Migrations.v3]).migrate(db)
+            try db.execute("""
+                INSERT INTO tasks(id, channel, title, brief, phase, state,
+                                  created_at, updated_at)
+                VALUES('task_v3', 'main', 'old task', 'brief', 'execution',
+                       'queued', 't0', 't0')
+                """)
+            try db.execute("""
+                INSERT INTO checkpoints(task_id, engineer_id, role, worker_id,
+                                        generation, schema_version, content,
+                                        created_at)
+                VALUES('task_v3', 'devin', 'main', 'main', 0, 1, '{}', 't0')
+                """)
+        }
+        do {
+            let db = try Database(path: path)
+            try Migrator(migrations: [Migrations.v4]).migrate(db)
+            XCTAssertEqual(
+                try db.query("SELECT id FROM tasks").first?["id"]?.text,
+                "task_v3")
+            // v4 columns and tables exist.
+            XCTAssertEqual(
+                try db.query("SELECT valid FROM checkpoints").first?["valid"]?.int,
+                1)
+            for table in ["quota_snapshots", "reservations", "leases",
+                          "outbox_cursors", "turns"] {
+                _ = try db.query("SELECT COUNT(*) AS c FROM \(table)")
+            }
+            // artifacts.generation added.
+            _ = try db.query("SELECT generation FROM artifacts")
         }
     }
 }

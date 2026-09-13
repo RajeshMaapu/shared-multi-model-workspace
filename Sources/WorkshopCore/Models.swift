@@ -277,12 +277,14 @@ public struct Artifact: Codable, Equatable, Sendable, Identifiable {
     public var baseRevision: String?
     public var validation: String
     public var description: String?
+    /// Ownership generation the artifact was produced under (fencing, T05).
+    public var generation: Int?
     public var createdAt: Date
 
     public init(id: String, taskID: TaskID, contentHash: String, relativePath: String,
                 mime: String? = nil, producer: String, baseRevision: String? = nil,
                 validation: String = "unverified", description: String? = nil,
-                createdAt: Date) {
+                generation: Int? = nil, createdAt: Date) {
         self.id = id
         self.taskID = taskID
         self.contentHash = contentHash
@@ -292,6 +294,7 @@ public struct Artifact: Codable, Equatable, Sendable, Identifiable {
         self.baseRevision = baseRevision
         self.validation = validation
         self.description = description
+        self.generation = generation
         self.createdAt = createdAt
     }
 }
@@ -395,5 +398,125 @@ public struct OutboxEvent: Codable, Equatable, Sendable, Identifiable {
         self.deliveryState = deliveryState
         self.createdAt = createdAt
         self.deliveredAt = deliveredAt
+    }
+}
+
+// MARK: - Phase 4 models
+
+/// A capacity observation for an engineer's budget bucket (§10).
+public struct QuotaSnapshot: Codable, Equatable, Sendable, Identifiable {
+    public var id: Int64
+    public var bucket: String
+    /// Remaining as a decimal string, or "unknown" — never a guess.
+    public var remaining: String
+    public var unit: String?
+    public var resetAt: Date?
+    public var source: String
+    public var observedAt: Date
+    /// available | low | critical | limited | unknown
+    public var availability: String
+
+    public init(id: Int64 = 0, bucket: String, remaining: String,
+                unit: String? = nil, resetAt: Date? = nil, source: String,
+                observedAt: Date, availability: String) {
+        self.id = id
+        self.bucket = bucket
+        self.remaining = remaining
+        self.unit = unit
+        self.resetAt = resetAt
+        self.source = source
+        self.observedAt = observedAt
+        self.availability = availability
+    }
+}
+
+/// A pre-dispatch capacity reservation, reconciled to actual usage after the
+/// turn (§10, T13/T14).
+public struct Reservation: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var taskID: TaskID
+    public var engineerID: EngineerID
+    public var bucket: String
+    public var reserved: Int
+    public var committed: Int?
+    /// held | reconciled | released
+    public var state: String
+    public var expiresAt: Date
+    public var createdAt: Date
+
+    public init(id: String, taskID: TaskID, engineerID: EngineerID,
+                bucket: String, reserved: Int, committed: Int? = nil,
+                state: String = "held", expiresAt: Date, createdAt: Date) {
+        self.id = id
+        self.taskID = taskID
+        self.engineerID = engineerID
+        self.bucket = bucket
+        self.reserved = reserved
+        self.committed = committed
+        self.state = state
+        self.expiresAt = expiresAt
+        self.createdAt = createdAt
+    }
+}
+
+/// A named resource lease (browser/computer-use registry, §9.2, T24).
+/// Workshop exposes no browser tool itself; this registry coordinates
+/// whichever engineer's runtime has one (ADR 0014).
+public struct ResourceLease: Codable, Equatable, Sendable {
+    public var resource: String
+    public var owner: String
+    public var taskID: TaskID?
+    public var generation: Int
+    public var expiresAt: Date
+    public var url: String?
+    public var updatedAt: Date
+
+    public init(resource: String, owner: String, taskID: TaskID? = nil,
+                generation: Int = 1, expiresAt: Date, url: String? = nil,
+                updatedAt: Date) {
+        self.resource = resource
+        self.owner = owner
+        self.taskID = taskID
+        self.generation = generation
+        self.expiresAt = expiresAt
+        self.url = url
+        self.updatedAt = updatedAt
+    }
+
+    public func expired(at now: Date) -> Bool { expiresAt <= now }
+}
+
+/// One adapter turn (T05/T23/T29). Timing columns feed §14.5 latency layers.
+public struct Turn: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var taskID: TaskID
+    public var subtaskID: SubtaskID?
+    public var engineerID: EngineerID
+    public var generation: Int?
+    /// running | completed | failed | cancel_requested | cancelled |
+    /// interrupted | uncertain
+    public var state: String
+    public var startedAt: Date
+    public var firstEventAt: Date?
+    public var endedAt: Date?
+    public var nativeSessionID: String?
+    public var requestIDs: [String]
+
+    public init(id: String, taskID: TaskID, subtaskID: SubtaskID? = nil,
+                engineerID: EngineerID, generation: Int? = nil,
+                state: String = "running", startedAt: Date,
+                firstEventAt: Date? = nil, endedAt: Date? = nil,
+                nativeSessionID: String? = nil, requestIDs: [String] = []) {
+        self.id = id
+        self.taskID = taskID
+        self.subtaskID = subtaskID
+        self.engineerID = engineerID
+        self.generation = generation
+        self.state = state
+        self.startedAt = startedAt
+        self.firstEventAt = firstEventAt
+        self.endedAt = endedAt
+        self.nativeSessionID = nativeSessionID
+        self.requestIDs = requestIDs
     }
 }

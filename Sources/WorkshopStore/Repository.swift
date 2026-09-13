@@ -186,6 +186,33 @@ public final class WorkshopRepository {
             """, [.text(taskID.rawValue), .integer(afterSeq), .integer(Int64(limit))]).map(messageFrom)
     }
 
+    /// Newest-page / backwards paging for T31: beforeSeq nil → newest `limit`
+    /// rows; else the `limit` rows immediately before beforeSeq. Both return
+    /// ascending order; provisional seqs excluded.
+    public func messagePage(_ taskID: TaskID, beforeSeq: Int64? = nil,
+                            limit: Int = 500) throws -> [Message] {
+        let cap = min(limit, 500)
+        if let beforeSeq {
+            return try db.query("""
+                SELECT * FROM (
+                    SELECT * FROM messages
+                    WHERE task_id=? AND seq<? AND seq<?
+                    ORDER BY seq DESC LIMIT ?
+                ) ORDER BY seq
+                """, [.text(taskID.rawValue), .integer(beforeSeq),
+                      .integer(Self.provisionalSeqBase),
+                      .integer(Int64(cap))]).map(messageFrom)
+        }
+        return try db.query("""
+            SELECT * FROM (
+                SELECT * FROM messages
+                WHERE task_id=? AND seq<?
+                ORDER BY seq DESC LIMIT ?
+            ) ORDER BY seq
+            """, [.text(taskID.rawValue), .integer(Self.provisionalSeqBase),
+                  .integer(Int64(cap))]).map(messageFrom)
+    }
+
     public func message(_ id: MessageID) throws -> Message? {
         try db.query("SELECT * FROM messages WHERE id=?", [.text(id.rawValue)]).first.map(messageFrom)
     }
@@ -299,6 +326,73 @@ public final class WorkshopRepository {
         return db.changes() == 1
     }
 
+    /// Reassignment CAS (T05): replaces the owner regardless of prior owner,
+    /// bumping generation so stale results are fenced at the tool boundary.
+    public func reassignSubtask(_ id: SubtaskID, newOwner: EngineerID,
+                                expectedGeneration: Int, at now: Date) throws -> Bool {
+        try db.execute("""
+            UPDATE subtasks
+            SET owner_id=?, generation=generation+1, state='claimed',
+                lease_expires_at=NULL, updated_at=?
+            WHERE id=? AND generation=?
+            """, [
+                .text(newOwner.rawValue), .text(WorkshopTime.string(now)),
+                .text(id.rawValue), .integer(Int64(expectedGeneration)),
+            ])
+        return db.changes() == 1
+    }
+
+    /// Lease heartbeat CAS: extends the lease while owner+generation match.
+    public func renewSubtaskLease(_ id: SubtaskID, owner: EngineerID, generation: Int,
+                                  leaseExpiresAt: Date, at now: Date) throws -> Bool {
+        try db.execute("""
+            UPDATE subtasks
+            SET lease_expires_at=?, updated_at=?
+            WHERE id=? AND owner_id=? AND generation=?
+            """, [
+                .text(WorkshopTime.string(leaseExpiresAt)),
+                .text(WorkshopTime.string(now)), .text(id.rawValue),
+                .text(owner.rawValue), .integer(Int64(generation)),
+            ])
+        return db.changes() == 1
+    }
+
+    /// Subtasks whose lease has expired (lease sweeper, T05).
+    public func subtasksWithExpiredLease(at now: Date) throws -> [Subtask] {
+        try db.query("""
+            SELECT * FROM subtasks
+            WHERE lease_expires_at IS NOT NULL AND lease_expires_at < ?
+              AND owner_id IS NOT NULL AND state IN ('claimed','working')
+            """, [.text(WorkshopTime.string(now))]).map(subtaskFrom)
+    }
+
+    /// The original result message for (subtask, generation) — T06 idempotency.
+    public func resultMessage(taskID: TaskID, subtaskID: SubtaskID,
+                              generation: Int) throws -> Message? {
+        let rows = try db.query("""
+            SELECT * FROM messages
+            WHERE task_id=? AND structured IS NOT NULL
+            ORDER BY seq DESC
+            """, [.text(taskID.rawValue)])
+        for r in rows {
+            let m = messageFrom(r)
+            guard let text = m.structured,
+                  let s = try? JSONDecoder().decode(JSONValue.self,
+                                                    from: Data(text.utf8)),
+                  s["type"]?.stringValue == "result",
+                  s["subtask_id"]?.stringValue == subtaskID.rawValue,
+                  s["generation"]?.intValue == Int64(generation) else { continue }
+            return m
+        }
+        return nil
+    }
+
+    /// Wakeup rows currently marked running (wake/restart reconcile, T29).
+    public func runningWakeups() throws -> [Wakeup] {
+        try db.query("SELECT * FROM wakeups WHERE state='running'", [])
+            .map(wakeupFrom)
+    }
+
     private func subtaskFrom(_ r: Row) -> Subtask {
         Subtask(
             id: SubtaskID(r["id"]!.text!),
@@ -408,14 +502,25 @@ public final class WorkshopRepository {
     public func insertArtifact(_ a: Artifact) throws {
         try db.execute("""
             INSERT INTO artifacts(id, task_id, content_hash, relative_path, mime, producer,
-                                  base_revision, validation, description, created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
+                                  base_revision, validation, description, generation,
+                                  created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """, [
                 .text(a.id), .text(a.taskID.rawValue), .text(a.contentHash),
                 .text(a.relativePath), a.mime.map(SQLiteValue.text), .text(a.producer),
                 a.baseRevision.map(SQLiteValue.text), .text(a.validation),
-                a.description.map(SQLiteValue.text), .text(WorkshopTime.string(a.createdAt)),
+                a.description.map(SQLiteValue.text),
+                a.generation.map { SQLiteValue.integer(Int64($0)) },
+                .text(WorkshopTime.string(a.createdAt)),
             ])
+    }
+
+    /// T06: dedupe artifacts on (task, content_hash).
+    public func artifactByHash(taskID: TaskID, contentHash: String) throws -> Artifact? {
+        try db.query("""
+            SELECT * FROM artifacts WHERE task_id=? AND content_hash=?
+            ORDER BY created_at LIMIT 1
+            """, [.text(taskID.rawValue), .text(contentHash)]).first.map(artifactFrom)
     }
 
     public func artifacts(_ taskID: TaskID) throws -> [Artifact] {
@@ -435,6 +540,7 @@ public final class WorkshopRepository {
                  baseRevision: r["base_revision"]?.text,
                  validation: r["validation"]!.text!,
                  description: r["description"]?.text,
+                 generation: r["generation"]?.int.map(Int.init),
                  createdAt: WorkshopTime.date(r["created_at"]!.text!))
     }
 
@@ -771,5 +877,302 @@ public final class WorkshopRepository {
     private func decodeList(_ json: String?) -> [String] {
         guard let json else { return [] }
         return (try? JSONDecoder().decode([String].self, from: Data(json.utf8))) ?? []
+    }
+
+    // MARK: - Quota snapshots (§10)
+
+    public func insertQuotaSnapshot(_ s: QuotaSnapshot) throws {
+        try db.execute("""
+            INSERT INTO quota_snapshots(bucket, remaining, unit, reset_at, source,
+                                        observed_at, availability)
+            VALUES(?,?,?,?,?,?,?)
+            """, [.text(s.bucket), .text(s.remaining),
+                  s.unit.map(SQLiteValue.text),
+                  s.resetAt.map { .text(WorkshopTime.string($0)) },
+                  .text(s.source), .text(WorkshopTime.string(s.observedAt)),
+                  .text(s.availability)])
+    }
+
+    public func quotaSnapshots(bucket: String? = nil) throws -> [QuotaSnapshot] {
+        let sql = bucket == nil
+            ? "SELECT * FROM quota_snapshots ORDER BY id"
+            : "SELECT * FROM quota_snapshots WHERE bucket=? ORDER BY id"
+        let args: [SQLiteValue?] = bucket.map { [.text($0)] } ?? []
+        return try db.query(sql, args).map(quotaSnapshotFrom)
+    }
+
+    public func latestQuotaSnapshot(_ bucket: String) throws -> QuotaSnapshot? {
+        try db.query("""
+            SELECT * FROM quota_snapshots WHERE bucket=? ORDER BY id DESC LIMIT 1
+            """, [.text(bucket)]).first.map(quotaSnapshotFrom)
+    }
+
+    private func quotaSnapshotFrom(_ r: Row) -> QuotaSnapshot {
+        QuotaSnapshot(id: r["id"]!.int!, bucket: r["bucket"]!.text!,
+                      remaining: r["remaining"]!.text!, unit: r["unit"]?.text,
+                      resetAt: r["reset_at"]?.text.map(WorkshopTime.date),
+                      source: r["source"]!.text!,
+                      observedAt: WorkshopTime.date(r["observed_at"]!.text!),
+                      availability: r["availability"]!.text!)
+    }
+
+    /// Today's committed token usage (input+output+cache) for an engineer, plus
+    /// whether any sample had nil counters (which makes remaining "unknown").
+    public func usageToday(_ engineerID: EngineerID, on dayStart: Date) throws
+        -> (tokens: Int, hasUnknown: Bool) {
+        let rows = try db.query("""
+            SELECT input, output, cache_read, cache_write FROM usage_samples
+            WHERE engineer_id=? AND observed_at>=?
+            """, [.text(engineerID.rawValue), .text(WorkshopTime.string(dayStart))])
+        var total = 0
+        var unknown = false
+        for r in rows {
+            let parts = [r["input"]?.int, r["output"]?.int,
+                         r["cache_read"]?.int, r["cache_write"]?.int]
+            if parts.contains(where: { $0 == nil }) { unknown = true }
+            total += Int(parts.compactMap { $0 }.reduce(0, +))
+        }
+        return (total, unknown)
+    }
+
+    // MARK: - Reservations (§10)
+
+    public func insertReservation(_ r: Reservation) throws {
+        try db.execute("""
+            INSERT INTO reservations(id, task_id, engineer_id, bucket, reserved,
+                                     committed, state, expires_at, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            """, [.text(r.id), .text(r.taskID.rawValue), .text(r.engineerID.rawValue),
+                  .text(r.bucket), .integer(Int64(r.reserved)),
+                  r.committed.map { SQLiteValue.integer(Int64($0)) },
+                  .text(r.state), .text(WorkshopTime.string(r.expiresAt)),
+                  .text(WorkshopTime.string(r.createdAt))])
+    }
+
+    public func updateReservation(_ id: String, state: String, committed: Int?,
+                                  at now: Date) throws {
+        try db.execute("""
+            UPDATE reservations SET state=?, committed=COALESCE(?, committed)
+            WHERE id=?
+            """, [.text(state), committed.map { SQLiteValue.integer(Int64($0)) },
+                  .text(id)])
+    }
+
+    public func reservations(taskID: TaskID? = nil, state: String? = nil) throws
+        -> [Reservation] {
+        var sql = "SELECT * FROM reservations"
+        var args: [SQLiteValue?] = []
+        var clauses: [String] = []
+        if let taskID { clauses.append("task_id=?"); args.append(.text(taskID.rawValue)) }
+        if let state { clauses.append("state=?"); args.append(.text(state)) }
+        if !clauses.isEmpty { sql += " WHERE " + clauses.joined(separator: " AND ") }
+        sql += " ORDER BY created_at"
+        return try db.query(sql, args).map(reservationFrom)
+    }
+
+    /// Sum of held reservations against a bucket (T13: never oversubscribe).
+    public func heldReservationTotal(_ bucket: String) throws -> Int {
+        let r = try db.query("""
+            SELECT COALESCE(SUM(reserved), 0) AS total FROM reservations
+            WHERE bucket=? AND state='held'
+            """, [.text(bucket)])
+        return Int(r.first?["total"]?.int ?? 0)
+    }
+
+    private func reservationFrom(_ r: Row) -> Reservation {
+        Reservation(id: r["id"]!.text!, taskID: TaskID(r["task_id"]!.text!),
+                    engineerID: EngineerID(rawValue: r["engineer_id"]!.text!) ?? .devin,
+                    bucket: r["bucket"]!.text!, reserved: Int(r["reserved"]!.int!),
+                    committed: r["committed"]?.int.map(Int.init),
+                    state: r["state"]!.text!,
+                    expiresAt: WorkshopTime.date(r["expires_at"]!.text!),
+                    createdAt: WorkshopTime.date(r["created_at"]!.text!))
+    }
+
+    // MARK: - Resource leases (§9.2, T24)
+
+    public func lease(_ resource: String) throws -> ResourceLease? {
+        try db.query("SELECT * FROM leases WHERE resource=?",
+                     [.text(resource)]).first.map(leaseFrom)
+    }
+
+    public func leases() throws -> [ResourceLease] {
+        try db.query("SELECT * FROM leases ORDER BY resource").map(leaseFrom)
+    }
+
+    /// CAS insert-or-takeover: succeeds when no row exists or the existing
+    /// lease is expired; bumps generation on takeover.
+    @discardableResult
+    public func acquireLease(resource: String, owner: String, taskID: TaskID?,
+                             ttlSeconds: Int, url: String?, at now: Date) throws
+        -> ResourceLease? {
+        let existing = try lease(resource)
+        if let existing, !existing.expired(at: now) {
+            return nil
+        }
+        let generation = (existing?.generation ?? 0) + 1
+        try db.execute("""
+            INSERT INTO leases(resource, owner, task_id, generation, expires_at, url,
+                               updated_at)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(resource) DO UPDATE SET owner=excluded.owner,
+                task_id=excluded.task_id, generation=excluded.generation,
+                expires_at=excluded.expires_at, url=excluded.url,
+                updated_at=excluded.updated_at
+            """, [.text(resource), .text(owner),
+                  taskID.map { .text($0.rawValue) }, .integer(Int64(generation)),
+                  .text(WorkshopTime.string(now + TimeInterval(ttlSeconds))),
+                  url.map(SQLiteValue.text), .text(WorkshopTime.string(now))])
+        return try lease(resource)
+    }
+
+    /// CAS renew: only the live owner at the current generation may extend.
+    @discardableResult
+    public func renewLease(resource: String, owner: String, generation: Int,
+                           ttlSeconds: Int, at now: Date) throws -> Bool {
+        guard let existing = try lease(resource),
+              existing.owner == owner, existing.generation == generation,
+              !existing.expired(at: now) else { return false }
+        try db.execute("""
+            UPDATE leases SET expires_at=?, updated_at=? WHERE resource=?
+            """, [.text(WorkshopTime.string(now + TimeInterval(ttlSeconds))),
+                  .text(WorkshopTime.string(now)), .text(resource)])
+        return true
+    }
+
+    /// CAS release: only the live owner at the current generation may release.
+    @discardableResult
+    public func releaseLease(resource: String, owner: String, generation: Int,
+                             at now: Date) throws -> Bool {
+        guard let existing = try lease(resource),
+              existing.owner == owner, existing.generation == generation else {
+            return false
+        }
+        try db.execute("DELETE FROM leases WHERE resource=?", [.text(resource)])
+        return true
+    }
+
+    private func leaseFrom(_ r: Row) -> ResourceLease {
+        ResourceLease(resource: r["resource"]!.text!, owner: r["owner"]!.text!,
+                      taskID: r["task_id"]?.text.map { TaskID($0) },
+                      generation: Int(r["generation"]!.int!),
+                      expiresAt: WorkshopTime.date(r["expires_at"]!.text!),
+                      url: r["url"]?.text,
+                      updatedAt: WorkshopTime.date(r["updated_at"]!.text!))
+    }
+
+    // MARK: - Outbox cursors (§8.5)
+
+    public func setOutboxCursor(_ consumer: String, seq: Int64, at now: Date) throws {
+        try db.execute("""
+            INSERT INTO outbox_cursors(consumer, last_seq, updated_at) VALUES(?,?,?)
+            ON CONFLICT(consumer) DO UPDATE SET last_seq=excluded.last_seq,
+                updated_at=excluded.updated_at
+            """, [.text(consumer), .integer(seq), .text(WorkshopTime.string(now))])
+    }
+
+    public func outboxCursor(_ consumer: String) throws -> Int64 {
+        try db.query("SELECT last_seq FROM outbox_cursors WHERE consumer=?",
+                     [.text(consumer)]).first?["last_seq"]?.int ?? 0
+    }
+
+    // MARK: - Turns (T05/T23/T29, §14.5)
+
+    public func insertTurn(_ t: Turn) throws {
+        try db.execute("""
+            INSERT INTO turns(id, task_id, subtask_id, engineer_id, generation, state,
+                              started_at, first_event_at, ended_at, native_session_id,
+                              request_ids)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """, [.text(t.id), .text(t.taskID.rawValue),
+                  t.subtaskID.map { .text($0.rawValue) },
+                  .text(t.engineerID.rawValue),
+                  t.generation.map { SQLiteValue.integer(Int64($0)) },
+                  .text(t.state), .text(WorkshopTime.string(t.startedAt)),
+                  t.firstEventAt.map { .text(WorkshopTime.string($0)) },
+                  t.endedAt.map { .text(WorkshopTime.string($0)) },
+                  t.nativeSessionID.map(SQLiteValue.text),
+                  .text(encodeList(t.requestIDs))])
+    }
+
+    public func updateTurnState(_ id: String, _ state: String, at now: Date) throws {
+        try db.execute("""
+            UPDATE turns SET state=?, ended_at=CASE
+                WHEN ? IN ('completed','failed','cancelled','interrupted','uncertain')
+                THEN ? ELSE ended_at END WHERE id=?
+            """, [.text(state), .text(state), .text(WorkshopTime.string(now)),
+                  .text(id)])
+    }
+
+    public func markTurnFirstEvent(_ id: String, at now: Date) throws {
+        try db.execute("""
+            UPDATE turns SET first_event_at=COALESCE(first_event_at, ?) WHERE id=?
+            """, [.text(WorkshopTime.string(now)), .text(id)])
+    }
+
+    public func turn(_ id: String) throws -> Turn? {
+        try db.query("SELECT * FROM turns WHERE id=?", [.text(id)])
+            .first.map(turnFrom)
+    }
+
+    public func turns(taskID: TaskID? = nil, state: String? = nil) throws -> [Turn] {
+        var sql = "SELECT * FROM turns"
+        var args: [SQLiteValue?] = []
+        var clauses: [String] = []
+        if let taskID { clauses.append("task_id=?"); args.append(.text(taskID.rawValue)) }
+        if let state { clauses.append("state=?"); args.append(.text(state)) }
+        if !clauses.isEmpty { sql += " WHERE " + clauses.joined(separator: " AND ") }
+        sql += " ORDER BY started_at"
+        return try db.query(sql, args).map(turnFrom)
+    }
+
+    private func turnFrom(_ r: Row) -> Turn {
+        Turn(id: r["id"]!.text!, taskID: TaskID(r["task_id"]!.text!),
+             subtaskID: r["subtask_id"]?.text.map { SubtaskID($0) },
+             engineerID: EngineerID(rawValue: r["engineer_id"]!.text!) ?? .devin,
+             generation: r["generation"]?.int.map(Int.init),
+             state: r["state"]!.text!,
+             startedAt: WorkshopTime.date(r["started_at"]!.text!),
+             firstEventAt: r["first_event_at"]?.text.map(WorkshopTime.date),
+             endedAt: r["ended_at"]?.text.map(WorkshopTime.date),
+             nativeSessionID: r["native_session_id"]?.text,
+             requestIDs: decodeList(r["request_ids"]?.text))
+    }
+
+    // MARK: - Checkpoint queries (§6.3, T30)
+
+    /// Latest checkpoint row for an owner, any validity.
+    public func latestCheckpoint(taskID: TaskID, engineerID: EngineerID)
+        throws -> (id: Int64, generation: Int, schemaVersion: Int, content: String,
+                   valid: Bool, createdAt: Date)? {
+        try db.query("""
+            SELECT * FROM checkpoints WHERE task_id=? AND engineer_id=?
+            ORDER BY id DESC LIMIT 1
+            """, [.text(taskID.rawValue), .text(engineerID.rawValue)])
+            .first.map(checkpointFrom)
+    }
+
+    /// Latest *valid* checkpoint — what resume actually uses.
+    public func latestValidCheckpoint(taskID: TaskID, engineerID: EngineerID)
+        throws -> (id: Int64, generation: Int, schemaVersion: Int, content: String,
+                   valid: Bool, createdAt: Date)? {
+        try db.query("""
+            SELECT * FROM checkpoints WHERE task_id=? AND engineer_id=? AND valid=1
+            ORDER BY id DESC LIMIT 1
+            """, [.text(taskID.rawValue), .text(engineerID.rawValue)])
+            .first.map(checkpointFrom)
+    }
+
+    public func markCheckpointInvalid(_ id: Int64) throws {
+        try db.execute("UPDATE checkpoints SET valid=0 WHERE id=?", [.integer(id)])
+    }
+
+    private func checkpointFrom(_ r: Row)
+        -> (id: Int64, generation: Int, schemaVersion: Int, content: String,
+            valid: Bool, createdAt: Date) {
+        (id: r["id"]!.int!, generation: Int(r["generation"]!.int!),
+         schemaVersion: Int(r["schema_version"]!.int!),
+         content: r["content"]!.text!, valid: (r["valid"]?.int ?? 1) == 1,
+         createdAt: WorkshopTime.date(r["created_at"]!.text!))
     }
 }

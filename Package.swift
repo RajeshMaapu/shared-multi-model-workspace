@@ -51,7 +51,8 @@ let package = Package(
         .testTarget(name: "AdapterContractTests",
                     dependencies: ["WorkshopAdapters", "WorkshopService", "WorkshopCore"]),
         .testTarget(name: "LiveSmokeTests",
-                    dependencies: ["WorkshopDaemonKit", "WorkshopService",
+                    dependencies: ["WorkshopDaemonKit", "WorkshopAdapters",
+                                   "WorkshopService",
                                    "WorkshopStore", "WorkshopCore"]),
     ]
 )

@@ -407,4 +407,29 @@ final class AdapterContractTests: XCTestCase {
                                                      key: "api_key")
         XCTAssertEqual(key, "ds-key-abc123")
     }
+
+    /// Managed-history compaction (§6.3): >60 messages → checkpoint-derived
+    /// summary + newest 20, no model call.
+    func testDeepSeekHistoryCompaction() async throws {
+        let adapter = deepseek(responses: [], recorded: Recorder())
+        adapter.checkpointSummary = { _ in "objective: X; next: continue" }
+        let history = (0..<70).map {
+            JSONValue.object(["role": .string("user"),
+                              "content": .string("m\($0)")])
+        }
+        let (kept, didCompact) = await adapter.compactedHistory(
+            history, taskID: TaskID("task_x"))
+        XCTAssertTrue(didCompact)
+        XCTAssertEqual(kept.count, 21)
+        XCTAssertEqual(kept[0]["role"]?.stringValue, "system")
+        XCTAssertTrue(kept[0]["content"]?.stringValue?
+            .contains("objective: X; next: continue") == true)
+        XCTAssertEqual(kept[1]["content"]?.stringValue, "m50")
+
+        // Small history: untouched.
+        let (untouched, didCompact2) = await adapter.compactedHistory(
+            Array(history.prefix(10)), taskID: TaskID("task_x"))
+        XCTAssertFalse(didCompact2)
+        XCTAssertEqual(untouched.count, 10)
+    }
 }

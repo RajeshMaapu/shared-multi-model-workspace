@@ -31,7 +31,8 @@ public final class ProcessACPTransport: ACPTransport, @unchecked Sendable {
         process.currentDirectoryURL = URL(fileURLWithPath: cwd)
         process.standardInput = inPipe
         process.standardOutput = outPipe
-        process.standardError = FileHandle.nullDevice
+        let errPipe = Pipe()
+        process.standardError = errPipe
         self.process = process
         self.stdinHandle = inPipe.fileHandleForWriting
 
@@ -62,6 +63,28 @@ public final class ProcessACPTransport: ACPTransport, @unchecked Sendable {
             }
             cont.finish()
         }.start()
+
+        // Bounded stderr capture: 256 KiB ring per process (§14.5).
+        let errFD = errPipe.fileHandleForReading.fileDescriptor
+        Thread {
+            var tail = Data()
+            var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+            while true {
+                let n = read(errFD, &chunk, chunk.count)
+                if n <= 0 { break }
+                tail.append(contentsOf: chunk[0..<n])
+                if tail.count > 256 * 1024 {
+                    tail = tail.suffix(256 * 1024)
+                }
+            }
+            self.stderrTail = tail
+        }.start()
+    }
+
+    /// Last ≤256 KiB of the child's stderr, redacted — for diagnostics.
+    public private(set) var stderrTail = Data()
+    public var stderrText: String {
+        Redactor.shared.redact(String(decoding: stderrTail, as: UTF8.self))
     }
 
     public func send(_ line: String) throws {
