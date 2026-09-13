@@ -4,6 +4,7 @@ import WorkshopCore
 /// Engineer card popover (§3.7): adapter kind, version, qualification badge,
 /// model selector, reasoning setting, health, quota, current assignments.
 struct EngineerCard: View {
+    @EnvironmentObject var state: AppState
     let probe: AdapterProbe
     let assignments: [Subtask]
 
@@ -49,7 +50,8 @@ struct EngineerCard: View {
             row("Reasoning", reasoning)
             row("Health", probe.health.detail.isEmpty
                 ? probe.health.label : probe.health.detail)
-            row("Quota", "unknown")
+            row("Quota", state.capacityLines[probe.engineer.rawValue]
+                ?? "unknown — not measured")
             if !assignments.isEmpty {
                 Text("Assignments")
                     .font(.system(size: 11, weight: .semibold))

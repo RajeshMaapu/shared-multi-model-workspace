@@ -188,3 +188,77 @@ Known limitations:            L6 asserts stage rows exist; it does not grade
                               verified by build, not a scripted UI test.
 Independent reviewer:         none (builder self-check only)
 ```
+
+```
+# Validation report — Phase 4
+
+Scope:                        resilience and resource policy — §4.3, §6.3,
+                              §8.5, §9.2, §9.4, §10, §14.1–14.5; T05, T06,
+                              T13, T14, T15, T23, T24, T29, T30, T31, T32,
+                              T38; latency §10.3.
+macOS / hardware / toolchain: macOS 15.6.1 / arm64 / Xcode 26.3 / Swift 6.2.4
+
+Deterministic tests:          ./scripts/test.sh — see phase4 report for the
+                              final counts; new Phase4ServiceTests (21),
+                              LatencyBench (1), StoreTests v3→v4.
+Live calls:                   exactly one bounded DeepSeek balance query
+                              (GET /user/balance, 10 s timeout) — availability
+                              and currency only; everything else is fake
+                              adapters + failure injection.
+
+Phase 4 coverage:             T05 stale-generation fencing (-32004, fenced/
+                              quarantine, current owner untouched) + lease
+                              sweeper expiry → blocked + reconciliation event;
+                              T06 artifact idempotent on (task, content_hash),
+                              report_result idempotent on (subtask,
+                              generation), interrupted turn → resume_from_
+                              checkpoint wakeup with checkpoint payload, or
+                              subtask blocked when no valid checkpoint;
+                              checkpoint schema/size(64KiB)/secret rejection,
+                              corrupt-checkpoint skip to earlier valid row;
+                              T13 critical bucket blocks dispatch once,
+                              reservations never oversubscribe; T14 unknown ≠
+                              0 ≠ unlimited (string "unknown", nil counters →
+                              unknown); T15 all-unavailable → durable task,
+                              blocked once, bounded re-probe; T23 cancel ack
+                              → cancelled, no-ack → uncertain (turns rows);
+                              T24 lease CAS acquire/renew/release + expiry
+                              takeover generation+1 + stale renew refused;
+                              T29 reconcileOnStart (turns→interrupted,
+                              reservations→released, wakeups→pending) +
+                              wake reconcile (dead process → interrupted,
+                              alive → continues); T30 storage guard -32010
+                              with reads still working; T31 5000-message
+                              newest page < 300 ms + backwards windows; T32
+                              redaction on export/tool surfaces; T38 online
+                              backup while writer active → v4 schema, task
+                              count, artifact hash manifest. §8.5 service
+                              outbox cursor + delivered-on-yield + client
+                              seq dedupe; dispatch.requested never marked
+                              delivered by broadcast.
+
+Failure injections:           stale gen report/artifact → fenced quarantine;
+                              expired subtask lease → blocked + event;
+                              malformed checkpoint row → skipped to earlier;
+                              free-space provider → -32010; fake clock expiry
+                              → lease takeover; fake adapter no-ack cancel →
+                              uncertain; adapter unavailable → blocked task.
+
+Inspectability:               workshop.search (FTS5 when compiled — system
+                              SQLite reports ENABLE_FTS5, LIKE fallback),
+                              workshop.exportTask (md + manifest + artifacts,
+                              redacted), workshop.diagnostics, workshop.backup
+                              + scripts/restore.sh (new home only).
+
+Latency:                      docs/evidence/phase4/latency.md — p50/p95 over
+                              200 iterations, FULL vs NORMAL comparison; the
+                              shipped setting stays synchronous=FULL.
+
+Known limitations:            task-row capacity indicator uses the selected
+                              task's owner map (list rows have no per-task
+                              owner without an extra IPC call); lease fencing
+                              of native harness tools is out of service scope
+                              (ADR 0013); sleep/wake liveness probes are
+                              registered by the daemon, simulated in tests.
+Independent reviewer:         none (builder self-check only)
+```

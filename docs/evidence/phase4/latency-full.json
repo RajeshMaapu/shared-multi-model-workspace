@@ -1,0 +1,1 @@
+{"results_ms":{"open_task_5000msg_newest_page":{"p50":24.97398853302002,"p95":26.044011116027832},"wakeup_queued":{"p95":0.722050666809082,"p50":0.1399517059326172},"create_task_receipt":{"p95":7.819056510925293,"p50":5.739092826843262},"committed_event_visible":{"p95":1.15203857421875,"p50":0.4780292510986328}},"iterations":200,"synchronous":"FULL"}

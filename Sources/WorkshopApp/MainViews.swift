@@ -87,6 +87,32 @@ struct SidebarView: View {
                 .padding(.horizontal, 12).padding(.top, 8)
                 .focused($searchFocused)
                 .onChange(of: state.searchFocusRequest) { _, _ in searchFocused = true }
+                .onSubmit { Task { await state.runSearch(search) } }
+            if !state.searchResults.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(state.searchResults) { hit in
+                        Button {
+                            state.selectedTaskID = hit.taskID
+                            state.searchResults = []
+                            search = ""
+                        } label: {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(state.tasks.first { $0.id == hit.taskID }?.title
+                                     ?? hit.taskID.rawValue)
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.9))
+                                Text(hit.snippet)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.white.opacity(0.6))
+                                    .lineLimit(2)
+                            }
+                            .padding(.horizontal, 16).padding(.vertical, 3)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .frame(maxHeight: 140)
+            }
             Button("+ New task") { state.composerFocusRequest += 1 }
                 .buttonStyle(.plain)
                 .font(.system(size: 13, weight: .medium))
@@ -178,5 +204,33 @@ struct EngineerRow: View {
             Spacer()
         }
         .padding(.horizontal, 16).padding(.vertical, 4)
+    }
+}
+
+/// Diagnostics window (§14.5): workshop.diagnostics JSON rendered readably.
+struct DiagnosticsView: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Diagnostics")
+                    .font(.system(size: 14, weight: .semibold))
+                Spacer()
+                Button("Refresh") {
+                    Task { await state.refreshDiagnostics() }
+                }
+            }
+            .padding([.top, .horizontal], 12)
+            ScrollView {
+                Text(state.diagnosticsJSON.isEmpty
+                     ? "No diagnostics loaded."
+                     : state.diagnosticsJSON)
+                    .font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+            }
+        }
     }
 }

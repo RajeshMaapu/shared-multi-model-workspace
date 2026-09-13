@@ -1,0 +1,1 @@
+{"synchronous":"NORMAL","results_ms":{"committed_event_visible":{"p95":2.8690099716186523,"p50":0.37300586700439453},"open_task_5000msg_newest_page":{"p95":25.46107769012451,"p50":24.631977081298828},"create_task_receipt":{"p95":21.84903621673584,"p50":5.966067314147949},"wakeup_queued":{"p95":0.5370378494262695,"p50":0.05602836608886719}},"iterations":200}

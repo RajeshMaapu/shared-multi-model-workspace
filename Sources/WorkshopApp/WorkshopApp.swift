@@ -27,7 +27,15 @@ struct WorkshopApp: App {
             CommandGroup(after: .toolbar) {
                 Button("Search") { state.searchFocusRequest += 1 }
                     .keyboardShortcut("k")
+                Button("Diagnostics") { openWindow(id: "diagnostics") }
             }
+        }
+
+        Window("Diagnostics", id: "diagnostics") {
+            DiagnosticsView()
+                .environmentObject(state)
+                .frame(minWidth: 640, minHeight: 480)
+                .task { await state.refreshDiagnostics() }
         }
 
         Settings {
@@ -42,6 +50,7 @@ struct WorkshopApp: App {
 
     private func startUp() async {
         await state.bootstrap()
+        applyDevFixtures()
         // Dev seed: WORKSHOP_SEED_TASK="title|||objective"
         if let seed = ProcessInfo.processInfo.environment["WORKSHOP_SEED_TASK"],
            !seed.isEmpty {
@@ -73,6 +82,47 @@ struct WorkshopApp: App {
         }
     }
 
+    /// Dev fixtures for Phase 4 evidence screenshots — they only set
+    /// view-model state; nothing is written to the daemon.
+    ///   WORKSHOP_FAKE_CAPACITY="devin:critical since 09:00,kimi:limited since 09:12"
+    ///   WORKSHOP_FAKE_BANNER="Recovered: 2 interrupted turns, 1 unresolved operations"
+    ///   WORKSHOP_FAKE_SEARCH="kind|snippet" (repeatable via ;)
+    ///   WORKSHOP_OPEN_DIAGNOSTICS=1 opens the Diagnostics window and the
+    ///   screenshot captures it instead of the main window.
+    private func applyDevFixtures() {
+        let env = ProcessInfo.processInfo.environment
+        if let spec = env["WORKSHOP_FAKE_CAPACITY"], !spec.isEmpty {
+            var lines: [String: String] = [:]
+            var alerts: Set<String> = []
+            for entry in spec.split(separator: ",") {
+                let kv = entry.split(separator: ":", maxSplits: 1)
+                guard kv.count == 2 else { continue }
+                let key = String(kv[0]), line = String(kv[1])
+                lines[key] = line
+                if line.hasPrefix("limited") || line.hasPrefix("critical") {
+                    alerts.insert(key)
+                }
+            }
+            state.capacityLines = lines
+            state.capacityAlerts = alerts
+        }
+        if let banner = env["WORKSHOP_FAKE_BANNER"], !banner.isEmpty {
+            state.recoveryBanner = banner
+        }
+        if let spec = env["WORKSHOP_FAKE_SEARCH"], !spec.isEmpty,
+           let taskID = state.selectedTaskID {
+            state.searchResults = spec.split(separator: ";").map { part in
+                let kv = part.split(separator: "|", maxSplits: 1)
+                return AppState.AppSearchHit(
+                    taskID: taskID, kind: String(kv.first ?? "message"),
+                    snippet: String(kv.count > 1 ? kv[1] : part))
+            }
+        }
+        if env["WORKSHOP_OPEN_DIAGNOSTICS"] == "1" {
+            openWindow(id: "diagnostics")
+        }
+    }
+
     /// WORKSHOP_SCREENSHOT_PATH: capture own main window after the fake reply streamed.
     private func scheduleScreenshotIfRequested() {
         guard let path = ProcessInfo.processInfo.environment["WORKSHOP_SCREENSHOT_PATH"],
@@ -91,11 +141,15 @@ struct WorkshopApp: App {
     }
 
     private func captureMainWindow(to path: String) {
-        // When WORKSHOP_OPEN_CARD is set, capture the popover window if it is
-        // up — it is a separate NSPanel and not part of the main contentView.
-        let wantCard = ProcessInfo.processInfo.environment["WORKSHOP_OPEN_CARD"] != nil
-        let window = wantCard ? (NSApp.windows.last ?? NSApp.windows.first)
-                              : NSApp.windows.first
+        // When WORKSHOP_OPEN_CARD / WORKSHOP_OPEN_DIAGNOSTICS is set, capture
+        // the popover/secondary window — it is not part of the main
+        // contentView.
+        let wantSecondary = ProcessInfo.processInfo
+            .environment["WORKSHOP_OPEN_CARD"] != nil
+            || ProcessInfo.processInfo
+                .environment["WORKSHOP_OPEN_DIAGNOSTICS"] == "1"
+        let window = wantSecondary ? (NSApp.windows.last ?? NSApp.windows.first)
+                                   : NSApp.windows.first
         guard let window else { return }
         // Prefer rendering the view directly: CGWindowList capture returns a
         // blank image without screen-recording permission, which this dev

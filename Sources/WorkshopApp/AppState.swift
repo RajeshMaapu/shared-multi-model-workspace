@@ -27,6 +27,20 @@ public final class AppState: ObservableObject {
     /// Incremented by menu commands; views focus the matching field.
     @Published public var composerFocusRequest = 0
     @Published public var searchFocusRequest = 0
+    /// Older message pages exist beyond the loaded window (T31).
+    @Published public var hasEarlierMessages = false
+    /// Cmd-K / sidebar search results (workshop.search, §14.1).
+    @Published public var searchResults: [AppSearchHit] = []
+    /// "Recovered: N interrupted turns, M unresolved operations" (§14.1).
+    @Published public var recoveryBanner: String?
+    /// Latest workshop.diagnostics payload for the Diagnostics view.
+    @Published public var diagnosticsJSON: String = ""
+    /// Engineer raw id → capacity summary line for cards/rows (§10).
+    @Published public var capacityLines: [String: String] = [:]
+    /// Engineers whose bucket is limited or critical (task-row indicator).
+    @Published public var capacityAlerts: Set<String> = []
+    /// Notification seqs already handled — at-least-once dedupe (§8.5).
+    private var seenEventSeqs: Set<Int64> = []
 
     public let client = WorkshopClient()
     private var notificationTask: Task<Void, Never>?
@@ -113,9 +127,18 @@ public final class AppState: ObservableObject {
         detail = try? await client.call(WorkshopProtocol.getTask,
                                         params: .object(["task_id": .string(id.rawValue)]),
                                         as: TaskDetail.self)
-        messages = (try? await client.call(WorkshopProtocol.readMessages,
-                                           params: .object(["task_id": .string(id.rawValue)]),
-                                           as: [Message].self)) ?? messages
+        // Newest page (T31); "Load earlier" pages backwards from first seq.
+        if let page = try? await client.call(WorkshopProtocol.readMessagePage,
+            params: .object(["task_id": .string(id.rawValue)]),
+            as: [Message].self) {
+            messages = page
+            hasEarlierMessages = (page.first?.seq ?? 1) > 1
+        }
+        recoveryBanner = try? await client.call(
+            WorkshopProtocol.recoverySummary,
+            params: .object(["task_id": .string(id.rawValue)]),
+            as: String.self)
+        await refreshCapacity()
         let taskParams: JSONValue = .object(["task_id": .string(id.rawValue)])
         artifacts = (try? await client.call(WorkshopProtocol.listArtifacts,
                                             params: taskParams,
@@ -149,6 +172,14 @@ public final class AppState: ObservableObject {
     }
 
     private func handleEvent(_ params: JSONValue?) async {
+        // At-least-once delivery: dedupe by outbox seq (§8.5).
+        if let seq = params?["seq"]?.intValue {
+            if seenEventSeqs.contains(seq) { return }
+            seenEventSeqs.insert(seq)
+            if seenEventSeqs.count > 10_000 {
+                seenEventSeqs = Set(seenEventSeqs.sorted().suffix(5_000))
+            }
+        }
         tasks = (try? await client.call(WorkshopProtocol.listTasks,
                                         as: [WorkshopTask].self)) ?? tasks
         guard let id = selectedTaskID,
@@ -231,5 +262,103 @@ public final class AppState: ObservableObject {
             "report_revision": .number(Double(reportRevision)),
             "alternative_index": .number(Double(index)),
         ])
+    }
+
+    // MARK: - Phase 4: paging, search, export, diagnostics, capacity
+
+    /// App-local mirror of the service's SearchHit (app target has no
+    /// dependency on WorkshopService).
+    public struct AppSearchHit: Codable, Sendable, Identifiable {
+        public var id: String { taskID.rawValue + kind + snippet }
+        public var taskID: TaskID
+        public var kind: String
+        public var snippet: String
+    }
+
+    /// Prepend the page before the current first message; keeps ≤2000 in
+    /// memory by trimming the newest tail (T31).
+    public func loadEarlierMessages() async {
+        guard let id = selectedTaskID, let first = messages.first else { return }
+        guard let older = try? await client.call(
+            WorkshopProtocol.readMessagePage,
+            params: .object(["task_id": .string(id.rawValue),
+                             "before_seq": .number(Double(first.seq))]),
+            as: [Message].self), !older.isEmpty else {
+            hasEarlierMessages = false
+            return
+        }
+        messages = older + messages
+        if messages.count > 2_000 { messages = Array(messages.prefix(2_000)) }
+        hasEarlierMessages = (older.first?.seq ?? 1) > 1
+    }
+
+    /// workshop.search over messages/decisions/artifacts (§14.1, Cmd-K).
+    public func runSearch(_ query: String) async {
+        guard !query.isEmpty else { searchResults = []; return }
+        searchResults = (try? await client.call(WorkshopProtocol.search,
+            params: .object(["query": .string(query), "limit": .number(50)]),
+            as: [AppSearchHit].self)) ?? []
+    }
+
+    /// workshop.exportTask into a user-chosen directory (§14.1).
+    public func exportSelectedTask(destDir: String) async {
+        guard let id = selectedTaskID else { return }
+        lastActionError = await taskAction(WorkshopProtocol.exportTask,
+                                           extra: ["dest_dir": .string(destDir)])
+    }
+
+    /// workshop.diagnostics for the Diagnostics view (§14.5).
+    public func refreshDiagnostics() async {
+        if let json = try? await client.call(WorkshopProtocol.diagnostics,
+                                             as: JSONValue.self),
+           let data = try? JSONEncoder().encode(json),
+           let obj = try? JSONSerialization.jsonObject(with: data),
+           let pretty = try? JSONSerialization.data(
+               withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) {
+            diagnosticsJSON = String(decoding: pretty, as: UTF8.self)
+        }
+    }
+
+    /// workshop_get_capacity tool (callable as user) → per-engineer lines.
+    public func refreshCapacity() async {
+        guard let cap = try? await client.call("workshop_get_capacity",
+                                               as: JSONValue.self) else { return }
+        var lines: [String: String] = [:]
+        var alerts: Set<String> = []
+        for engineer in EngineerID.allCases {
+            guard let info = cap[engineer.rawValue] else { continue }
+            let availability = info["availability"]?.stringValue ?? "unknown"
+            let observed = info["observed_at"]?.stringValue
+            switch availability {
+            case "unknown":
+                lines[engineer.rawValue] = observed == nil
+                    ? "unknown — not measured" : "unknown — measured \(observed!)"
+            case "limited":
+                lines[engineer.rawValue] = "limited since \(observed ?? "now")"
+                alerts.insert(engineer.rawValue)
+            case "critical":
+                lines[engineer.rawValue] = "critical since \(observed ?? "now")"
+                alerts.insert(engineer.rawValue)
+            default:
+                let remaining = info["remaining"]?.stringValue ?? "?"
+                lines[engineer.rawValue] =
+                    "\(remaining) left — measured \(observed ?? "recently")"
+            }
+        }
+        capacityLines = lines
+        capacityAlerts = alerts
+    }
+
+    /// True when the selected task's owner bucket is limited/critical — the
+    /// compact impact indicator on the task row/header (§10).
+    public func selectedTaskCapacityAlert() -> String? {
+        guard let detail else { return nil }
+        for sub in detail.subtasks {
+            if let owner = sub.ownerID,
+               capacityAlerts.contains(owner.rawValue) {
+                return "\(owner.displayName) capacity \(capacityLines[owner.rawValue] ?? "limited")"
+            }
+        }
+        return nil
     }
 }

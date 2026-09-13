@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import WorkshopCore
 
 enum TaskTab: String, CaseIterable {
@@ -45,6 +46,11 @@ struct TaskPaneView: View {
                             .font(.system(size: 12))
                             .foregroundStyle(WorkshopColors.secondaryText)
                         statusChips(detail)
+                        if let alert = state.selectedTaskCapacityAlert() {
+                            Chip(text: "⚠ " + alert,
+                                 color: WorkshopColors.attention)
+                                .padding(.top, 4)
+                        }
                     }
                     Spacer()
                     taskActionsMenu(detail.task)
@@ -86,7 +92,12 @@ struct TaskPaneView: View {
     @ViewBuilder
     private func statusChips(_ detail: TaskDetail) -> some View {
         let running = Set(detail.runningEngineers)
-        let queued = detail.pendingWakeups.filter { !running.contains($0.engineer) }
+        // Dedupe by (engineer, state): a running engineer with several pending
+        // wakeup rows must not repeat the same chip.
+        var seen = Set<String>()
+        let queued = detail.pendingWakeups.filter { w in
+            !running.contains(w.engineer) && seen.insert(w.engineer.rawValue + w.state).inserted
+        }
         if !running.isEmpty || !queued.isEmpty {
             HStack(spacing: 6) {
                 ForEach(detail.runningEngineers, id: \.self) { e in
@@ -122,12 +133,25 @@ struct TaskPaneView: View {
                 Task { await state.convertToResearch() }
             }
             .disabled(task.state != .paused)
+            Divider()
+            Button("Export…") { exportTask() }
         } label: {
             Text("Actions")
                 .font(.system(size: 12, weight: .medium))
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
+    }
+
+    /// workshop.exportTask — pick a destination folder, then export (§14.1).
+    private func exportTask() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export Here"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await state.exportSelectedTask(destDir: url.path) }
     }
 }
 
@@ -151,9 +175,33 @@ struct ConversationView: View {
 
     var body: some View {
         ScrollViewReader { proxy in
+            // Recovery banner after restart/sleep-wake reconcile (§14.1).
+            if let banner = state.recoveryBanner {
+                Text(banner)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(WorkshopColors.primaryText)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(WorkshopColors.attention.opacity(0.15))
+            }
             ZStack(alignment: .bottom) {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
+                        if state.hasEarlierMessages {
+                            Button("Load earlier") {
+                                // Anchor on the first visible message so the
+                                // scroll position survives the prepend (T31).
+                                let anchor = state.messages.first?.id
+                                Task {
+                                    await state.loadEarlierMessages()
+                                    if let anchor { proxy.scrollTo(anchor) }
+                                }
+                            }
+                            .font(.system(size: 12, weight: .medium))
+                            .buttonStyle(.plain)
+                            .foregroundStyle(WorkshopColors.secondaryText)
+                            .frame(maxWidth: .infinity)
+                        }
                         ForEach(state.messages) { message in
                             MessageRow(message: message)
                                 .id(message.id)
