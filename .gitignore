@@ -1,0 +1,7 @@
+.build/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+docs/evidence/**/tmp/
+.DS_Store
+xcuserdata/
