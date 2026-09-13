@@ -249,11 +249,67 @@ public final class DaemonRuntime: @unchecked Sendable {
                                                                principal: principal))
             case WorkshopProtocol.listEngineers:
                 return try .from(await service.listEngineers())
+            case WorkshopProtocol.listProposals:
+                let id = TaskID(params?["task_id"]?.stringValue ?? "")
+                return try .from(try await service.listProposals(id))
+            case WorkshopProtocol.listReports:
+                let id = TaskID(params?["task_id"]?.stringValue ?? "")
+                return try .from(try await service.listReports(id))
+            case WorkshopProtocol.listDecisions:
+                let id = TaskID(params?["task_id"]?.stringValue ?? "")
+                return try .from(try await service.listDecisions(id))
+            case WorkshopProtocol.approveArchitecture:
+                let id = TaskID(params?["task_id"]?.stringValue ?? "")
+                try await service.approveArchitecture(
+                    taskID: id,
+                    reportRevision: Int(params?["report_revision"]?.intValue ?? 0),
+                    scope: params?["scope"]?.stringValue, principal: principal)
+                return .object(["ok": .bool(true)])
+            case WorkshopProtocol.requestChanges:
+                let id = TaskID(params?["task_id"]?.stringValue ?? "")
+                try await service.requestChanges(
+                    taskID: id,
+                    reportRevision: Int(params?["report_revision"]?.intValue ?? 0),
+                    comment: params?["comment"]?.stringValue ?? "",
+                    principal: principal)
+                return .object(["ok": .bool(true)])
+            case WorkshopProtocol.chooseAlternative:
+                let id = TaskID(params?["task_id"]?.stringValue ?? "")
+                try await service.chooseAlternative(
+                    taskID: id,
+                    reportRevision: Int(params?["report_revision"]?.intValue ?? 0),
+                    alternativeIndex: Int(params?["alternative_index"]?.intValue ?? 0),
+                    principal: principal)
+                return .object(["ok": .bool(true)])
+            case WorkshopProtocol.pauseTask:
+                try await service.pauseTask(
+                    taskID: TaskID(params?["task_id"]?.stringValue ?? ""),
+                    principal: principal)
+                return .object(["ok": .bool(true)])
+            case WorkshopProtocol.resumeTask:
+                try await service.resumeTask(
+                    taskID: TaskID(params?["task_id"]?.stringValue ?? ""),
+                    principal: principal)
+                return .object(["ok": .bool(true)])
+            case WorkshopProtocol.cancelTask:
+                try await service.cancelTask(
+                    taskID: TaskID(params?["task_id"]?.stringValue ?? ""),
+                    principal: principal)
+                return .object(["ok": .bool(true)])
+            case WorkshopProtocol.acceptTask:
+                try await service.acceptTask(
+                    taskID: TaskID(params?["task_id"]?.stringValue ?? ""),
+                    principal: principal)
+                return .object(["ok": .bool(true)])
+            case WorkshopProtocol.convertToResearch:
+                try await service.convertToResearch(
+                    taskID: TaskID(params?["task_id"]?.stringValue ?? ""),
+                    principal: principal)
+                return .object(["ok": .bool(true)])
             default:
                 if method.hasPrefix("workshop_"),
                    WorkshopToolCatalog.method(for: method) != nil
-                    || ["workshop_create_task", "workshop_propose_subtask",
-                        "workshop_claim_subtask", "workshop_assign_subtask"].contains(method) {
+                    || ["workshop_create_task"].contains(method) {
                     return try await service.callTool(method, args: params ?? .object([:]),
                                                       principal: principal)
                 }

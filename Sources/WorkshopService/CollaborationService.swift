@@ -28,6 +28,14 @@ public actor CollaborationService {
     private var wakeupScheduled = false
     /// (task, engineer) pairs with a turn currently running.
     private var runningTurns: Set<String> = []
+    /// Turn handles for pause/cancel: "<task>:<engineer>" → adapter+ref+turnID.
+    private var runningTurnRefs:
+        [String: (adapter: EngineerAdapter, ref: SessionRef, turnID: String)] = [:]
+    /// Research-phase deadlines in seconds; <= 0 disables the timer (tests).
+    private let researchDeadline: TimeInterval
+    private let reviewDeadline: TimeInterval
+    /// Scheduled policy deadline timers keyed "research:<task>" / "review:<task>".
+    private var policyTimers: [String: Task<Void, Never>] = [:]
 
     /// Test hook: called with the rendered context packet before each sendTurn.
     public var packetInspector: (@Sendable (EngineerID, String) -> Void)?
@@ -51,6 +59,8 @@ public actor CollaborationService {
                 homeDir: String? = nil,
                 wakeupCoalescence: Duration = .milliseconds(500),
                 wakeupLoopBound: Int = 6,
+                researchDeadline: TimeInterval = 1200,
+                reviewDeadline: TimeInterval = 900,
                 now: @escaping () -> Date = Date.init) throws {
         try Migrations.all.migrate(database)
         self.repo = WorkshopRepository(db: database)
@@ -59,6 +69,8 @@ public actor CollaborationService {
         self.homeDir = homeDir
         self.wakeupCoalescence = wakeupCoalescence
         self.wakeupLoopBound = wakeupLoopBound
+        self.researchDeadline = researchDeadline
+        self.reviewDeadline = reviewDeadline
         self.now = now
     }
 
@@ -67,11 +79,15 @@ public actor CollaborationService {
                             homeDir: String? = nil,
                             wakeupCoalescence: Duration = .milliseconds(500),
                             wakeupLoopBound: Int = 6,
+                            researchDeadline: TimeInterval = 1200,
+                            reviewDeadline: TimeInterval = 900,
                             now: @escaping () -> Date = Date.init) throws {
         try self.init(database: try Database(path: databasePath), adapters: adapters,
                       dispatcherEnabled: dispatcherEnabled, homeDir: homeDir,
                       wakeupCoalescence: wakeupCoalescence,
-                      wakeupLoopBound: wakeupLoopBound, now: now)
+                      wakeupLoopBound: wakeupLoopBound,
+                      researchDeadline: researchDeadline,
+                      reviewDeadline: reviewDeadline, now: now)
     }
 
     // MARK: - Authentication
@@ -104,6 +120,8 @@ public actor CollaborationService {
 
     public func shutdown() {
         isShutdown = true
+        for timer in policyTimers.values { timer.cancel() }
+        policyTimers.removeAll()
         for continuation in eventContinuations.values { continuation.finish() }
         eventContinuations.removeAll()
     }
@@ -180,12 +198,15 @@ public actor CollaborationService {
             .filter { $0.state == "pending" || $0.state == "running" }
             .map { WakeupInfo(engineer: $0.engineerID, reason: $0.reason,
                               state: $0.state) }
+        let proposals = try repo.proposals(id)
         return TaskDetail(task: task,
                           participants: try repo.participants(id),
                           subtasks: try repo.subtasks(id),
                           usage: usage,
                           runningEngineers: running,
-                          pendingWakeups: wakeups)
+                          pendingWakeups: wakeups,
+                          draftProposalCount: proposals.filter { $0.visibility == "draft" }.count,
+                          publishedProposalCount: proposals.filter { $0.visibility == "published" }.count)
     }
 
     /// Artifact rows for a task (workshop.listArtifacts).
@@ -277,13 +298,21 @@ public actor CollaborationService {
                         + #"","subtask_id":""# + subtaskID.rawValue + #""}"#,
                     deliveryState: "pending", at: timestamp)
             case .researchProposal:
+                // Substantial path (§5.3): Queued → Researching and every
+                // participant is woken to draft an independent proposal.
+                try transition(taskID, from: .queued, to: .researching, at: timestamp)
                 try repo.insertMessage(Message(
                     id: MessageID(newID("msg")), taskID: taskID,
                     seq: try repo.nextMessageSeq(taskID), author: .system,
                     kind: .systemEvent,
-                    body: "Research/proposal phase requires the Phase 3 collaboration "
-                        + "policy, which is not yet implemented. Task preserved in Queued.",
+                    body: "Research phase started; each participant drafts an "
+                        + "independent proposal (private until published).",
                     deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+                for engineer in request.participants {
+                    try repo.insertWakeup(taskID: taskID, engineerID: engineer,
+                                          reason: "research_proposal",
+                                          triggerSeq: nil, at: timestamp)
+                }
             }
             let r = CreateTaskReceipt(taskID: taskID, committedSeq: seq, state: .queued,
                                       status: .created, deepLink: nil)
@@ -295,6 +324,8 @@ public actor CollaborationService {
         }
         publishCommitted()
         scheduleDispatch()
+        scheduleWakeupCoalescer()
+        if request.phase == .researchProposal { scheduleResearchDeadline(taskID) }
         return receipt!
     }
 
@@ -351,7 +382,9 @@ public actor CollaborationService {
         if let engineer = principal.engineerID {
             try requireParticipant(engineer, taskID: taskID)
         }
+        // Provisional-seq rows are still streaming; engineers never see them.
         return try repo.messages(taskID, afterSeq: afterSeq, limit: limit)
+            .filter { $0.deliveryState == .committed }
     }
 
     /// workshop_post_message: kind text|proposal|review|help_request|decision;
@@ -424,11 +457,13 @@ public actor CollaborationService {
     /// workshop_report_result: owner submits evidence; subtask → review, task → verifying.
     public func toolReportResult(taskID: TaskID, subtaskID: SubtaskID, summary: String,
                                  artifactIDs: [String], validation: [JSONValue],
-                                 principal: Principal) throws -> Message {
+                                 principal: Principal) async throws -> Message {
         guard let engineer = principal.engineerID else {
             throw WorkshopError.invalidRequest("report_result requires an engineer principal")
         }
         try requireParticipant(engineer, taskID: taskID)
+        let task = try loadTask(taskID)
+        try requireImplementationApproval(task)
         guard let subtask = try repo.subtask(subtaskID), subtask.taskID == taskID,
               subtask.ownerID == engineer else {
             throw WorkshopError.notOwner
@@ -464,6 +499,33 @@ public actor CollaborationService {
                                   deliveryState: "pending", at: timestamp)
         }
         publishCommitted()
+
+        // Proportional review (§5.5): high-risk or research tasks get a
+        // verifier ≠ owner; prefer Devin when it isn't the owner.
+        if subtask.risk == "high" || task.phase == .researchProposal,
+           let resultMessage = committed {
+            let participants = (try repo.participants(taskID)).map(\.engineerID)
+            var candidates = participants.filter { $0 != engineer }
+            if candidates.contains(.devin) {
+                candidates.removeAll { $0 == .devin }
+                candidates.insert(.devin, at: 0)
+            }
+            var verifier: EngineerID?
+            for candidate in candidates {
+                if let adapter = adapters[candidate],
+                   await adapter.probe().health.kind == .available {
+                    verifier = candidate
+                    break
+                }
+            }
+            if let verifier {
+                _ = try repo.insertWakeup(
+                    taskID: taskID, engineerID: verifier,
+                    reason: "verify_result:" + resultMessage.id.rawValue,
+                    triggerSeq: resultMessage.seq, at: now())
+                scheduleWakeupCoalescer()
+            }
+        }
         return committed!
     }
 
@@ -475,6 +537,7 @@ public actor CollaborationService {
             throw WorkshopError.invalidRequest("publish_artifact requires an engineer principal")
         }
         try requireParticipant(engineer, taskID: taskID)
+        try requireImplementationApproval(try loadTask(taskID))
         guard let homeDir else {
             throw WorkshopError.invalidRequest("no artifact store configured")
         }
@@ -551,7 +614,7 @@ public actor CollaborationService {
             guard let summary = args["summary"]?.stringValue else {
                 throw WorkshopError.invalidRequest("summary required")
             }
-            return try .from(try toolReportResult(
+            return try .from(try await toolReportResult(
                 taskID: id, subtaskID: subtaskID, summary: summary,
                 artifactIDs: args["artifact_ids"]?.arrayValue?
                     .compactMap { $0.stringValue } ?? [],
@@ -567,8 +630,74 @@ public actor CollaborationService {
                 content = .object(obj)
             }
             return try toolSaveCheckpoint(taskID: id, content: content, principal: principal)
-        case "workshop_create_task", "workshop_propose_subtask",
-             "workshop_claim_subtask", "workshop_assign_subtask":
+        case "workshop_submit_proposal":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            return try await toolSubmitProposal(taskID: id, content: args,
+                                                principal: principal)
+        case "workshop_read_proposals":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            return try .from(try toolReadProposals(taskID: id, principal: principal))
+        case "workshop_submit_review":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            guard let proposalID = args["proposal_id"]?.stringValue,
+                  let body = args["body"]?.stringValue else {
+                throw WorkshopError.invalidRequest("proposal_id and body required")
+            }
+            return try .from(try await toolSubmitReview(
+                taskID: id, proposalID: proposalID,
+                severity: args["severity"]?.stringValue ?? "low",
+                disposition: args["disposition"]?.stringValue ?? "agree",
+                body: body, evidence: args["evidence"]?.stringValue,
+                principal: principal))
+        case "workshop_submit_report":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            return try await toolSubmitReport(taskID: id, content: args,
+                                              principal: principal)
+        case "workshop_assign_subtask":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            guard let ownerRaw = args["owner"]?.stringValue,
+                  let owner = EngineerID(rawValue: ownerRaw) else {
+                throw WorkshopError.invalidRequest("owner required")
+            }
+            return try await toolAssignSubtask(
+                taskID: id, subtaskID: SubtaskID(args["subtask_id"]?.stringValue ?? ""),
+                owner: owner, rationale: args["rationale"]?.stringValue ?? "",
+                expectedGeneration: args["expected_generation"]?.intValue.map(Int.init),
+                principal: principal)
+        case "workshop_claim_subtask":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            return try await toolClaimSubtask(
+                taskID: id, subtaskID: SubtaskID(args["subtask_id"]?.stringValue ?? ""),
+                principal: principal)
+        case "workshop_propose_subtask":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            guard let title = args["title"]?.stringValue else {
+                throw WorkshopError.invalidRequest("title required")
+            }
+            let acceptance = args["acceptance_criteria"]?.arrayValue?
+                .compactMap { $0.stringValue } ?? []
+            let depends = args["depends_on"]?.arrayValue?
+                .compactMap { $0.stringValue } ?? []
+            return try await toolProposeSubtask(
+                taskID: id, title: title, acceptanceCriteria: acceptance,
+                proposedOwner: args["proposed_owner"]?.stringValue
+                    .flatMap(EngineerID.init(rawValue:)),
+                risk: args["risk"]?.stringValue, dependsOn: depends,
+                principal: principal)
+        case "workshop_dispute_assignment":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            guard let body = args["body"]?.stringValue else {
+                throw WorkshopError.invalidRequest("body required")
+            }
+            return try await toolDisputeAssignment(
+                taskID: id, subtaskID: SubtaskID(args["subtask_id"]?.stringValue ?? ""),
+                body: body, principal: principal)
+        case "workshop_escalate_task":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            return try await toolEscalateTask(
+                taskID: id, reason: args["reason"]?.stringValue ?? "",
+                principal: principal)
+        case "workshop_create_task":
             throw WorkshopError.phaseNotImplemented(name)
         default:
             throw WorkshopError.methodNotFound(name)
@@ -657,15 +786,16 @@ public actor CollaborationService {
             guard let pending = attempt("pendingWakeups", { try repo.pendingWakeups() }),
                   !pending.isEmpty else { break }
             var groups: [String: (taskID: TaskID, engineer: EngineerID,
-                                 reason: String, rows: [Int64])] = [:]
+                                 reasons: [String], rows: [Int64])] = [:]
             var order: [String] = []
             for row in pending {
                 let key = row.taskID.rawValue + ":" + row.engineerID.rawValue
                 if groups[key] == nil {
-                    groups[key] = (row.taskID, row.engineerID, row.reason, [])
+                    groups[key] = (row.taskID, row.engineerID, [], [])
                     order.append(key)
                 }
                 groups[key]!.rows.append(row.id)
+                groups[key]!.reasons.append(row.reason)
             }
             var anyPending = false
             for key in order {
@@ -689,13 +819,21 @@ public actor CollaborationService {
                                                               at: now()) })
                     }
                     let timestamp = now()
+                    let unavailableBody: String
+                    if group.reasons.contains("consolidate") {
+                        // §5.3: no other engineer is promoted to arbiter.
+                        unavailableBody = "Consolidated report waits for "
+                            + "\(group.engineer.displayName) (unavailable: "
+                            + "\(probe.health.detail)) or a user override"
+                    } else {
+                        unavailableBody = "\(group.engineer.rawValue.capitalized) was "
+                            + "mentioned but is \(probe.health.detail); not woken"
+                    }
                     _ = attempt("wakeupUnavailableEvent") {
                         try repo.insertMessage(Message(
                             id: MessageID(newID("msg")), taskID: task.id,
                             seq: try repo.nextMessageSeq(task.id), author: .system,
-                            kind: .systemEvent,
-                            body: "\(group.engineer.rawValue.capitalized) was "
-                                + "mentioned but is \(probe.health.detail); not woken",
+                            kind: .systemEvent, body: unavailableBody,
                             deliveryState: .committed, createdAt: timestamp,
                             updatedAt: timestamp))
                     }
@@ -713,7 +851,7 @@ public actor CollaborationService {
                 }) ?? nil
                 await runTurn(adapter: adapter, engineer: group.engineer, task: task,
                               subtask: owned ?? fallback,
-                              wakeReason: group.reason)
+                              wakeReason: group.reasons.last)
                 for id in group.rows {
                     _ = attempt("wakeupDone",
                                 { try repo.setWakeupState(id, "done", at: now()) })
@@ -724,6 +862,8 @@ public actor CollaborationService {
                 let more = attempt("pendingWakeups", { try repo.pendingWakeups() }) ?? []
                 if more.isEmpty { break }
             }
+            // In-flight turn groups stay pending; don't busy-poll them.
+            try? await Task.sleep(for: max(wakeupCoalescence, .milliseconds(20)))
         }
     }
 
@@ -743,22 +883,34 @@ public actor CollaborationService {
                         body: message.body
                             + "\n\n[stream interrupted by service restart; marked uncertain]",
                         at: timestamp)
+                    if message.seq >= WorkshopRepository.provisionalSeqBase {
+                        try repo.reassignMessageSeq(
+                            message.id, seq: try repo.nextMessageSeq(message.taskID),
+                            at: timestamp)
+                    }
                     try repo.updateMessageDelivery(message.id, .committed, at: timestamp)
                     if let authorID = message.author.engineerID,
                        let subtask = try repo.latestOwnedSubtask(taskID: message.taskID,
                                                                owner: authorID) {
                         try repo.updateSubtaskState(subtask.id, .blocked, at: timestamp)
                     }
+                    // F2: the message must reflect what actually happened — only
+                    // claim "blocked" when the working→blocked transition ran.
+                    var transitioned = false
                     if let task = try repo.task(message.taskID), task.state == .working {
                         try transition(message.taskID, from: .working, to: .blocked,
                                        at: timestamp)
+                        transitioned = true
                     }
+                    let detail = transitioned
+                        ? "task blocked pending reconciliation (Phase 4)"
+                        : "task remains \(try repo.task(message.taskID)?.state.displayName.lowercased() ?? "unknown")"
                     try repo.insertMessage(Message(
                         id: MessageID(newID("msg")), taskID: message.taskID,
                         seq: try repo.nextMessageSeq(message.taskID), author: .system,
                         kind: .systemEvent,
-                        body: "Interrupted stream marked uncertain after service restart; "
-                            + "task blocked pending reconciliation (Phase 4)",
+                        body: "Interrupted stream marked uncertain after service "
+                            + "restart; \(detail)",
                         deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
                 }
             }
@@ -796,6 +948,11 @@ public actor CollaborationService {
         await dispatchLoop()
     }
 
+    /// Test hook: all wakeup rows for a task, any state.
+    public func wakeupsForTest(_ taskID: TaskID) throws -> [WorkshopRepository.Wakeup] {
+        try repo.wakeups(taskID)
+    }
+
     /// Test hook: run the CAS claim directly (concurrent callers → exactly one winner).
     public func claimForTest(subtaskID: SubtaskID, owner: EngineerID,
                              expectedGeneration: Int) throws -> Bool {
@@ -804,21 +961,24 @@ public actor CollaborationService {
     }
 
     /// Test hook: simulate a crashed mid-turn state — claimed subtask, working task,
-    /// and an uncommitted streaming message.
-    public func insertStreamingMessageForTest() throws {
+    /// and an uncommitted streaming message. `forceWorking: false` leaves the task
+    /// in its current state (tests the non-transitioning recovery message, F2).
+    public func insertStreamingMessageForTest(forceWorking: Bool = true) throws {
         guard let task = try repo.listTasks().first else { return }
         let timestamp = now()
         try repo.db.transaction {
-            if let subtask = try repo.subtasks(task.id).first {
-                _ = try repo.claimSubtask(subtask.id, owner: .devin,
-                                          expectedGeneration: subtask.generation,
-                                          leaseExpiresAt: timestamp.addingTimeInterval(300),
-                                          at: timestamp)
-            }
-            var state = task.state
-            for next in [TaskState.ready, .working] where state != next {
-                try transition(task.id, from: state, to: next, at: timestamp)
-                state = next
+            if forceWorking {
+                if let subtask = try repo.subtasks(task.id).first {
+                    _ = try repo.claimSubtask(subtask.id, owner: .devin,
+                                              expectedGeneration: subtask.generation,
+                                              leaseExpiresAt: timestamp.addingTimeInterval(300),
+                                              at: timestamp)
+                }
+                var state = task.state
+                for next in [TaskState.ready, .working] where state != next {
+                    try transition(task.id, from: state, to: next, at: timestamp)
+                    state = next
+                }
             }
             try repo.insertMessage(Message(
                 id: MessageID(newID("msg")), taskID: task.id,
@@ -1008,24 +1168,46 @@ public actor CollaborationService {
             return
         }
 
-        // Streaming placeholder message in its own transaction.
+        // Streaming placeholder gets a provisional seq (≥ provisionalSeqBase)
+        // so it sorts last while streaming and never takes a real slot (F1).
         let messageID = MessageID(newID("msg"))
         _ = attempt("insertStreamingMessage") {
             try repo.db.transaction {
                 try repo.insertMessage(Message(
-                    id: messageID, taskID: task.id, seq: try repo.nextMessageSeq(task.id),
+                    id: messageID, taskID: task.id,
+                    seq: try repo.nextProvisionalSeq(),
                     author: .engineer(engineer), kind: .text, body: "",
                     deliveryState: .streaming, createdAt: timestamp, updatedAt: timestamp))
             }
         }
 
-        // Context: only messages after the participant's consumed cursor (§8.5),
-        // bounded to the last 60.
+        // Execution-style turns mark the task working so the UI reflects it.
+        if wakeReason == nil || wakeReason == "assigned" || wakeReason == "resumed"
+            || wakeReason == "changes_requested" {
+            _ = attempt("markWorking") {
+                try repo.db.transaction {
+                    if let subtask, subtask.state == .claimed {
+                        try repo.updateSubtaskState(subtask.id, .working, at: timestamp)
+                    }
+                    if let current = try repo.task(task.id),
+                       current.state.canTransition(to: .working) {
+                        try transition(task.id, from: current.state, to: .working,
+                                       at: timestamp)
+                    }
+                }
+            }
+            publishCommitted()
+        }
+
+        // Context: only committed messages after the participant's consumed
+        // cursor (§8.5), bounded to the last 60. Streaming placeholders are
+        // excluded from packets and from cursor advancement (F1).
         let lastRead: Int64 = attempt("participantCursor", {
             try repo.participant(task.id, engineer)?.lastReadSeq ?? 0
         }) ?? 0
-        var recent: [Message] = attempt("recentMessages",
-                                        { try repo.messages(task.id, afterSeq: lastRead) }) ?? []
+        var recent: [Message] = (attempt("recentMessages",
+            { try repo.messages(task.id, afterSeq: lastRead) }) ?? [])
+            .filter { $0.deliveryState == .committed }
         var truncatedNote: String?
         if recent.count > 60 {
             truncatedNote = "\(recent.count - 60) older messages omitted"
@@ -1040,9 +1222,14 @@ public actor CollaborationService {
         let context = TurnContext(task: task, subtask: subtask,
                                   recentMessages: recent,
                                   wakeReason: wakeReason,
+                                  wakeDetail: await wakeDetail(
+                                      for: wakeReason, task: task,
+                                      engineer: engineer, subtask: subtask),
                                   truncatedNote: truncatedNote)
         packetInspector?(engineer, context.packetText(for: engineer))
         let turnID = newID("turn")
+        runningTurnRefs[turnKey] = (adapter, ref, turnID)
+        defer { runningTurnRefs.removeValue(forKey: turnKey) }
         let stream = adapter.sendTurn(ref: ref, turnID: turnID, context: context,
                                       deadline: timestamp.addingTimeInterval(300))
         do {
@@ -1091,6 +1278,11 @@ public actor CollaborationService {
         _ = attempt("commitTurn") {
             try repo.db.transaction {
                 try repo.updateMessageBody(messageID, body: body, at: endTime)
+                // F1: the placeholder takes its real seq now, so tool-posted
+                // messages from the same turn keep their earlier seqs.
+                try repo.reassignMessageSeq(messageID,
+                                            seq: try repo.nextMessageSeq(task.id),
+                                            at: endTime)
                 try repo.updateMessageDelivery(messageID, .committed, at: endTime)
                 try repo.insertOutbox(taskID: task.id, eventType: "message.committed",
                                       payload: #"{"message_id":""# + messageID.rawValue
@@ -1099,7 +1291,22 @@ public actor CollaborationService {
                 if failedReason == nil, sawCompletion {
                     try repo.setLastReadSeq(task.id, engineer, seq: maxSeq, at: endTime)
                 }
-                if let failedReason {
+                let latest = try repo.task(task.id)
+                if let latest, latest.cancelRequestedAt != nil,
+                   latest.state != .cancelled {
+                    // A cancellation was requested while this turn ran.
+                    if latest.state.canTransition(to: .cancelled) {
+                        try transition(task.id, from: latest.state, to: .cancelled,
+                                       at: endTime)
+                    } else {
+                        try repo.updateTaskState(task.id, .cancelled, at: endTime)
+                    }
+                    try repo.insertMessage(Message(
+                        id: MessageID(newID("msg")), taskID: task.id,
+                        seq: try repo.nextMessageSeq(task.id), author: .system,
+                        kind: .systemEvent, body: "Cancellation completed",
+                        deliveryState: .committed, createdAt: endTime, updatedAt: endTime))
+                } else if let failedReason {
                     if wakeReason == nil {
                         if let subtask {
                             try repo.updateSubtaskState(subtask.id, .blocked, at: endTime)
@@ -1124,8 +1331,10 @@ public actor CollaborationService {
                     if let subtask {
                         try repo.updateSubtaskState(subtask.id, .review, at: endTime)
                     }
-                    if let current = try repo.task(task.id) {
-                        try transition(task.id, from: current.state, to: .verifying, at: endTime)
+                    if let current = try repo.task(task.id),
+                       current.state.canTransition(to: .verifying) {
+                        try transition(task.id, from: current.state, to: .verifying,
+                                       at: endTime)
                     }
                     try repo.insertMessage(Message(
                         id: MessageID(newID("msg")), taskID: task.id,
@@ -1142,5 +1351,1020 @@ public actor CollaborationService {
             }
         }
         publishCommitted()
+    }
+
+    // MARK: - Phase 3: collaboration policy (§5.1, §5.3, §5.5, §8.2)
+
+    private func loadTask(_ taskID: TaskID) throws -> WorkshopTask {
+        guard let task = try repo.task(taskID) else {
+            throw WorkshopError.taskNotFound(taskID)
+        }
+        return task
+    }
+
+    private func requireUser(_ principal: Principal, _ action: String) throws {
+        guard principal == .user else {
+            throw WorkshopError.userAuthorityRequired(action)
+        }
+    }
+
+    /// T07: on substantial tasks implementation tools need approval covering
+    /// the current report revision (T08 invalidates older approvals).
+    private func requireImplementationApproval(_ task: WorkshopTask) throws {
+        if task.phase == .researchProposal && !task.hasCurrentApproval {
+            throw WorkshopError.approvalRequired(task.id)
+        }
+    }
+
+    /// Extra packet payload for special wakeup reasons (spec §G + Phase 3).
+    private func wakeDetail(for reason: String?, task: WorkshopTask,
+                            engineer: EngineerID, subtask: Subtask?) async -> String? {
+        guard let reason else { return nil }
+        let head = reason.split(separator: ":").first.map(String.init) ?? reason
+        switch head {
+        case "verify_result":
+            let messageID = reason.split(separator: ":").dropFirst().first
+                .map(String.init) ?? ""
+            return "Result message to verify: \(messageID). Read it via "
+                + "workshop_read_messages and inspect artifacts via workshop_get_task."
+        case "allocate":
+            var lines = ["Ready subtasks (assign each via workshop_assign_subtask):"]
+            let subs = (try? repo.subtasks(task.id)) ?? []
+            let ownership = latestReportOwnership(task.id)
+            for sub in subs where sub.state == .ready || sub.state == .claimed {
+                let proposed = ownership[sub.title]?.stringValue ?? "none"
+                let deps = sub.dependencies.joined(separator: ", ")
+                lines.append("- \(sub.id.rawValue) \"\(sub.title)\" risk=\(sub.risk) "
+                    + "proposed_owner=\(proposed) deps=[\(deps)] state=\(sub.state.rawValue)")
+            }
+            lines.append("Engineer health:")
+            for participant in ((try? repo.participants(task.id)) ?? []).map(\.engineerID) {
+                if let adapter = adapters[participant] {
+                    let probe = await adapter.probe()
+                    lines.append("- \(participant.rawValue): \(probe.health.label) "
+                        + "(\(probe.health.detail))")
+                } else {
+                    lines.append("- \(participant.rawValue): Unavailable (no adapter)")
+                }
+            }
+            return lines.joined(separator: "\n")
+        case "dispute":
+            let disputes = ((try? repo.decisions(task.id)) ?? [])
+                .filter { $0.kind == "dispute" }
+            if let last = disputes.last {
+                return "Dispute from \(last.author): \(last.body)"
+            }
+            return nil
+        case "revise_report":
+            let changes = ((try? repo.decisions(task.id)) ?? [])
+                .filter { $0.kind == "request_changes" }
+            if let last = changes.last {
+                return "Requested changes: \(last.body)"
+            }
+            return nil
+        default:
+            return nil
+        }
+    }
+
+    /// proposed_owner per subtask_title from the latest report (or the
+    /// approved proposal when the user overrode with scope "proposal:<id>").
+    private func latestReportOwnership(_ taskID: TaskID) -> [String: JSONValue] {
+        guard let report = try? repo.latestReport(taskID),
+              let content = try? JSONDecoder().decode(JSONValue.self,
+                                                      from: Data(report.content.utf8)),
+              let items = content["proposed_ownership"]?.arrayValue else { return [:] }
+        var map: [String: JSONValue] = [:]
+        for item in items {
+            if let title = item["subtask_title"]?.stringValue {
+                map[title] = item["proposed_owner"]
+            }
+        }
+        return map
+    }
+
+    // MARK: Deadlines
+
+    private func scheduleResearchDeadline(_ taskID: TaskID) {
+        guard researchDeadline > 0 else { return }
+        let key = "research:" + taskID.rawValue
+        policyTimers[key]?.cancel()
+        let deadline = researchDeadline
+        policyTimers[key] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(deadline))
+            guard !Task.isCancelled else { return }
+            _ = try? await self?.publishProposals(taskID)
+        }
+    }
+
+    private func scheduleReviewDeadline(_ taskID: TaskID) {
+        guard reviewDeadline > 0 else { return }
+        let key = "review:" + taskID.rawValue
+        policyTimers[key]?.cancel()
+        let deadline = reviewDeadline
+        policyTimers[key] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(deadline))
+            guard !Task.isCancelled else { return }
+            await self?.requestConsolidation(taskID)
+        }
+    }
+
+    /// Wake Devin to consolidate once, while the task is reviewing proposals.
+    private func requestConsolidation(_ taskID: TaskID) {
+        guard let task = try? repo.task(taskID),
+              task.state == .reviewingProposal else { return }
+        let already = ((try? repo.wakeups(taskID)) ?? []).contains {
+            $0.engineerID == .devin && $0.reason == "consolidate"
+        }
+        guard !already else { return }
+        _ = attempt("consolidateWakeup") {
+            try repo.insertWakeup(taskID: taskID, engineerID: .devin,
+                                  reason: "consolidate", triggerSeq: nil, at: now())
+        }
+        scheduleWakeupCoalescer()
+    }
+
+    // MARK: Proposals (T12)
+
+    /// workshop_submit_proposal: one independent proposal per participant,
+    /// stored as a private draft until publication.
+    public func toolSubmitProposal(taskID: TaskID, content: JSONValue,
+                                   principal: Principal) async throws -> JSONValue {
+        guard let engineer = principal.engineerID else {
+            throw WorkshopError.invalidRequest("submit_proposal requires an engineer principal")
+        }
+        try requireParticipant(engineer, taskID: taskID)
+        let task = try loadTask(taskID)
+        guard task.phase == .researchProposal else {
+            throw WorkshopError.invalidRequest("task is not a research task")
+        }
+        guard task.state == .researching || task.state == .reviewingProposal else {
+            throw WorkshopError.invalidRequest(
+                "proposals are only accepted while researching/reviewing (state: "
+                + task.state.rawValue + ")")
+        }
+        var stripped = content
+        if case .object(var obj) = stripped {
+            obj.removeValue(forKey: "task_id")
+            stripped = .object(obj)
+        }
+        let data = try JSONEncoder().encode(stripped)
+        let timestamp = now()
+        var result: Proposal
+        if let existing = try repo.proposalBy(taskID: taskID, author: engineer) {
+            var updated = existing
+            updated.revision += 1
+            updated.content = String(decoding: data, as: UTF8.self)
+            updated.updatedAt = timestamp
+            try repo.upsertProposal(updated)
+            result = updated
+        } else {
+            let proposal = Proposal(id: newID("prop"), taskID: taskID, author: engineer,
+                                    content: String(decoding: data, as: UTF8.self),
+                                    createdAt: timestamp, updatedAt: timestamp)
+            try repo.upsertProposal(proposal)
+            result = proposal
+        }
+        // Publish early once every available participant has drafted.
+        if task.state == .researching {
+            let participants = try repo.participants(taskID).map(\.engineerID)
+            var allDrafted = !participants.isEmpty
+            for participant in participants {
+                guard let adapter = adapters[participant],
+                      await adapter.probe().health.kind == .available else { continue }
+                if try repo.proposalBy(taskID: taskID, author: participant) == nil {
+                    allDrafted = false
+                }
+            }
+            if allDrafted { try await publishProposals(taskID) }
+        }
+        return .object(["proposal_id": .string(result.id),
+                        "revision": .number(Double(result.revision)),
+                        "visibility": .string(result.visibility)])
+    }
+
+    /// workshop_read_proposals: published proposals plus the caller's own
+    /// draft; other engineers' drafts are invisible (T12).
+    public func toolReadProposals(taskID: TaskID, principal: Principal) throws -> [Proposal] {
+        let all = try repo.proposals(taskID)
+        return all.filter {
+            $0.visibility == "published" || $0.author == principal.engineerID
+        }
+    }
+
+    /// All proposals for the UI/user (drafts included — the user sees counts).
+    public func listProposals(_ taskID: TaskID) throws -> [Proposal] {
+        try repo.proposals(taskID)
+    }
+
+    public func listReports(_ taskID: TaskID) throws -> [Report] {
+        try repo.reports(taskID)
+    }
+
+    public func listDecisions(_ taskID: TaskID) throws -> [Decision] {
+        try repo.decisions(taskID)
+    }
+
+    /// Publish all drafts together: visibility flips atomically, the task
+    /// moves to ReviewingProposal, and every participant gets a cross_review
+    /// wakeup. Missing participants are recorded in the system event.
+    public func publishProposals(_ taskID: TaskID) async throws {
+        let task = try loadTask(taskID)
+        guard task.phase == .researchProposal, task.state == .researching else { return }
+        let timestamp = now()
+        let proposals = try repo.proposals(taskID)
+        let authors = proposals.map(\.author.rawValue).sorted()
+        let participants = try repo.participants(taskID).map(\.engineerID)
+        let missing = participants.filter { p in
+            !proposals.contains { $0.author == p }
+        }.map(\.rawValue).sorted()
+        try repo.db.transaction {
+            try repo.publishAllProposals(taskID, at: timestamp)
+            try transition(taskID, from: .researching, to: .reviewingProposal,
+                           at: timestamp)
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID), author: .system,
+                kind: .systemEvent,
+                body: "Proposals published by: \(authors.joined(separator: ", "))"
+                    + (missing.isEmpty ? "" : "; missing: \(missing.joined(separator: ", "))"),
+                deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+            for engineer in participants {
+                try repo.insertWakeup(taskID: taskID, engineerID: engineer,
+                                      reason: "cross_review", triggerSeq: nil,
+                                      at: timestamp)
+            }
+            try repo.insertOutbox(taskID: taskID, eventType: "task.state_changed",
+                                  payload: #"{"task_id":""# + taskID.rawValue
+                                      + #"","state":"reviewing_proposal"}"#,
+                                  deliveryState: "pending", at: timestamp)
+        }
+        publishCommitted()
+        scheduleWakeupCoalescer()
+        scheduleReviewDeadline(taskID)
+    }
+
+    // MARK: Reviews (cross-review + proportional verification, §5.5)
+
+    /// workshop_submit_review: stored as a kind=review message carrying a
+    /// structured payload; drives consolidation and verification outcomes.
+    public func toolSubmitReview(taskID: TaskID, proposalID: String, severity: String,
+                                 disposition: String, body: String, evidence: String?,
+                                 principal: Principal) async throws -> Message {
+        guard let engineer = principal.engineerID else {
+            throw WorkshopError.invalidRequest("submit_review requires an engineer principal")
+        }
+        try requireParticipant(engineer, taskID: taskID)
+        guard ["low", "medium", "high"].contains(severity) else {
+            throw WorkshopError.invalidRequest("severity must be low|medium|high")
+        }
+        guard ["agree", "disagree", "needs_changes"].contains(disposition) else {
+            throw WorkshopError.invalidRequest(
+                "disposition must be agree|disagree|needs_changes")
+        }
+        var structured: [String: JSONValue] = [
+            "type": .string("review"),
+            "proposal_id": .string(proposalID),
+            "severity": .string(severity),
+            "disposition": .string(disposition),
+        ]
+        if let evidence { structured["evidence"] = .string(evidence) }
+        let structuredText = String(
+            decoding: try JSONEncoder().encode(JSONValue.object(structured)),
+            as: UTF8.self)
+        let message = try postMessage(taskID: taskID, body: body, principal: principal,
+                                      kind: .review, structured: structuredText)
+
+        if try repo.proposal(proposalID) != nil {
+            // Proposal review: consolidate once every available participant
+            // has submitted at least one review (§5.3).
+            let participants = try repo.participants(taskID).map(\.engineerID)
+            let proposalIDs = Set(try repo.proposals(taskID).map(\.id))
+            var reviewedBy = Set<EngineerID>()
+            for m in try repo.messages(taskID) where m.kind == .review {
+                guard let author = m.author.engineerID,
+                      let s = m.structured,
+                      let value = try? JSONDecoder().decode(JSONValue.self,
+                                                            from: Data(s.utf8)),
+                      value["type"]?.stringValue == "review",
+                      let pid = value["proposal_id"]?.stringValue,
+                      proposalIDs.contains(pid) else { continue }
+                reviewedBy.insert(author)
+            }
+            var allReviewed = !participants.isEmpty
+            for participant in participants {
+                guard let adapter = adapters[participant],
+                      await adapter.probe().health.kind == .available else { continue }
+                if !reviewedBy.contains(participant) { allReviewed = false }
+            }
+            if allReviewed { requestConsolidation(taskID) }
+        } else if let resultMessage = try repo.message(MessageID(proposalID)),
+                  let s = resultMessage.structured,
+                  let value = try? JSONDecoder().decode(JSONValue.self,
+                                                        from: Data(s.utf8)),
+                  let subtaskRaw = value["subtask_id"]?.stringValue,
+                  let subtask = try repo.subtask(SubtaskID(subtaskRaw)),
+                  subtask.taskID == taskID {
+            // Verification review of a report_result message (§5.5).
+            let timestamp = now()
+            try repo.db.transaction {
+                if disposition == "agree" {
+                    try repo.updateSubtaskState(subtask.id, .done, at: timestamp)
+                    try repo.updateSubtaskVerification(subtask.id, "passed",
+                                                     at: timestamp)
+                    try repo.insertMessage(Message(
+                        id: MessageID(newID("msg")), taskID: taskID,
+                        seq: try repo.nextMessageSeq(taskID), author: .system,
+                        kind: .systemEvent,
+                        body: "Verification passed for \"\(subtask.title)\"",
+                        deliveryState: .committed, createdAt: timestamp,
+                        updatedAt: timestamp))
+                } else {
+                    try repo.updateSubtaskState(subtask.id, .working, at: timestamp)
+                    try repo.updateSubtaskVerification(subtask.id, "changes_requested",
+                                                     at: timestamp)
+                    if let current = try repo.task(taskID),
+                       current.state == .verifying {
+                        try transition(taskID, from: .verifying, to: .working,
+                                       at: timestamp)
+                    }
+                    if let owner = subtask.ownerID {
+                        try repo.insertWakeup(taskID: taskID, engineerID: owner,
+                                              reason: "changes_requested",
+                                              triggerSeq: message.seq, at: timestamp)
+                    }
+                    try repo.insertMessage(Message(
+                        id: MessageID(newID("msg")), taskID: taskID,
+                        seq: try repo.nextMessageSeq(taskID), author: .system,
+                        kind: .systemEvent,
+                        body: "Verification requested changes on "
+                            + "\"\(subtask.title)\"",
+                        deliveryState: .committed, createdAt: timestamp,
+                        updatedAt: timestamp))
+                }
+            }
+            publishCommitted()
+            scheduleWakeupCoalescer()
+        }
+        return message
+    }
+
+    // MARK: Consolidated report (§5.3)
+
+    /// workshop_submit_report: Devin (or the user) writes revision N of the
+    /// consolidated report. A later revision invalidates any approval (T08).
+    public func toolSubmitReport(taskID: TaskID, content: JSONValue,
+                                 principal: Principal) async throws -> JSONValue {
+        guard principal == .user || principal == .engineer(.devin) else {
+            throw WorkshopError.userAuthorityRequired(
+                "the consolidated report is Devin Fusion's responsibility")
+        }
+        if let engineer = principal.engineerID {
+            try requireParticipant(engineer, taskID: taskID)
+        }
+        let task = try loadTask(taskID)
+        var stripped = content
+        if case .object(var obj) = stripped {
+            obj.removeValue(forKey: "task_id")
+            stripped = .object(obj)
+        }
+        let data = try JSONEncoder().encode(stripped)
+        let timestamp = now()
+        let revision = ((try repo.latestReport(taskID))?.revision ?? 0) + 1
+        let report = Report(id: newID("rep"), taskID: taskID, revision: revision,
+                            author: principal.kind == "engineer" ? "devin" : "user",
+                            content: String(decoding: data, as: UTF8.self),
+                            createdAt: timestamp)
+        var invalidatedFrom: Int?
+        try repo.db.transaction {
+            try repo.insertReport(report)
+            try repo.updateTaskRevisions(taskID, reportRevision: .some(revision),
+                                         at: timestamp)
+            // T08: a new revision revokes the older approval's authority.
+            if let approved = task.approvalRevision, approved != revision {
+                try repo.updateTaskRevisions(taskID, approvalRevision: .some(nil),
+                                             at: timestamp)
+                invalidatedFrom = approved
+                try repo.insertMessage(Message(
+                    id: MessageID(newID("msg")), taskID: taskID,
+                    seq: try repo.nextMessageSeq(taskID), author: .system,
+                    kind: .systemEvent,
+                    body: "Report revised to r\(revision); prior approval (r\(approved)) "
+                        + "no longer authorizes new work",
+                    deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+            }
+            if task.state == .reviewingProposal {
+                try transition(taskID, from: .reviewingProposal,
+                               to: .awaitingArchitectureApproval, at: timestamp)
+            }
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID),
+                author: principal, kind: .proposal,
+                body: "Consolidated report r\(revision)",
+                deliveryState: .committed,
+                structured: #"{"type":"report","revision":\#(revision),"report_id":""#
+                    + report.id + #""}"#,
+                createdAt: timestamp, updatedAt: timestamp))
+            try repo.insertOutbox(taskID: taskID, eventType: "task.state_changed",
+                                  payload: #"{"task_id":""# + taskID.rawValue
+                                      + #"","report_revision":\#(revision)}"#,
+                                  deliveryState: "pending", at: timestamp)
+        }
+        _ = invalidatedFrom
+        publishCommitted()
+        return .object(["report_id": .string(report.id),
+                        "revision": .number(Double(revision))])
+    }
+
+    // MARK: User authority: approval / changes / alternative
+
+    /// Shared approval path (approveArchitecture / chooseAlternative /
+    /// proposal override). User principal only.
+    private func approve(taskID: TaskID, reportRevision: Int, scope: String?,
+                         kind: String, principal: Principal) async throws {
+        try requireUser(principal, "approve architecture")
+        let task = try loadTask(taskID)
+        guard task.phase == .researchProposal else {
+            throw WorkshopError.invalidRequest("task is not a research task")
+        }
+        let current = task.reportRevision ?? 0
+        guard reportRevision == current else {
+            throw WorkshopError.staleRevision(expected: reportRevision,
+                                            actual: task.reportRevision)
+        }
+        // Resolve the approved content: latest report, or a published proposal
+        // when the user overrides via scope "proposal:<id>" (§5.3).
+        var contentJSON: JSONValue?
+        if let scope, scope.hasPrefix("proposal:") {
+            let proposalID = String(scope.dropFirst("proposal:".count))
+            guard let proposal = try repo.proposal(proposalID),
+                  proposal.taskID == taskID,
+                  proposal.visibility == "published" else {
+                throw WorkshopError.invalidRequest(
+                    "scope proposal is not a published proposal on this task")
+            }
+            contentJSON = try? JSONDecoder().decode(JSONValue.self,
+                                                    from: Data(proposal.content.utf8))
+        } else if let report = try repo.latestReport(taskID) {
+            contentJSON = try? JSONDecoder().decode(JSONValue.self,
+                                                    from: Data(report.content.utf8))
+        }
+        let timestamp = now()
+        let firstApproval = task.approvalRevision == nil
+        try repo.db.transaction {
+            try repo.insertDecision(Decision(
+                id: newID("dec"), taskID: taskID, kind: kind,
+                revision: reportRevision, scope: scope, author: "user",
+                body: scope ?? "approved", createdAt: timestamp))
+            try repo.updateTaskRevisions(taskID,
+                                         approvalRevision: .some(reportRevision),
+                                         at: timestamp)
+            var state = task.state
+            if state == .reviewingProposal {
+                try transition(taskID, from: state,
+                               to: .awaitingArchitectureApproval, at: timestamp)
+                state = .awaitingArchitectureApproval
+            }
+            if state == .awaitingArchitectureApproval {
+                try transition(taskID, from: state, to: .ready, at: timestamp)
+            }
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID), author: .system,
+                kind: .systemEvent,
+                body: "Architecture approved (r\(reportRevision)"
+                    + (scope.map { ", scope \($0)" } ?? "") + ")",
+                deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+            if firstApproval, let contentJSON {
+                try createSubtasks(from: contentJSON, taskID: taskID, at: timestamp)
+            }
+        }
+        publishCommitted()
+        // Wake the allocation arbiter.
+        if try repo.participant(taskID, .devin) != nil {
+            _ = try repo.insertWakeup(taskID: taskID, engineerID: .devin,
+                                      reason: "allocate", triggerSeq: nil,
+                                      at: now())
+            scheduleWakeupCoalescer()
+        } else {
+            _ = attempt("allocateUnavailable") {
+                try repo.insertMessage(Message(
+                    id: MessageID(newID("msg")), taskID: taskID,
+                    seq: try repo.nextMessageSeq(taskID), author: .system,
+                    kind: .systemEvent,
+                    body: "Allocation waits for Devin Fusion, who is not a "
+                        + "participant of this task",
+                    deliveryState: .committed, createdAt: now(), updatedAt: now()))
+            }
+            publishCommitted()
+        }
+    }
+
+    /// Create subtasks from a report/proposal's proposed_ownership array.
+    /// Dependencies are title references resolved in a second pass.
+    private func createSubtasks(from content: JSONValue, taskID: TaskID,
+                                at timestamp: Date) throws {
+        guard let items = content["proposed_ownership"]?.arrayValue else { return }
+        var idByTitle: [String: SubtaskID] = [:]
+        for item in items {
+            guard let title = item["subtask_title"]?.stringValue else { continue }
+            let id = SubtaskID(newID("sub"))
+            idByTitle[title] = id
+            let acceptance = item["acceptance_criteria"]?.arrayValue?
+                .compactMap { $0.stringValue }
+                ?? item["acceptance_criteria"]?.stringValue.map { [$0] } ?? []
+            try repo.insertSubtask(Subtask(
+                id: id, taskID: taskID, title: title, acceptance: acceptance,
+                risk: item["risk"]?.stringValue ?? "normal",
+                createdAt: timestamp, updatedAt: timestamp))
+        }
+        for item in items {
+            guard let title = item["subtask_title"]?.stringValue,
+                  let id = idByTitle[title],
+                  let deps = item["depends_on"]?.arrayValue else { continue }
+            let depIDs = deps.compactMap { $0.stringValue }
+                .compactMap { idByTitle[$0]?.rawValue }
+            guard !depIDs.isEmpty else { continue }
+            try repo.db.execute(
+                "UPDATE subtasks SET dependencies=? WHERE id=?",
+                [.text(String(decoding: try JSONEncoder().encode(depIDs),
+                              as: UTF8.self)), .text(id.rawValue)])
+        }
+    }
+
+    public func approveArchitecture(taskID: TaskID, reportRevision: Int, scope: String?,
+                                    principal: Principal) async throws {
+        try await approve(taskID: taskID, reportRevision: reportRevision,
+                          scope: scope, kind: "approval", principal: principal)
+    }
+
+    public func requestChanges(taskID: TaskID, reportRevision: Int, comment: String,
+                               principal: Principal) async throws {
+        try requireUser(principal, "request changes")
+        let task = try loadTask(taskID)
+        guard reportRevision == task.reportRevision ?? 0 else {
+            throw WorkshopError.staleRevision(expected: reportRevision,
+                                            actual: task.reportRevision)
+        }
+        let timestamp = now()
+        try repo.db.transaction {
+            try repo.insertDecision(Decision(
+                id: newID("dec"), taskID: taskID, kind: "request_changes",
+                revision: reportRevision, author: "user", body: comment,
+                createdAt: timestamp))
+            if task.state == .awaitingArchitectureApproval {
+                try transition(taskID, from: .awaitingArchitectureApproval,
+                               to: .reviewingProposal, at: timestamp)
+            }
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID), author: .system,
+                kind: .systemEvent,
+                body: "Changes requested on report r\(reportRevision): \(comment)",
+                deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+        }
+        publishCommitted()
+        if try repo.participant(taskID, .devin) != nil {
+            _ = try repo.insertWakeup(taskID: taskID, engineerID: .devin,
+                                      reason: "revise_report", triggerSeq: nil,
+                                      at: now())
+            scheduleWakeupCoalescer()
+        }
+    }
+
+    public func chooseAlternative(taskID: TaskID, reportRevision: Int,
+                                  alternativeIndex: Int,
+                                  principal: Principal) async throws {
+        try await approve(taskID: taskID, reportRevision: reportRevision,
+                          scope: "alternative:\(alternativeIndex)",
+                          kind: "choose_alternative", principal: principal)
+    }
+
+    // MARK: Allocation (§5.3)
+
+    /// workshop_assign_subtask: Devin (arbiter) or the user. CAS on generation;
+    /// refuses when dependencies are unfinished.
+    public func toolAssignSubtask(taskID: TaskID, subtaskID: SubtaskID,
+                                  owner: EngineerID, rationale: String,
+                                  expectedGeneration: Int?,
+                                  principal: Principal) async throws -> JSONValue {
+        guard principal == .user || principal == .engineer(.devin) else {
+            throw WorkshopError.userAuthorityRequired(
+                "assignment authority belongs to the user or Devin Fusion")
+        }
+        if let engineer = principal.engineerID {
+            try requireParticipant(engineer, taskID: taskID)
+        }
+        let task = try loadTask(taskID)
+        try requireImplementationApproval(task)
+        try requireParticipant(owner, taskID: taskID)
+        guard let subtask = try repo.subtask(subtaskID), subtask.taskID == taskID else {
+            throw WorkshopError.invalidRequest("subtask not found on task")
+        }
+        try requireDependenciesDone(subtask)
+        let expected = expectedGeneration ?? subtask.generation
+        let timestamp = now()
+        var assigned = false
+        try repo.db.transaction {
+            assigned = try repo.assignSubtask(
+                subtaskID, owner: owner, expectedGeneration: expected,
+                leaseExpiresAt: timestamp.addingTimeInterval(300), at: timestamp)
+            guard assigned else { return }
+            let proposed = latestReportOwnership(taskID)[subtask.title]?.stringValue
+            try repo.insertDecision(Decision(
+                id: newID("dec"), taskID: taskID, kind: "allocation",
+                author: principal.kind == "user" ? "user" : "devin",
+                body: rationale, relatedID: subtaskID.rawValue, createdAt: timestamp))
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID), author: .system,
+                kind: .assignment,
+                body: "\(subtask.title) assigned to \(owner.displayName)",
+                deliveryState: .committed,
+                structured: String(decoding: try JSONEncoder().encode(JSONValue.object([
+                    "type": .string("assignment"),
+                    "subtask_id": .string(subtaskID.rawValue),
+                    "title": .string(subtask.title),
+                    "proposed_owner": proposed.map { JSONValue.string($0) } ?? .null,
+                    "owner": .string(owner.rawValue),
+                    "rationale": .string(rationale),
+                ])), as: UTF8.self),
+                createdAt: timestamp, updatedAt: timestamp))
+            try repo.insertWakeup(taskID: taskID, engineerID: owner,
+                                  reason: "assigned", triggerSeq: nil, at: timestamp)
+        }
+        guard assigned else {
+            throw WorkshopError.invalidRequest(
+                "subtask already owned or stale generation")
+        }
+        publishCommitted()
+        scheduleWakeupCoalescer()
+        return .object(["assigned": .bool(true),
+                        "generation": .number(Double(expected + 1))])
+    }
+
+    private func requireDependenciesDone(_ subtask: Subtask) throws {
+        for depID in subtask.dependencies {
+            guard let dep = try repo.subtask(SubtaskID(depID)),
+                  dep.state == .done else {
+                throw WorkshopError.blockedByDependency(subtask.id)
+            }
+        }
+    }
+
+    /// workshop_claim_subtask: a participant claims an unowned, unblocked
+    /// subtask (small tasks, or approved substantial tasks).
+    public func toolClaimSubtask(taskID: TaskID, subtaskID: SubtaskID,
+                                 principal: Principal) async throws -> JSONValue {
+        guard let engineer = principal.engineerID else {
+            throw WorkshopError.invalidRequest("claim_subtask requires an engineer principal")
+        }
+        try requireParticipant(engineer, taskID: taskID)
+        let task = try loadTask(taskID)
+        try requireImplementationApproval(task)
+        guard let adapter = adapters[engineer],
+              await adapter.probe().health.kind == .available else {
+            throw WorkshopError.adapterUnavailable(engineer)
+        }
+        guard let subtask = try repo.subtask(subtaskID), subtask.taskID == taskID else {
+            throw WorkshopError.invalidRequest("subtask not found on task")
+        }
+        try requireDependenciesDone(subtask)
+        let timestamp = now()
+        var claimed = false
+        try repo.db.transaction {
+            claimed = try repo.claimSubtask(
+                subtaskID, owner: engineer,
+                expectedGeneration: subtask.generation,
+                leaseExpiresAt: timestamp.addingTimeInterval(300), at: timestamp)
+            guard claimed else { return }
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID), author: .system,
+                kind: .systemEvent,
+                body: "\(engineer.displayName) claimed \(subtask.title) "
+                    + "(generation \(subtask.generation + 1))",
+                deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+            try repo.insertWakeup(taskID: taskID, engineerID: engineer,
+                                  reason: "assigned", triggerSeq: nil, at: timestamp)
+        }
+        guard claimed else {
+            throw WorkshopError.invalidRequest("subtask already owned")
+        }
+        publishCommitted()
+        scheduleWakeupCoalescer()
+        return .object(["claimed": .bool(true)])
+    }
+
+    /// workshop_propose_subtask: a participant proposes a new subtask; it is
+    /// created ready with a structured proposal card.
+    public func toolProposeSubtask(taskID: TaskID, title: String,
+                                   acceptanceCriteria: [String],
+                                   proposedOwner: EngineerID?, risk: String?,
+                                   dependsOn: [String],
+                                   principal: Principal) async throws -> JSONValue {
+        guard let engineer = principal.engineerID else {
+            throw WorkshopError.invalidRequest(
+                "propose_subtask requires an engineer principal")
+        }
+        try requireParticipant(engineer, taskID: taskID)
+        let task = try loadTask(taskID)
+        try requireImplementationApproval(task)
+        let timestamp = now()
+        let subtaskID = SubtaskID(newID("sub"))
+        let existing = try repo.subtasks(taskID)
+        let depIDs = dependsOn.compactMap { name in
+            existing.first { $0.title == name || $0.id.rawValue == name }?.id.rawValue
+        }
+        try repo.db.transaction {
+            try repo.insertSubtask(Subtask(
+                id: subtaskID, taskID: taskID, title: title,
+                acceptance: acceptanceCriteria, dependencies: depIDs,
+                risk: risk ?? "normal",
+                createdAt: timestamp, updatedAt: timestamp))
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID), author: principal,
+                kind: .proposal, body: "Proposed subtask: \(title)",
+                deliveryState: .committed,
+                structured: String(decoding: try JSONEncoder().encode(JSONValue.object([
+                    "type": .string("subtask_proposal"),
+                    "subtask_id": .string(subtaskID.rawValue),
+                    "title": .string(title),
+                    "proposed_owner": proposedOwner
+                        .map { JSONValue.string($0.rawValue) } ?? .null,
+                    "risk": .string(risk ?? "normal"),
+                    "depends_on": .array(depIDs.map { .string($0) }),
+                ])), as: UTF8.self),
+                createdAt: timestamp, updatedAt: timestamp))
+        }
+        publishCommitted()
+        return .object(["subtask_id": .string(subtaskID.rawValue)])
+    }
+
+    /// workshop_dispute_assignment: an engineer disputes an allocation; the
+    /// dispute is recorded and Devin is woken to resolve it.
+    public func toolDisputeAssignment(taskID: TaskID, subtaskID: SubtaskID,
+                                      body: String,
+                                      principal: Principal) async throws -> JSONValue {
+        guard let engineer = principal.engineerID else {
+            throw WorkshopError.invalidRequest(
+                "dispute_assignment requires an engineer principal")
+        }
+        try requireParticipant(engineer, taskID: taskID)
+        _ = try loadTask(taskID)
+        let timestamp = now()
+        try repo.db.transaction {
+            try repo.insertDecision(Decision(
+                id: newID("dec"), taskID: taskID, kind: "dispute",
+                author: engineer.rawValue, body: body,
+                relatedID: subtaskID.rawValue, createdAt: timestamp))
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID), author: .system,
+                kind: .systemEvent,
+                body: "\(engineer.displayName) disputed the assignment of "
+                    + subtaskID.rawValue + ": " + body,
+                deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+            if try repo.participant(taskID, .devin) != nil {
+                try repo.insertWakeup(taskID: taskID, engineerID: .devin,
+                                      reason: "dispute", triggerSeq: nil,
+                                      at: timestamp)
+            }
+        }
+        publishCommitted()
+        scheduleWakeupCoalescer()
+        return .object(["recorded": .bool(true)])
+    }
+
+    /// workshop_escalate_task: an engineer pauses the task and asks the user
+    /// to convert it to research or resume it.
+    public func toolEscalateTask(taskID: TaskID, reason: String,
+                                 principal: Principal) async throws -> JSONValue {
+        guard let engineer = principal.engineerID else {
+            throw WorkshopError.invalidRequest("escalate_task requires an engineer principal")
+        }
+        try requireParticipant(engineer, taskID: taskID)
+        let task = try loadTask(taskID)
+        let timestamp = now()
+        try repo.db.transaction {
+            try repo.insertDecision(Decision(
+                id: newID("dec"), taskID: taskID, kind: "escalation",
+                author: engineer.rawValue, body: reason, createdAt: timestamp))
+            if task.state == .working {
+                try transition(taskID, from: .working, to: .paused, at: timestamp)
+            }
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID), author: .system,
+                kind: .systemEvent,
+                body: "\(engineer.displayName) escalated: \(reason). "
+                    + "User may convert to research or resume.",
+                deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+        }
+        publishCommitted()
+        return .object(["escalated": .bool(true)])
+    }
+
+    // MARK: Task actions (user principal)
+
+    /// Pause a working task: suppress pending wakeups and cancel in-flight
+    /// turns, recording requested/acknowledged system events.
+    public func pauseTask(taskID: TaskID, principal: Principal) async throws {
+        try requireUser(principal, "pause task")
+        let task = try loadTask(taskID)
+        guard task.state == .working else {
+            throw WorkshopError.invalidRequest(
+                "only a working task can be paused (state: \(task.state.rawValue))")
+        }
+        let timestamp = now()
+        try repo.db.transaction {
+            try transition(taskID, from: .working, to: .paused, at: timestamp)
+            try repo.suppressPendingWakeups(taskID, at: timestamp)
+        }
+        await cancelRunningTurns(taskID: taskID, action: "Pause")
+        publishCommitted()
+    }
+
+    /// Resume a paused task back to Ready (or Researching for research tasks)
+    /// and re-wake the owner / participants.
+    public func resumeTask(taskID: TaskID, principal: Principal) async throws {
+        try requireUser(principal, "resume task")
+        let task = try loadTask(taskID)
+        guard task.state == .paused else {
+            throw WorkshopError.invalidRequest(
+                "only a paused task can be resumed (state: \(task.state.rawValue))")
+        }
+        let timestamp = now()
+        try repo.db.transaction {
+            if task.phase == .researchProposal {
+                try transition(taskID, from: .paused, to: .researching, at: timestamp)
+                for participant in try repo.participants(taskID) {
+                    try repo.insertWakeup(taskID: taskID,
+                                          engineerID: participant.engineerID,
+                                          reason: "research_proposal",
+                                          triggerSeq: nil, at: timestamp)
+                }
+            } else {
+                try transition(taskID, from: .paused, to: .ready, at: timestamp)
+                if let sub = try repo.subtasks(taskID)
+                    .first(where: { $0.ownerID != nil }),
+                   let owner = sub.ownerID {
+                    try repo.insertWakeup(taskID: taskID, engineerID: owner,
+                                          reason: "resumed", triggerSeq: nil,
+                                          at: timestamp)
+                } else if let sub = try repo.subtasks(taskID)
+                    .first(where: { $0.state == .ready }) {
+                    try repo.insertOutbox(
+                        taskID: taskID, eventType: Self.dispatchRequested,
+                        payload: #"{"task_id":""# + taskID.rawValue
+                            + #"","subtask_id":""# + sub.id.rawValue + #""}"#,
+                        deliveryState: "pending", at: timestamp)
+                }
+            }
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID), author: .system,
+                kind: .systemEvent, body: "Task resumed by user",
+                deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+        }
+        publishCommitted()
+        scheduleWakeupCoalescer()
+        scheduleDispatch()
+    }
+
+    /// Cancel a ready/working task. With a turn running, the request is
+    /// recorded and the transition completes when the turn ends.
+    public func cancelTask(taskID: TaskID, principal: Principal) async throws {
+        try requireUser(principal, "cancel task")
+        let task = try loadTask(taskID)
+        guard task.state == .ready || task.state == .working else {
+            throw WorkshopError.invalidRequest(
+                "only a ready/working task can be cancelled (state: \(task.state.rawValue))")
+        }
+        let timestamp = now()
+        let running = runningTurnRefs.keys.filter {
+            $0.hasPrefix(taskID.rawValue + ":")
+        }
+        try repo.db.transaction {
+            try repo.insertDecision(Decision(
+                id: newID("dec"), taskID: taskID, kind: "cancellation",
+                author: "user", body: "task cancelled", createdAt: timestamp))
+            try repo.suppressPendingWakeups(taskID, at: timestamp)
+            if running.isEmpty {
+                try transition(taskID, from: task.state, to: .cancelled, at: timestamp)
+                try repo.insertMessage(Message(
+                    id: MessageID(newID("msg")), taskID: taskID,
+                    seq: try repo.nextMessageSeq(taskID), author: .system,
+                    kind: .systemEvent, body: "Cancellation completed",
+                    deliveryState: .committed, createdAt: timestamp,
+                    updatedAt: timestamp))
+            } else {
+                try repo.updateTaskRevisions(taskID,
+                                             cancelRequestedAt: .some(timestamp),
+                                             at: timestamp)
+                try repo.insertMessage(Message(
+                    id: MessageID(newID("msg")), taskID: taskID,
+                    seq: try repo.nextMessageSeq(taskID), author: .system,
+                    kind: .systemEvent, body: "Cancellation requested",
+                    deliveryState: .committed, createdAt: timestamp,
+                    updatedAt: timestamp))
+            }
+        }
+        if !running.isEmpty {
+            await cancelRunningTurns(taskID: taskID, action: "Cancellation")
+        }
+        publishCommitted()
+    }
+
+    /// Record requested/acknowledged cancel events and call cancelTurn.
+    private func cancelRunningTurns(taskID: TaskID, action: String) async {
+        let keys = runningTurnRefs.keys.filter {
+            $0.hasPrefix(taskID.rawValue + ":")
+        }
+        for key in keys {
+            guard let info = runningTurnRefs[key] else { continue }
+            let timestamp = now()
+            _ = attempt("cancelRequestedEvent") {
+                try repo.insertMessage(Message(
+                    id: MessageID(newID("msg")), taskID: taskID,
+                    seq: try repo.nextMessageSeq(taskID), author: .system,
+                    kind: .systemEvent,
+                    body: "\(action) requested; turn cancellation requested for "
+                        + info.ref.engineer.displayName,
+                    deliveryState: .committed, createdAt: timestamp,
+                    updatedAt: timestamp))
+            }
+            await info.adapter.cancelTurn(ref: info.ref, turnID: info.turnID)
+            let ack = now()
+            _ = attempt("cancelAckEvent") {
+                try repo.insertMessage(Message(
+                    id: MessageID(newID("msg")), taskID: taskID,
+                    seq: try repo.nextMessageSeq(taskID), author: .system,
+                    kind: .systemEvent,
+                    body: "Turn cancellation acknowledged by "
+                        + info.ref.engineer.displayName,
+                    deliveryState: .committed, createdAt: ack, updatedAt: ack))
+            }
+        }
+    }
+
+    /// Accept a verifying task: subtasks still in review become done; the
+    /// task becomes Done and an acceptance decision is recorded.
+    public func acceptTask(taskID: TaskID, principal: Principal) async throws {
+        try requireUser(principal, "accept task")
+        let task = try loadTask(taskID)
+        guard task.state == .verifying else {
+            throw WorkshopError.invalidRequest(
+                "only a verifying task can be accepted (state: \(task.state.rawValue))")
+        }
+        let timestamp = now()
+        try repo.db.transaction {
+            for sub in try repo.subtasks(taskID) where sub.state == .review {
+                try repo.updateSubtaskState(sub.id, .done, at: timestamp)
+            }
+            try transition(taskID, from: .verifying, to: .done, at: timestamp)
+            try repo.insertDecision(Decision(
+                id: newID("dec"), taskID: taskID, kind: "acceptance",
+                author: "user", body: "task accepted", createdAt: timestamp))
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID), author: .system,
+                kind: .systemEvent, body: "Task accepted by user",
+                deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+        }
+        publishCommitted()
+    }
+
+    /// Convert a paused task (after escalation) to the research path.
+    public func convertToResearch(taskID: TaskID, principal: Principal) async throws {
+        try requireUser(principal, "convert to research")
+        let task = try loadTask(taskID)
+        guard task.state == .paused else {
+            throw WorkshopError.invalidRequest(
+                "only a paused task can be converted (state: \(task.state.rawValue))")
+        }
+        let timestamp = now()
+        try repo.db.transaction {
+            try repo.updateTaskPhase(taskID, .researchProposal, at: timestamp)
+            try transition(taskID, from: .paused, to: .researching, at: timestamp)
+            for participant in try repo.participants(taskID) {
+                try repo.insertWakeup(taskID: taskID,
+                                      engineerID: participant.engineerID,
+                                      reason: "research_proposal",
+                                      triggerSeq: nil, at: timestamp)
+            }
+            try repo.insertMessage(Message(
+                id: MessageID(newID("msg")), taskID: taskID,
+                seq: try repo.nextMessageSeq(taskID), author: .system,
+                kind: .systemEvent,
+                body: "Task converted to research; each participant drafts a "
+                    + "proposal",
+                deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+        }
+        publishCommitted()
+        scheduleWakeupCoalescer()
+        scheduleResearchDeadline(taskID)
     }
 }

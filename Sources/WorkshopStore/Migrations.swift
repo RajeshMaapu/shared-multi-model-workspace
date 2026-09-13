@@ -148,5 +148,47 @@ public enum Migrations {
         ALTER TABLE messages ADD COLUMN structured TEXT
         """)
 
-    public static let all = Migrator(migrations: [v1, v2])
+    /// Schema v3: proposals, reports, decisions; tasks.report_revision and
+    /// tasks.cancel_requested_at; subtasks.risk and subtasks.verification.
+    public static let v3 = Migrator.Migration(version: 3, sql: """
+        CREATE TABLE proposals(
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            author TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1,
+            visibility TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE reports(
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            revision INTEGER NOT NULL,
+            author TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(task_id, revision)
+        );
+
+        CREATE TABLE decisions(
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            kind TEXT NOT NULL,
+            revision INTEGER,
+            scope TEXT,
+            author TEXT NOT NULL,
+            body TEXT NOT NULL,
+            related_id TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        ALTER TABLE tasks ADD COLUMN report_revision INTEGER;
+        ALTER TABLE tasks ADD COLUMN cancel_requested_at TEXT;
+        ALTER TABLE subtasks ADD COLUMN risk TEXT NOT NULL DEFAULT 'normal';
+        ALTER TABLE subtasks ADD COLUMN verification TEXT NOT NULL DEFAULT 'none'
+        """)
+
+    public static let all = Migrator(migrations: [v1, v2, v3])
 }

@@ -92,7 +92,11 @@ final class MCPTests: XCTestCase {
             .compactMap { $0["name"]?.stringValue } ?? []
         XCTAssertTrue(names.contains("workshop_get_task"))
         XCTAssertTrue(names.contains("workshop_report_result"))
-        XCTAssertEqual(names.count, 8)
+        XCTAssertTrue(names.contains("workshop_submit_proposal"))
+        XCTAssertTrue(names.contains("workshop_submit_report"))
+        XCTAssertTrue(names.contains("workshop_assign_subtask"))
+        XCTAssertTrue(names.contains("workshop_escalate_task"))
+        XCTAssertEqual(names.count, 17)
     }
 
     func testUnknownToolIsError() async {

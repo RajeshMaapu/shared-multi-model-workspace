@@ -149,19 +149,29 @@ final class ServiceTests: XCTestCase {
         XCTAssertEqual(subtask.generation, 1)
     }
 
-    func testResearchProposalStaysQueued() async throws {
+    /// Phase 3: research tasks dispatch all participants to draft proposals.
+    func testResearchProposalEntersResearching() async throws {
         let adapters = fakes()
         let svc = try service(adapters: adapters)
         let receipt = try await svc.createTask(request(phase: .researchProposal))
         await svc.start()
         await svc.awaitIdle()
-        XCTAssertEqual(receipt.state, .queued)
+        // Turns are wakeup-driven; wait until all participants have run.
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline,
+              adapters.contains(where: { $0.turnCount == 0 }) {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
         let detail = try await svc.getTask(receipt.taskID)
-        XCTAssertEqual(detail.task.state, .queued)
+        XCTAssertEqual(detail.task.state, .researching)
+        for adapter in adapters {
+            XCTAssertEqual(adapter.turnCount, 1,
+                           "\(adapter.engineer) should get one research turn")
+        }
         let messages = try await svc.readMessages(receipt.taskID)
         XCTAssertTrue(messages.contains { $0.kind == .systemEvent
-            && $0.body.contains("Phase 3") })
-        XCTAssertEqual(adapters.map(\.turnCount).reduce(0, +), 0)
+            && $0.body.contains("Research phase started") })
+        await svc.shutdown()
     }
 
     func testNoEligibleEngineerBlocksWithoutRetry() async throws {

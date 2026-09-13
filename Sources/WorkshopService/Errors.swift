@@ -17,6 +17,14 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
     case workspaceEscape(String)
     /// Tool intentionally unimplemented in this phase.
     case phaseNotImplemented(String)
+    /// Reserved to the user principal (or the allocation arbiter) (-32005).
+    case userAuthorityRequired(String)
+    /// Substantial task lacks a current approval (-32006).
+    case approvalRequired(TaskID)
+    /// Subtask dependencies are not all done (-32007).
+    case blockedByDependency(SubtaskID)
+    /// Report revision no longer current (-32008, T08).
+    case staleRevision(expected: Int, actual: Int?)
 
     /// JSON-RPC error code for this failure.
     public var rpcCode: Int {
@@ -37,6 +45,14 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
             return WorkshopProtocol.ErrorCode.invalidParams
         case .phaseNotImplemented:
             return WorkshopProtocol.ErrorCode.methodNotFound
+        case .userAuthorityRequired:
+            return WorkshopProtocol.ErrorCode.userAuthorityRequired
+        case .approvalRequired:
+            return WorkshopProtocol.ErrorCode.approvalRequired
+        case .blockedByDependency:
+            return WorkshopProtocol.ErrorCode.blockedByDependency
+        case .staleRevision:
+            return WorkshopProtocol.ErrorCode.staleRevision
         case .illegalTransition, .adapterUnavailable:
             return WorkshopProtocol.ErrorCode.internalError
         }
@@ -64,6 +80,14 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
             return "Path escapes the task workspace: \(path)"
         case .phaseNotImplemented(let tool):
             return "\(tool) arrives in Phase 3/5; not implemented"
+        case .userAuthorityRequired(let what):
+            return "User authority required: \(what)"
+        case .approvalRequired(let task):
+            return "Task \(task.rawValue) requires an approved current report revision before implementation"
+        case .blockedByDependency(let sub):
+            return "Subtask \(sub.rawValue) has unfinished dependencies"
+        case .staleRevision(let expected, let actual):
+            return "Stale report revision \(expected); current is \(actual.map(String.init) ?? "none")"
         }
     }
 }

@@ -38,6 +38,10 @@ public enum TaskState: String, Codable, CaseIterable, Sendable {
         case (.researching, .reviewingProposal): return true
         case (.reviewingProposal, .awaitingArchitectureApproval): return true
         case (.awaitingArchitectureApproval, .ready): return true
+        // Phase 3 additions (ADR 0010): request-changes loops back to review;
+        // a paused small task can be converted to research after escalation.
+        case (.awaitingArchitectureApproval, .reviewingProposal): return true
+        case (.paused, .researching): return true
         case (.ready, .working), (.ready, .cancelled): return true
         case (.working, .verifying), (.working, .blocked),
              (.working, .paused), (.working, .cancelled): return true

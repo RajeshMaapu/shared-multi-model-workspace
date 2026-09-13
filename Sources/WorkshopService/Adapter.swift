@@ -46,15 +46,19 @@ public struct TurnContext: Sendable {
     public var recentMessages: [Message]
     /// Why this turn was woken (nil = owner-execution turn).
     public var wakeReason: String?
+    /// Extra instruction payload for the wakeup (subtask list, comment, …).
+    public var wakeDetail: String?
     /// Note about omitted older messages, if the context was truncated.
     public var truncatedNote: String?
 
     public init(task: WorkshopTask, subtask: Subtask?, recentMessages: [Message],
-                wakeReason: String? = nil, truncatedNote: String? = nil) {
+                wakeReason: String? = nil, wakeDetail: String? = nil,
+                truncatedNote: String? = nil) {
         self.task = task
         self.subtask = subtask
         self.recentMessages = recentMessages
         self.wakeReason = wakeReason
+        self.wakeDetail = wakeDetail
         self.truncatedNote = truncatedNote
     }
 
@@ -90,11 +94,64 @@ public struct TurnContext: Sendable {
         }
         if let wakeReason {
             lines.append("")
-            switch wakeReason {
+            let reason = wakeReason.split(separator: ":").first.map(String.init) ?? wakeReason
+            switch reason {
             case "mention": lines.append("You were mentioned in the conversation above.")
             case "review_request": lines.append("Your review was requested.")
             case "user_message": lines.append("The user replied; you are the current owner.")
+            case "research_proposal":
+                lines.append("Research phase: write ONE independent proposal via "
+                    + "workshop_submit_proposal {task_id, title, summary, approach, "
+                    + "alternatives:[{title, summary}], tradeoffs, sources, risks, "
+                    + "proposed_ownership:[{subtask_title, acceptance_criteria, "
+                    + "proposed_owner, rationale}], acceptance_tests, estimated_cost}. "
+                    + "Peers' drafts are private; do not implement anything.")
+            case "cross_review":
+                lines.append("All proposals are published. Read them via "
+                    + "workshop_read_proposals, then post one review per peer proposal "
+                    + "via workshop_submit_review {task_id, proposal_id, severity: "
+                    + "low|medium|high, disposition: agree|disagree|needs_changes, "
+                    + "body, evidence?}. Preserve disagreement; do not force consensus.")
+            case "consolidate":
+                lines.append("You are the consolidation arbiter. Read the published "
+                    + "proposals and reviews, then call workshop_submit_report {task_id, "
+                    + "recommendation, alternatives:[{title, summary}], tradeoffs, sources, "
+                    + "disagreements:[{topic, positions:[{engineer, position}]}], "
+                    + "proposed_ownership:[{subtask_title, acceptance_criteria, "
+                    + "proposed_owner, rationale, risk: normal|high, depends_on:[title]}], "
+                    + "risks, acceptance_tests}.")
+            case "allocate":
+                lines.append("You are the allocation arbiter. Assign every ready subtask "
+                    + "via workshop_assign_subtask {task_id, subtask_id, owner, rationale}. "
+                    + "You may deviate from the report's proposed owners with rationale. "
+                    + "Only assign subtasks whose dependencies are done.")
+            case "assigned":
+                lines.append("You own this subtask now. Implement it, publish artifacts "
+                    + "via workshop_publish_artifact, then call workshop_report_result "
+                    + "{task_id, subtask_id, summary, artifact_ids, validation}.")
+            case "dispute":
+                lines.append("An engineer disputed an assignment; see the decision log "
+                    + "and conversation. Reassign via workshop_assign_subtask or explain "
+                    + "via workshop_post_message.")
+            case "revise_report":
+                lines.append("The user requested changes to the consolidated report. "
+                    + "Revise it via workshop_submit_report (a new revision).")
+            case "verify_result":
+                lines.append("Verify the reported result: inspect the published "
+                    + "artifacts and validation evidence, then call "
+                    + "workshop_submit_review {task_id, proposal_id: <result message id>, "
+                    + "severity, disposition: agree|needs_changes, body}. "
+                    + "disposition agree = verification passed.")
+            case "resumed":
+                lines.append("The task was resumed by the user.")
+            case "changes_requested":
+                lines.append("Verification requested changes on your subtask; "
+                    + "address them and report again via workshop_report_result.")
             default: lines.append("Wakeup reason: \(wakeReason)")
+            }
+            if let wakeDetail, !wakeDetail.isEmpty {
+                lines.append("")
+                lines.append(wakeDetail)
             }
         }
         return lines.joined(separator: "\n")

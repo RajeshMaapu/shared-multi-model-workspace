@@ -8,12 +8,30 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
         public let afterDeltas: Int
     }
 
+    /// A scripted action performed inside a turn (Phase 3 tests).
+    public enum ScriptedAction: Sendable {
+        /// Call a Workshop tool via `toolRunner` (service.callTool) with the
+        /// adapter's own engineer principal.
+        case toolCall(String, JSONValue)
+        /// Emit a streamed text delta.
+        case text(String)
+        /// Suspend the stream until this turn is cancelled (pause/cancel tests).
+        case waitForCancel
+    }
+
     public let engineer: EngineerID
     /// Delay between streamed deltas. 0 in tests.
     public var delayPerDelta: Duration
     /// If set, the stream throws after emitting this many deltas.
     public var failAfterDeltas: Int?
-    private let scriptedHealth: EngineerHealth
+    /// When set, the turn runs these scripted actions instead of the default reply.
+    public var script: (@Sendable (TurnContext) async -> [ScriptedAction])?
+    /// How scripted tool calls reach the service (set by tests/daemon).
+    public var toolRunner: (@Sendable (String, JSONValue, Principal) async throws -> JSONValue)?
+    private var scriptedHealth: EngineerHealth
+
+    /// Override the probed health (tests).
+    public func setHealth(_ health: EngineerHealth) { scriptedHealth = health }
 
     private struct State {
         var turnCount = 0
@@ -58,28 +76,55 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
         let failAfter = failAfterDeltas
         let title = context.task.title
         let engineerName = engineer.displayName
+        let script = self.script
+        let runner = self.toolRunner
+        let principal = Principal.engineer(engineer)
         return AsyncThrowingStream { continuation in
             Task {
                 continuation.yield(.turnStarted)
-                let reply = "Acknowledged \"\(title)\". \(engineerName) has claimed this subtask, " +
-                    "reviewed the brief, and will report back with results."
-                // ~6 deltas forming the reply
-                let words = reply.split(separator: " ").map(String.init)
-                let chunkCount = 6
-                let perChunk = max(1, (words.count + chunkCount - 1) / chunkCount)
                 var emitted = 0
-                for start in stride(from: 0, to: words.count, by: perChunk) {
-                    if let failAfter, emitted >= failAfter {
-                        continuation.finish(throwing: InjectedFailure(afterDeltas: failAfter))
-                        return
-                    }
-                    let end = min(start + perChunk, words.count)
-                    var chunk = words[start..<end].joined(separator: " ")
-                    if end < words.count { chunk += " " }
-                    continuation.yield(.messageDelta(chunk))
+                func emitDelta(_ text: String) {
+                    continuation.yield(.messageDelta(text))
                     emitted += 1
-                    if delay > .zero {
-                        try? await Task.sleep(for: delay)
+                }
+                if let script {
+                    for action in await script(context) {
+                        switch action {
+                        case .toolCall(let name, let args):
+                            _ = try? await runner?(name, args, principal)
+                        case .text(let text):
+                            emitDelta(text)
+                        case .waitForCancel:
+                            var waited = 0
+                            while !self.state.with({ $0.cancelledTurns.contains(turnID) }),
+                                  waited < 1000 {
+                                try? await Task.sleep(for: .milliseconds(10))
+                                waited += 1
+                            }
+                            continuation.yield(.turnCompleted)
+                            continuation.finish()
+                            return
+                        }
+                    }
+                } else {
+                    let reply = "Acknowledged \"\(title)\". \(engineerName) has claimed this subtask, " +
+                        "reviewed the brief, and will report back with results."
+                    // ~6 deltas forming the reply
+                    let words = reply.split(separator: " ").map(String.init)
+                    let chunkCount = 6
+                    let perChunk = max(1, (words.count + chunkCount - 1) / chunkCount)
+                    for start in stride(from: 0, to: words.count, by: perChunk) {
+                        if let failAfter, emitted >= failAfter {
+                            continuation.finish(throwing: InjectedFailure(afterDeltas: failAfter))
+                            return
+                        }
+                        let end = min(start + perChunk, words.count)
+                        var chunk = words[start..<end].joined(separator: " ")
+                        if end < words.count { chunk += " " }
+                        emitDelta(chunk)
+                        if delay > .zero {
+                            try? await Task.sleep(for: delay)
+                        }
                     }
                 }
                 continuation.yield(.toolStarted("read_brief"))

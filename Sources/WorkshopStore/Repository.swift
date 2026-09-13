@@ -14,13 +14,16 @@ public final class WorkshopRepository {
     public func insertTask(_ task: WorkshopTask) throws {
         try db.execute("""
             INSERT INTO tasks(id, channel, title, brief, phase, state, scope_revision,
-                              approval_revision, budget_policy_ref, created_at, updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                              approval_revision, report_revision, cancel_requested_at,
+                              budget_policy_ref, created_at, updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, [
                 .text(task.id.rawValue), .text(task.channel), .text(task.title),
                 .text(task.brief), .text(task.phase.rawValue), .text(task.state.rawValue),
                 .integer(Int64(task.scopeRevision)),
                 task.approvalRevision.map { .integer(Int64($0)) },
+                task.reportRevision.map { .integer(Int64($0)) },
+                task.cancelRequestedAt.map { .text(WorkshopTime.string($0)) },
                 task.budgetPolicyRef.map(SQLiteValue.text),
                 .text(WorkshopTime.string(task.createdAt)),
                 .text(WorkshopTime.string(task.updatedAt)),
@@ -41,6 +44,35 @@ public final class WorkshopRepository {
         ])
     }
 
+    public func updateTaskPhase(_ id: TaskID, _ phase: TaskPhase, at now: Date) throws {
+        try db.execute("UPDATE tasks SET phase=?, updated_at=? WHERE id=?", [
+            .text(phase.rawValue), .text(WorkshopTime.string(now)), .text(id.rawValue),
+        ])
+    }
+
+    /// Update the research bookkeeping columns (nil = leave unchanged).
+    public func updateTaskRevisions(_ id: TaskID, reportRevision: Int?? = nil,
+                                    approvalRevision: Int?? = nil,
+                                    cancelRequestedAt: Date?? = nil,
+                                    at now: Date) throws {
+        var sets: [String] = ["updated_at=?"]
+        var args: [SQLiteValue?] = [.text(WorkshopTime.string(now))]
+        if let reportRevision {
+            sets.append("report_revision=?")
+            args.append(reportRevision.map { .integer(Int64($0)) })
+        }
+        if let approvalRevision {
+            sets.append("approval_revision=?")
+            args.append(approvalRevision.map { .integer(Int64($0)) })
+        }
+        if let cancelRequestedAt {
+            sets.append("cancel_requested_at=?")
+            args.append(cancelRequestedAt.map { .text(WorkshopTime.string($0)) })
+        }
+        args.append(.text(id.rawValue))
+        try db.execute("UPDATE tasks SET \(sets.joined(separator: ", ")) WHERE id=?", args)
+    }
+
     private func taskFrom(_ r: Row) -> WorkshopTask {
         WorkshopTask(
             id: TaskID(r["id"]!.text!),
@@ -51,6 +83,8 @@ public final class WorkshopRepository {
             state: TaskState(rawValue: r["state"]!.text!) ?? .draft,
             scopeRevision: Int(r["scope_revision"]!.int ?? 1),
             approvalRevision: r["approval_revision"]?.int.map(Int.init),
+            reportRevision: r["report_revision"]?.int.map(Int.init),
+            cancelRequestedAt: r["cancel_requested_at"]?.text.map(WorkshopTime.date),
             budgetPolicyRef: r["budget_policy_ref"]?.text,
             createdAt: WorkshopTime.date(r["created_at"]!.text!),
             updatedAt: WorkshopTime.date(r["updated_at"]!.text!)
@@ -101,9 +135,30 @@ public final class WorkshopRepository {
 
     // MARK: - Messages
 
+    /// Provisional seqs (streaming placeholders) live at or above this base so
+    /// they sort last while streaming and never consume a real seq slot (F1).
+    public static let provisionalSeqBase: Int64 = 1_000_000_000
+
     public func nextMessageSeq(_ taskID: TaskID) throws -> Int64 {
-        (try db.query("SELECT MAX(seq) AS m FROM messages WHERE task_id=?",
-                      [.text(taskID.rawValue)]).first?["m"]?.int ?? 0) + 1
+        (try db.query("""
+            SELECT MAX(seq) AS m FROM messages WHERE task_id=? AND seq<?
+            """, [.text(taskID.rawValue), .integer(Self.provisionalSeqBase)])
+            .first?["m"]?.int ?? 0) + 1
+    }
+
+    /// A provisional seq for a streaming placeholder, derived from rowid so it
+    /// is unique even across concurrent streaming messages on the same task.
+    public func nextProvisionalSeq() throws -> Int64 {
+        Self.provisionalSeqBase
+            + (try db.query("SELECT MAX(rowid) AS m FROM messages")
+                .first?["m"]?.int ?? 0) + 1
+    }
+
+    /// Assign the real seq when a streaming placeholder commits (F1).
+    public func reassignMessageSeq(_ id: MessageID, seq: Int64, at now: Date) throws {
+        try db.execute("UPDATE messages SET seq=?, updated_at=? WHERE id=?", [
+            .integer(seq), .text(WorkshopTime.string(now)), .text(id.rawValue),
+        ])
     }
 
     public func insertMessage(_ m: Message) throws {
@@ -174,15 +229,16 @@ public final class WorkshopRepository {
     public func insertSubtask(_ s: Subtask) throws {
         try db.execute("""
             INSERT INTO subtasks(id, task_id, title, acceptance, dependencies, owner_id,
-                                 generation, lease_expires_at, state, created_at, updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                                 generation, lease_expires_at, state, risk, verification,
+                                 created_at, updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, [
                 .text(s.id.rawValue), .text(s.taskID.rawValue), .text(s.title),
                 .text(encodeList(s.acceptance)), .text(encodeList(s.dependencies)),
                 s.ownerID.map { .text($0.rawValue) },
                 .integer(Int64(s.generation)),
                 s.leaseExpiresAt.map { .text(WorkshopTime.string($0)) },
-                .text(s.state.rawValue),
+                .text(s.state.rawValue), .text(s.risk), .text(s.verification),
                 .text(WorkshopTime.string(s.createdAt)),
                 .text(WorkshopTime.string(s.updatedAt)),
             ])
@@ -219,6 +275,30 @@ public final class WorkshopRepository {
         ])
     }
 
+    public func updateSubtaskVerification(_ id: SubtaskID, _ verification: String,
+                                          at now: Date) throws {
+        try db.execute("UPDATE subtasks SET verification=?, updated_at=? WHERE id=?", [
+            .text(verification), .text(WorkshopTime.string(now)), .text(id.rawValue),
+        ])
+    }
+
+    /// Atomic assignment CAS: sets owner only if generation matches and the
+    /// subtask is unowned (returns false otherwise).
+    public func assignSubtask(_ id: SubtaskID, owner: EngineerID, expectedGeneration: Int,
+                              leaseExpiresAt: Date, at now: Date) throws -> Bool {
+        try db.execute("""
+            UPDATE subtasks
+            SET owner_id=?, generation=generation+1, state='claimed',
+                lease_expires_at=?, updated_at=?
+            WHERE id=? AND owner_id IS NULL AND generation=?
+            """, [
+                .text(owner.rawValue), .text(WorkshopTime.string(leaseExpiresAt)),
+                .text(WorkshopTime.string(now)), .text(id.rawValue),
+                .integer(Int64(expectedGeneration)),
+            ])
+        return db.changes() == 1
+    }
+
     private func subtaskFrom(_ r: Row) -> Subtask {
         Subtask(
             id: SubtaskID(r["id"]!.text!),
@@ -230,6 +310,8 @@ public final class WorkshopRepository {
             generation: Int(r["generation"]!.int ?? 0),
             leaseExpiresAt: r["lease_expires_at"]?.text.map(WorkshopTime.date),
             state: SubtaskState(rawValue: r["state"]!.text!) ?? .ready,
+            risk: r["risk"]?.text ?? "normal",
+            verification: r["verification"]?.text ?? "none",
             createdAt: WorkshopTime.date(r["created_at"]!.text!),
             updatedAt: WorkshopTime.date(r["updated_at"]!.text!)
         )
@@ -475,6 +557,116 @@ public final class WorkshopRepository {
                                  WHERE w2.task_id=? AND w2.reason='user_message'), 0)
             """, [.text(taskID.rawValue), .text(taskID.rawValue)]).first
         return Int(r?["n"]?.int ?? 0)
+    }
+
+    /// Suppress every pending wakeup on a task (pause/cancel).
+    public func suppressPendingWakeups(_ taskID: TaskID, at now: Date) throws {
+        try db.execute("""
+            UPDATE wakeups SET state='suppressed', updated_at=?
+            WHERE task_id=? AND state='pending'
+            """, [.text(WorkshopTime.string(now)), .text(taskID.rawValue)])
+    }
+
+    // MARK: - Proposals / Reports / Decisions (Phase 3)
+
+    public func upsertProposal(_ p: Proposal) throws {
+        try db.execute("""
+            INSERT INTO proposals(id, task_id, author, revision, visibility, content,
+                                  created_at, updated_at)
+            VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,
+                visibility=excluded.visibility, content=excluded.content,
+                updated_at=excluded.updated_at
+            """, [.text(p.id), .text(p.taskID.rawValue), .text(p.author.rawValue),
+                  .integer(Int64(p.revision)), .text(p.visibility), .text(p.content),
+                  .text(WorkshopTime.string(p.createdAt)),
+                  .text(WorkshopTime.string(p.updatedAt))])
+    }
+
+    public func proposals(_ taskID: TaskID) throws -> [Proposal] {
+        try db.query("SELECT * FROM proposals WHERE task_id=? ORDER BY created_at, id",
+                     [.text(taskID.rawValue)]).map(proposalFrom)
+    }
+
+    public func proposal(_ id: String) throws -> Proposal? {
+        try db.query("SELECT * FROM proposals WHERE id=?", [.text(id)])
+            .first.map(proposalFrom)
+    }
+
+    public func proposalBy(taskID: TaskID, author: EngineerID) throws -> Proposal? {
+        try db.query("""
+            SELECT * FROM proposals WHERE task_id=? AND author=?
+            ORDER BY revision DESC LIMIT 1
+            """, [.text(taskID.rawValue), .text(author.rawValue)]).first.map(proposalFrom)
+    }
+
+    /// Publish every draft on the task in one go (called inside a transaction).
+    public func publishAllProposals(_ taskID: TaskID, at now: Date) throws {
+        try db.execute("""
+            UPDATE proposals SET visibility='published', updated_at=?
+            WHERE task_id=? AND visibility='draft'
+            """, [.text(WorkshopTime.string(now)), .text(taskID.rawValue)])
+    }
+
+    private func proposalFrom(_ r: Row) -> Proposal {
+        Proposal(id: r["id"]!.text!, taskID: TaskID(r["task_id"]!.text!),
+                 author: EngineerID(rawValue: r["author"]!.text!) ?? .devin,
+                 revision: Int(r["revision"]!.int ?? 1),
+                 visibility: r["visibility"]!.text!, content: r["content"]!.text!,
+                 createdAt: WorkshopTime.date(r["created_at"]!.text!),
+                 updatedAt: WorkshopTime.date(r["updated_at"]!.text!))
+    }
+
+    public func insertReport(_ rep: Report) throws {
+        try db.execute("""
+            INSERT INTO reports(id, task_id, revision, author, content, created_at)
+            VALUES(?,?,?,?,?,?)
+            """, [.text(rep.id), .text(rep.taskID.rawValue), .integer(Int64(rep.revision)),
+                  .text(rep.author), .text(rep.content),
+                  .text(WorkshopTime.string(rep.createdAt))])
+    }
+
+    public func reports(_ taskID: TaskID) throws -> [Report] {
+        try db.query("SELECT * FROM reports WHERE task_id=? ORDER BY revision",
+                     [.text(taskID.rawValue)]).map(reportFrom)
+    }
+
+    public func latestReport(_ taskID: TaskID) throws -> Report? {
+        try db.query("""
+            SELECT * FROM reports WHERE task_id=? ORDER BY revision DESC LIMIT 1
+            """, [.text(taskID.rawValue)]).first.map(reportFrom)
+    }
+
+    private func reportFrom(_ r: Row) -> Report {
+        Report(id: r["id"]!.text!, taskID: TaskID(r["task_id"]!.text!),
+               revision: Int(r["revision"]!.int ?? 1), author: r["author"]!.text!,
+               content: r["content"]!.text!,
+               createdAt: WorkshopTime.date(r["created_at"]!.text!))
+    }
+
+    public func insertDecision(_ d: Decision) throws {
+        try db.execute("""
+            INSERT INTO decisions(id, task_id, kind, revision, scope, author, body,
+                                  related_id, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            """, [.text(d.id), .text(d.taskID.rawValue), .text(d.kind),
+                  d.revision.map { .integer(Int64($0)) },
+                  d.scope.map(SQLiteValue.text), .text(d.author), .text(d.body),
+                  d.relatedID.map(SQLiteValue.text),
+                  .text(WorkshopTime.string(d.createdAt))])
+    }
+
+    public func decisions(_ taskID: TaskID) throws -> [Decision] {
+        try db.query("SELECT * FROM decisions WHERE task_id=? ORDER BY created_at, id",
+                     [.text(taskID.rawValue)]).map(decisionFrom)
+    }
+
+    private func decisionFrom(_ r: Row) -> Decision {
+        Decision(id: r["id"]!.text!, taskID: TaskID(r["task_id"]!.text!),
+                 kind: r["kind"]!.text!, revision: r["revision"]?.int.map(Int.init),
+                 scope: r["scope"]?.text, author: r["author"]!.text!,
+                 body: r["body"]!.text!, relatedID: r["related_id"]?.text,
+                 createdAt: WorkshopTime.date(r["created_at"]!.text!))
     }
 
     // MARK: - Checkpoints

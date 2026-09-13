@@ -188,14 +188,11 @@ final class Phase2ServiceTests: XCTestCase {
 
     func testPhaseGatedToolsReturnMethodNotFound() async throws {
         let (svc, _) = try await service()
-        for name in ["workshop_create_task", "workshop_propose_subtask",
-                     "workshop_claim_subtask", "workshop_assign_subtask"] {
-            do {
-                _ = try await svc.callTool(name, args: .object([:]),
-                                           principal: .engineer(.devin))
-                XCTFail("expected phaseNotImplemented for \(name)")
-            } catch WorkshopError.phaseNotImplemented {}
-        }
+        do {
+            _ = try await svc.callTool("workshop_create_task", args: .object([:]),
+                                       principal: .engineer(.devin))
+            XCTFail("expected phaseNotImplemented")
+        } catch WorkshopError.phaseNotImplemented {}
     }
 
     // MARK: - wakeups (§5.4)

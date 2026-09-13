@@ -9,12 +9,27 @@ public struct WorkshopTask: Codable, Equatable, Sendable {
     public var state: TaskState
     public var scopeRevision: Int
     public var approvalRevision: Int?
+    /// Latest consolidated report revision (research path, Phase 3).
+    public var reportRevision: Int?
+    /// Set when cancellation was requested while a turn was running.
+    public var cancelRequestedAt: Date?
     public var budgetPolicyRef: String?
     public var createdAt: Date
     public var updatedAt: Date
 
+    /// §5.1 classification for display: explicit phase is the classifier.
+    public var classification: String {
+        phase == .researchProposal ? "substantial" : "small"
+    }
+
+    /// Whether the current report revision is covered by an active approval.
+    public var hasCurrentApproval: Bool {
+        approvalRevision != nil && approvalRevision == reportRevision
+    }
+
     public init(id: TaskID, channel: String, title: String, brief: String, phase: TaskPhase,
                 state: TaskState, scopeRevision: Int = 1, approvalRevision: Int? = nil,
+                reportRevision: Int? = nil, cancelRequestedAt: Date? = nil,
                 budgetPolicyRef: String? = nil, createdAt: Date, updatedAt: Date) {
         self.id = id
         self.channel = channel
@@ -24,6 +39,8 @@ public struct WorkshopTask: Codable, Equatable, Sendable {
         self.state = state
         self.scopeRevision = scopeRevision
         self.approvalRevision = approvalRevision
+        self.reportRevision = reportRevision
+        self.cancelRequestedAt = cancelRequestedAt
         self.budgetPolicyRef = budgetPolicyRef
         self.createdAt = createdAt
         self.updatedAt = updatedAt
@@ -109,12 +126,17 @@ public struct Subtask: Codable, Equatable, Sendable, Identifiable {
     public var generation: Int
     public var leaseExpiresAt: Date?
     public var state: SubtaskState
+    /// Risk tier from the report/proposal (normal|high).
+    public var risk: String
+    /// Verification outcome (none|passed|changes_requested).
+    public var verification: String
     public var createdAt: Date
     public var updatedAt: Date
 
     public init(id: SubtaskID, taskID: TaskID, title: String, acceptance: [String] = [],
                 dependencies: [String] = [], ownerID: EngineerID? = nil, generation: Int = 0,
                 leaseExpiresAt: Date? = nil, state: SubtaskState = .ready,
+                risk: String = "normal", verification: String = "none",
                 createdAt: Date, updatedAt: Date) {
         self.id = id
         self.taskID = taskID
@@ -125,6 +147,8 @@ public struct Subtask: Codable, Equatable, Sendable, Identifiable {
         self.generation = generation
         self.leaseExpiresAt = leaseExpiresAt
         self.state = state
+        self.risk = risk
+        self.verification = verification
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -198,16 +222,22 @@ public struct TaskDetail: Codable, Equatable, Sendable {
     public var runningEngineers: [EngineerID]
     /// Pending/running wakeup rows for this task (status chips).
     public var pendingWakeups: [WakeupInfo]
+    /// Proposal visibility counts (T12: drafts are private; only counts show).
+    public var draftProposalCount: Int
+    public var publishedProposalCount: Int
 
     public init(task: WorkshopTask, participants: [Participant], subtasks: [Subtask],
                 usage: UsageSample? = nil, runningEngineers: [EngineerID] = [],
-                pendingWakeups: [WakeupInfo] = []) {
+                pendingWakeups: [WakeupInfo] = [], draftProposalCount: Int = 0,
+                publishedProposalCount: Int = 0) {
         self.task = task
         self.participants = participants
         self.subtasks = subtasks
         self.usage = usage
         self.runningEngineers = runningEngineers
         self.pendingWakeups = pendingWakeups
+        self.draftProposalCount = draftProposalCount
+        self.publishedProposalCount = publishedProposalCount
     }
 }
 
@@ -262,6 +292,83 @@ public struct Artifact: Codable, Equatable, Sendable, Identifiable {
         self.baseRevision = baseRevision
         self.validation = validation
         self.description = description
+        self.createdAt = createdAt
+    }
+}
+
+/// A research-phase proposal (Phase 3). Drafts are private to the author.
+public struct Proposal: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var taskID: TaskID
+    public var author: EngineerID
+    public var revision: Int
+    /// draft | published
+    public var visibility: String
+    /// JSON content (title, summary, approach, alternatives, …).
+    public var content: String
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(id: String, taskID: TaskID, author: EngineerID, revision: Int = 1,
+                visibility: String = "draft", content: String,
+                createdAt: Date, updatedAt: Date) {
+        self.id = id
+        self.taskID = taskID
+        self.author = author
+        self.revision = revision
+        self.visibility = visibility
+        self.content = content
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+/// A consolidated report revision (Phase 3, §5.3).
+public struct Report: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var taskID: TaskID
+    public var revision: Int
+    public var author: String
+    /// JSON content (recommendation, alternatives, proposed_ownership, …).
+    public var content: String
+    public var createdAt: Date
+
+    public init(id: String, taskID: TaskID, revision: Int, author: String,
+                content: String, createdAt: Date) {
+        self.id = id
+        self.taskID = taskID
+        self.revision = revision
+        self.author = author
+        self.content = content
+        self.createdAt = createdAt
+    }
+}
+
+/// A recorded decision (Phase 3): approvals, allocations, disputes, …
+public struct Decision: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var taskID: TaskID
+    /// approval|request_changes|choose_alternative|allocation|dispute|
+    /// escalation|acceptance|scope_change|cancellation
+    public var kind: String
+    public var revision: Int?
+    public var scope: String?
+    public var author: String
+    public var body: String
+    public var relatedID: String?
+    public var createdAt: Date
+
+    public init(id: String, taskID: TaskID, kind: String, revision: Int? = nil,
+                scope: String? = nil, author: String, body: String,
+                relatedID: String? = nil, createdAt: Date) {
+        self.id = id
+        self.taskID = taskID
+        self.kind = kind
+        self.revision = revision
+        self.scope = scope
+        self.author = author
+        self.body = body
+        self.relatedID = relatedID
         self.createdAt = createdAt
     }
 }
