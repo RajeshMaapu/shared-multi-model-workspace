@@ -83,12 +83,15 @@ public enum MessageKind: String, Codable, CaseIterable, Sendable {
 /// Author of a message or operation.
 public enum Principal: Codable, Hashable, Sendable {
     case user
+    /// The user's Codex entry point — limited authority (§9.3, ADR 0015).
+    case codex
     case engineer(EngineerID)
     case system
 
     public var kind: String {
         switch self {
         case .user: return "user"
+        case .codex: return "codex"
         case .engineer: return "engineer"
         case .system: return "system"
         }
@@ -103,6 +106,7 @@ public enum Principal: Codable, Hashable, Sendable {
     public var displayName: String {
         switch self {
         case .user: return "You"
+        case .codex: return "You (via Codex)"
         case .engineer(let id): return id.displayName
         case .system: return "Workshop"
         }
@@ -112,6 +116,7 @@ public enum Principal: Codable, Hashable, Sendable {
         switch kind {
         case "engineer": self = .engineer(EngineerID(rawValue: engineerID ?? "") ?? .devin)
         case "system": self = .system
+        case "codex": self = .codex
         default: self = .user
         }
     }
@@ -121,6 +126,8 @@ public enum Principal: Codable, Hashable, Sendable {
         let s = try c.decode(String.self)
         if s.hasPrefix("engineer:") {
             self = .engineer(EngineerID(rawValue: String(s.dropFirst(9))) ?? .devin)
+        } else if s == "codex" {
+            self = .codex
         } else {
             self = s == "system" ? .system : .user
         }
@@ -130,6 +137,7 @@ public enum Principal: Codable, Hashable, Sendable {
         var c = encoder.singleValueContainer()
         switch self {
         case .user: try c.encode("user")
+        case .codex: try c.encode("codex")
         case .system: try c.encode("system")
         case .engineer(let id): try c.encode("engineer:" + id.rawValue)
         }

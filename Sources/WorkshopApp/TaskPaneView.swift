@@ -251,7 +251,7 @@ struct MessageRow: View {
                 Avatar(author: message.author)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text(message.author.displayName)
+                        Text(messageAuthorName(message))
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(WorkshopColors.primaryText)
                         Text(message.createdAt, style: .time)
@@ -708,6 +708,16 @@ struct ComposerField: View {
 // MARK: - Phase 3: Proposals / Report / Decisions
 
 /// Decoded fields shared by proposal and report JSON payloads.
+/// User messages posted through the Codex MCP bridge read "You (via Codex)".
+private func messageAuthorName(_ message: Message) -> String {
+    if message.author == .user,
+       let payload = message.structured.flatMap(contentJSON),
+       payload["via"]?.stringValue == "codex" {
+        return Principal.codex.displayName
+    }
+    return message.author.displayName
+}
+
 private func contentJSON(_ raw: String) -> JSONValue? {
     try? JSONDecoder().decode(JSONValue.self, from: Data(raw.utf8))
 }

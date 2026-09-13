@@ -1,12 +1,13 @@
 import SwiftUI
 import AppKit
+import UserNotifications
 import WorkshopCore
 
 @main
 struct WorkshopApp: App {
     @StateObject private var state = AppState()
-    @AppStorage("sendOnEnter") private var sendOnEnter = true
     @Environment(\.openWindow) private var openWindow
+    private let notificationDelegate = NotificationPoster.Delegate()
 
     var body: some Scene {
         WindowGroup(id: "main") {
@@ -15,6 +16,7 @@ struct WorkshopApp: App {
                 .frame(minWidth: 980, minHeight: 680)
                 .onAppear { applyEnvironmentHooks() }
                 .task { await startUp() }
+                .onOpenURL { url in Task { await state.handleDeepLink(url) } }
         }
         .defaultSize(width: 1440, height: 960)
         .commands {
@@ -29,6 +31,14 @@ struct WorkshopApp: App {
                     .keyboardShortcut("k")
                 Button("Diagnostics") { openWindow(id: "diagnostics") }
             }
+            // §4.5: distinct lifecycle actions — Quit (Cmd-Q, UI only; the
+            // daemon keeps running when background mode is on), Pause team,
+            // and Stop background work.
+            CommandGroup(before: .appTermination) {
+                Button("Pause Team") { Task { await state.pauseAllWorking() } }
+                Button("Stop Background Work…") { confirmStopBackground() }
+                Divider()
+            }
         }
 
         Window("Diagnostics", id: "diagnostics") {
@@ -39,17 +49,77 @@ struct WorkshopApp: App {
         }
 
         Settings {
-            Form {
-                Toggle("Send messages with Return (Shift-Return for newline)",
-                       isOn: $sendOnEnter)
+            WorkshopSettingsView()
+        }
+
+        // Menu-bar extra (§4.5): "N active turns · M awaiting you" plus quick
+        // actions; opens the main window on request.
+        MenuBarExtra {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("\(state.activeTurns) active turn"
+                     + (state.activeTurns == 1 ? "" : "s"))
+                Text("\(state.awaitingYou) awaiting you")
+                Divider()
+                Button("Open Workshop") {
+                    openWindow(id: "main")
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+                Button("Pause Team") {
+                    Task { await state.pauseAllWorking() }
+                }
+                Button("Stop Background Work…") { confirmStopBackground() }
+                Divider()
+                Button("Quit Workshop") { NSApp.terminate(nil) }
             }
-            .padding(20)
-            .frame(width: 420)
+            .padding(10)
+        } label: {
+            Label {
+                Text("\(state.activeTurns)/\(state.awaitingYou)")
+            } icon: {
+                Image(systemName: "hammer")
+            }
+        }
+        .menuBarExtraStyle(.window)
+    }
+
+    /// "Stop background work" — confirm, then ask the daemon to pause all
+    /// Working tasks and exit (helper registration stays, §4.5).
+    private func confirmStopBackground() {
+        let alert = NSAlert()
+        alert.messageText = "Stop background work?"
+        alert.informativeText = "All working tasks will be paused and the "
+            + "Workshop service will exit. The helper stays registered "
+            + "but idle."
+        alert.addButton(withTitle: "Stop")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            Task { await state.stopBackgroundWork() }
         }
     }
 
     private func startUp() async {
+        UNUserNotificationCenter.current().delegate = notificationDelegate
+        NotificationCenter.default.addObserver(
+            forName: NotificationPoster.openTaskNotification, object: nil,
+            queue: .main) { note in
+            if let id = note.object as? String {
+                Task { @MainActor in
+                    await state.openTaskFromNotification(id)
+                }
+            }
+        }
         await state.bootstrap()
+        await state.checkBuildMismatch()
+        await state.refreshStatusCounts()
+        state.notifyAttentionStates()
+        // Slow status timer for the menu-bar counters and attention posts.
+        Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                await state.refreshStatusCounts()
+                state.notifyAttentionStates()
+            }
+        }
         applyDevFixtures()
         // Dev seed: WORKSHOP_SEED_TASK="title|||objective"
         if let seed = ProcessInfo.processInfo.environment["WORKSHOP_SEED_TASK"],
@@ -118,8 +188,18 @@ struct WorkshopApp: App {
                     snippet: String(kv.count > 1 ? kv[1] : part))
             }
         }
+        if let banner = env["WORKSHOP_FAKE_UPDATE_BANNER"], !banner.isEmpty {
+            state.updateBanner = banner
+        }
+        if let notice = env["WORKSHOP_FAKE_DEEPLINK_NOTICE"], !notice.isEmpty {
+            state.deepLinkNotice = notice
+        }
         if env["WORKSHOP_OPEN_DIAGNOSTICS"] == "1" {
             openWindow(id: "diagnostics")
+        }
+        if env["WORKSHOP_OPEN_SETTINGS"] == "1" {
+            NSApp.sendAction(Selector(("showSettingsWindow:")),
+                             to: nil, from: nil)
         }
     }
 

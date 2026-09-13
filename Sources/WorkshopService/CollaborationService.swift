@@ -152,6 +152,13 @@ public actor CollaborationService {
                   !stored.isEmpty, stored == token else { continue }
             return .engineer(engineer)
         }
+        // Codex principal: profiles/codex/token → limited authority (§9.3).
+        let codexPath = homeDir + "/profiles/codex/token"
+        if let stored = try? String(contentsOfFile: codexPath, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !stored.isEmpty, stored == token {
+            return .codex
+        }
         throw WorkshopError.invalidRequest("invalid token")
     }
 
@@ -411,12 +418,26 @@ public actor CollaborationService {
         if let engineer = principal.engineerID {
             try requireParticipant(engineer, taskID: taskID)
         }
+        // Codex posts read as the user's entry point: author stays `user` and
+        // the channel is recorded in structured (§9.3: display "You (via Codex)").
+        var structured = structured
+        var author = principal
+        if principal == .codex {
+            author = .user
+            var fields = structured.flatMap {
+                try? JSONDecoder().decode([String: JSONValue].self,
+                                          from: Data($0.utf8))
+            } ?? [:]
+            fields["via"] = .string("codex")
+            structured = String(decoding: (try? JSONEncoder().encode(fields))
+                                    ?? Data(), as: UTF8.self)
+        }
         let timestamp = now()
         let messageID = MessageID(newID("msg"))
         var committed: Message?
         try repo.db.transaction {
             let m = Message(id: messageID, taskID: taskID, seq: try repo.nextMessageSeq(taskID),
-                            author: principal, kind: kind, body: body, replyTo: replyTo,
+                            author: author, kind: kind, body: body, replyTo: replyTo,
                             deliveryState: .committed, structured: structured,
                             createdAt: timestamp, updatedAt: timestamp)
             try repo.insertMessage(m)
@@ -758,9 +779,61 @@ public actor CollaborationService {
     /// Unified entry point for the §8.3 collaboration tools — used by the IPC
     /// daemon, the workshop-mcp bridge, and the DeepSeek tool loop. Author
     /// identity always comes from `principal`, never from args.
+    /// Tools the Codex principal may call (§9.3, ADR 0015): task entry and
+    /// read/follow-up only — approvals, allocation, acceptance stay user-only.
+    private static let codexTools: Set<String> = [
+        "workshop_create_task", "workshop_list_tasks", "workshop_get_task",
+        "workshop_read_messages", "workshop_post_message",
+    ]
+
+    /// Set by the daemon after verifying `workshop://` is registered to
+    /// ai.maapu.workshop; receipts report the deep link truthfully.
+    public nonisolated(unsafe) var deepLinkHandlerVerified = false
+
+    /// identity always comes from `principal`, never from args.
     public func callTool(_ name: String, args: JSONValue,
                          principal: Principal) async throws -> JSONValue {
+        if principal == .codex && !Self.codexTools.contains(name) {
+            throw WorkshopError.userAuthorityRequired(
+                "Codex may create and follow up tasks; approval, allocation, "
+                    + "and acceptance stay with the user in the app")
+        }
         switch name {
+        case "workshop_create_task":
+            let request: CreateTaskRequest
+            do {
+                request = try args.decode(as: CreateTaskRequest.self)
+            } catch {
+                throw WorkshopError.invalidRequest(
+                    "workshop_create_task requires idempotency_key, title, "
+                        + "objective, phase")
+            }
+            let receipt = try createTask(request)
+            // status = the task's dispatch position right now (§8.4):
+            // created | queued | running.
+            let current = try repo.task(receipt.taskID)?.state ?? receipt.state
+            let status: CreateTaskStatus = switch current {
+            case .working, .researching, .verifying: .running
+            case .queued, .paused: .queued
+            default: receipt.status
+            }
+            var out: [String: JSONValue] = [
+                "task_id": .string(receipt.taskID.rawValue),
+                "committed_seq": .number(Double(receipt.committedSeq)),
+                "state": .string(receipt.state.rawValue),
+                "status": .string(status.rawValue),
+            ]
+            if deepLinkHandlerVerified {
+                out["deep_link"] = .string("workshop://task/"
+                    + receipt.taskID.rawValue)
+            } else {
+                out["deep_link"] = .null
+                out["deep_link_note"] = .string(
+                    "workshop:// scheme not yet registered to Workshop.app")
+            }
+            return .object(out)
+        case "workshop_list_tasks":
+            return try .from(try listTasks())
         case "workshop_get_task":
             let id = TaskID(args["task_id"]?.stringValue ?? "")
             return try .from(try toolGetTask(taskID: id, principal: principal))
@@ -893,8 +966,6 @@ public actor CollaborationService {
             return try toolRenewLease(args: args, principal: principal)
         case "workshop_release_lease":
             return try toolReleaseLease(args: args, principal: principal)
-        case "workshop_create_task":
-            throw WorkshopError.phaseNotImplemented(name)
         default:
             throw WorkshopError.methodNotFound(name)
         }
@@ -912,6 +983,8 @@ public actor CollaborationService {
         switch message.author {
         case .system:
             return // system events never wake anyone
+        case .codex:
+            return // stored as .user with via=codex; never a row author
         case .user:
             // A user reply wakes the current owner (T10).
             if let owner = try repo.subtasks(message.taskID).lazy

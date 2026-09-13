@@ -1,3 +1,4 @@
+import CoreServices
 import Foundation
 import Security
 import WorkshopAdapters
@@ -84,6 +85,26 @@ public final class DaemonRuntime: @unchecked Sendable {
                 chmod(tokenPath, 0o600)
             }
         }
+
+        // Codex entry point token (§9.3): same generation/permissions as the
+        // engineer tokens; preserved across restarts.
+        let codexDir = home + "/profiles/codex"
+        try fm.createDirectory(atPath: codexDir, withIntermediateDirectories: true)
+        let codexTokenPath = codexDir + "/token"
+        if !fm.fileExists(atPath: codexTokenPath) {
+            var bytes = [UInt8](repeating: 0, count: 32)
+            _ = bytes.withUnsafeMutableBytes {
+                SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!)
+            }
+            let token = bytes.map { String(format: "%02x", $0) }.joined()
+            try token.write(toFile: codexTokenPath, atomically: true, encoding: .utf8)
+            chmod(codexTokenPath, 0o600)
+        }
+
+        // Stable bridge path (§4.5): ~/.codex/config.toml points at
+        // <home>/bin/workshop-mcp; re-point it at every start so rebuilds
+        // never leave a stale path behind.
+        Self.installBridgeSymlink(home: home, ownExecutable: ownExecutable)
 
         let runtime = runtimeDir ?? IPCServer.defaultRuntimeDir()
         self.runtimeDir = runtime
@@ -199,6 +220,8 @@ public final class DaemonRuntime: @unchecked Sendable {
                                                capacityPolicies: policies)
         self.service = service
         Self.log("opened database at \(dbPath)")
+        service.deepLinkHandlerVerified = Self.deepLinkRegistered()
+        self.buildID = Self.buildID(executable: ownExecutable)
 
         // Register the resolved DeepSeek key with the Redactor (compare-only;
         // never logged).
@@ -256,7 +279,20 @@ public final class DaemonRuntime: @unchecked Sendable {
                 return .object([
                     "status": .string("ok"),
                     "protocol_version": .number(Double(WorkshopProtocol.version)),
+                    "build": .string(self.buildID ?? ""),
                 ])
+            case WorkshopProtocol.stopBackground:
+                // Pause every Working task, answer the client, then exit. The
+                // LaunchAgent registration stays; KeepAlive=false keeps it idle.
+                let tasks = (try? await service.listTasks()) ?? []
+                for task in tasks where task.state == .working {
+                    try? await service.pauseTask(taskID: task.id, principal: .user)
+                }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
+                    Self.log("stop background work requested; exiting")
+                    Foundation.exit(0)
+                }
+                return .object(["ok": .bool(true)])
             case WorkshopProtocol.createTask:
                 let request = try (params ?? .object([:])).decode(as: CreateTaskRequest.self)
                 return try .from(try await service.createTask(request))
@@ -407,6 +443,54 @@ public final class DaemonRuntime: @unchecked Sendable {
 
     /// DeepSeek adapter needing a bound service reference, applied in `start()`.
     private var deepseekRebind: DeepSeekAdapter?
+
+    /// Build identity reported by workshop.health — the bundle's
+    /// CFBundleVersion when running packaged ("bundle:<ver>"), else the
+    /// executable's mtime+size ("bin:<mtime>-<size>"). The app compares its own
+    /// value and only warns when both sides carry a bundle version.
+    private var buildID: String?
+
+    public static func buildID(executable: String) -> String {
+        let plist = (executable as NSString).deletingLastPathComponent
+            + "/../Info.plist"
+        if let info = NSDictionary(contentsOfFile: plist),
+           let version = info["CFBundleVersion"] as? String {
+            return "bundle:\(version)"
+        }
+        if let attrs = try? FileManager.default
+            .attributesOfItem(atPath: executable),
+           let mtime = attrs[.modificationDate] as? Date,
+           let size = attrs[.size] as? Int64 {
+            return "bin:\(Int(mtime.timeIntervalSince1970))-\(size)"
+        }
+        return "unknown"
+    }
+
+    /// True when Launch Services resolves `workshop://` to this app's bundle id.
+    static func deepLinkRegistered() -> Bool {
+        guard let handler = LSCopyDefaultHandlerForURLScheme("workshop" as CFString)?
+            .takeRetainedValue() as? String else { return false }
+        return handler == "ai.maapu.workshop"
+    }
+
+    /// <home>/bin/workshop-mcp → sibling of this executable.
+    static func installBridgeSymlink(home: String, ownExecutable: String) {
+        let fm = FileManager.default
+        let target = (ownExecutable as NSString).deletingLastPathComponent
+            + "/workshop-mcp"
+        guard fm.fileExists(atPath: target) else { return }
+        let binDir = home + "/bin"
+        try? fm.createDirectory(atPath: binDir, withIntermediateDirectories: true)
+        let link = binDir + "/workshop-mcp"
+        if (try? fm.destinationOfSymbolicLink(atPath: link)) == target { return }
+        try? fm.removeItem(atPath: link)
+        do {
+            try fm.createSymbolicLink(atPath: link, withDestinationPath: target)
+            Self.log("bridge symlink \(link) -> \(target)")
+        } catch {
+            Self.log("bridge symlink failed: \(error.localizedDescription)")
+        }
+    }
 
     /// Committed template path: development checkout layout relative to this
     /// file, falling back to a bundle-adjacent Configuration directory.

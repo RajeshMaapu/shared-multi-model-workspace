@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import SwiftUI
 import WorkshopCore
 import WorkshopIPC
 
@@ -119,6 +121,7 @@ public final class AppState: ObservableObject {
                                         as: [WorkshopTask].self)) ?? tasks
         engineers = (try? await client.call(WorkshopProtocol.listEngineers,
                                             as: [AdapterProbe].self)) ?? engineers
+        notifyAttentionStates()
         await loadSelectedTask()
     }
 
@@ -347,6 +350,137 @@ public final class AppState: ObservableObject {
         }
         capacityLines = lines
         capacityAlerts = alerts
+    }
+
+    // MARK: - Phase 5: lifecycle, deep links, notifications, update banner
+
+    /// Build-mismatch banner: "Service is running an older build …" (§4.1).
+    @Published public var updateBanner: String?
+    /// Deep link to an unknown task surfaces here (§8.4).
+    @Published public var deepLinkNotice: String?
+    /// Menu-bar extra counters (§4.5).
+    @Published public var activeTurns = 0
+    /// Settings: mute user-facing notifications (never pauses work).
+    @AppStorage("muteNotifications") public var muteNotifications = false
+    /// (task, state) pairs already notified — one notification per transition.
+    private var notifiedStates: Set<String> = []
+
+    /// Pause every task currently Working (menu "Pause team", §4.5).
+    public func pauseAllWorking() async {
+        for task in tasks where task.state == .working {
+            _ = try? await client.call(
+                WorkshopProtocol.pauseTask,
+                params: .object(["task_id": .string(task.id.rawValue)]))
+        }
+        await refresh()
+    }
+
+    /// Ask the daemon to pause everything and exit; the LaunchAgent stays
+    /// registered but idle (§4.5 "Stop background work").
+    public func stopBackgroundWork() async {
+        _ = try? await client.call(WorkshopProtocol.stopBackground)
+        try? await Task.sleep(for: .milliseconds(700))
+        serviceUnavailable = true
+    }
+
+    /// workshop://task/<id> — select the task; unknown id → in-app notice.
+    public func handleDeepLink(_ url: URL) async {
+        guard url.scheme == "workshop" else { return }
+        let id = (url.host == "task")
+            ? url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            : url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !id.isEmpty else { return }
+        if tasks.isEmpty { await refresh() }
+        if let match = tasks.first(where: { $0.id.rawValue == id }) {
+            selectedTaskID = match.id
+            deepLinkNotice = nil
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            deepLinkNotice = "Unknown task \(id)"
+        }
+    }
+
+    /// Counts for the menu-bar extra; called by refresh and a slow timer.
+    public func refreshStatusCounts() async {
+        if let diag = try? await client.call(WorkshopProtocol.diagnostics,
+                                             as: JSONValue.self) {
+            activeTurns = diag["running_turns"]?.arrayValue?.count ?? 0
+        }
+    }
+
+    /// Number of tasks waiting on the user ("awaiting you" in the menu bar).
+    public var awaitingYou: Int {
+        tasks.filter { $0.state == .awaitingArchitectureApproval
+            || $0.state == .blocked }.count
+    }
+
+    /// Compare the app's build id with workshop.health.build. Only bundle
+    /// builds carry a comparable id; a mismatch shows the relaunch banner.
+    public func checkBuildMismatch() async {
+        guard let health = try? await client.call(WorkshopProtocol.health,
+                                                  as: JSONValue.self),
+              let service = health["build"]?.stringValue,
+              service.hasPrefix("bundle:") else { return }
+        let own = Self.ownBuildID()
+        if own.hasPrefix("bundle:"), own != service {
+            updateBanner = "Service is running an older build — "
+                + "Stop background work and relaunch"
+        } else {
+            updateBanner = nil
+        }
+    }
+
+    /// Same scheme as DaemonRuntime.buildID — bundle version or bin mtime+size.
+    public static func ownBuildID() -> String {
+        if let exe = Bundle.main.executableURL {
+            let plist = exe.deletingLastPathComponent()
+                .appendingPathComponent("../Info.plist").path
+            if let info = NSDictionary(contentsOfFile: plist),
+               let version = info["CFBundleVersion"] as? String {
+                return "bundle:\(version)"
+            }
+            if let attrs = try? FileManager.default
+                .attributesOfItem(atPath: exe.path),
+               let mtime = attrs[.modificationDate] as? Date,
+               let size = attrs[.size] as? Int64 {
+                return "bin:\(Int(mtime.timeIntervalSince1970))-\(size)"
+            }
+        }
+        return "unknown"
+    }
+
+    /// Post one user notification per (task, state) transition; the mute
+    /// setting suppresses delivery only — work continues regardless.
+    public func notifyAttentionStates() {
+        guard !muteNotifications else { return }
+        for task in tasks {
+            let reason: String?
+            switch task.state {
+            case .awaitingArchitectureApproval:
+                reason = "Architecture proposal awaits your approval"
+            case .blocked:
+                reason = "Task is blocked and needs input"
+            case .verifying:
+                reason = "Owner reported complete — verification pending"
+            default:
+                reason = nil
+            }
+            guard let reason else { continue }
+            let key = task.id.rawValue + ":" + task.state.rawValue
+            if notifiedStates.insert(key).inserted {
+                NotificationPoster.post(
+                    taskID: task.id.rawValue, title: task.title, body: reason)
+            }
+        }
+    }
+
+    /// Select a task when its notification is clicked.
+    public func openTaskFromNotification(_ taskID: String) async {
+        if tasks.isEmpty { await refresh() }
+        if let match = tasks.first(where: { $0.id.rawValue == taskID }) {
+            selectedTaskID = match.id
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     /// True when the selected task's owner bucket is limited/critical — the

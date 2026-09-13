@@ -36,6 +36,8 @@ public enum WorkshopProtocol {
     public static let recoverySummary = "workshop.recoverySummary"
     public static let exportTask = "workshop.exportTask"
     public static let backup = "workshop.backup"
+    /// Pause all Working tasks and exit the daemon (§4.5 Stop background work).
+    public static let stopBackground = "workshop.stopBackground"
 
     // Collaboration tool methods (spec §8.3); callable over IPC with an
     // authenticated engineer principal.

@@ -67,7 +67,7 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
     public var message: String {
         switch self {
         case .idempotencyConflict:
-            return "Idempotency key was already used with a different payload"
+            return "idempotency conflict: key was already used with a different payload"
         case .invalidRequest(let why):
             return "Invalid request: \(why)"
         case .methodNotFound(let method):

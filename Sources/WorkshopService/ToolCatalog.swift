@@ -20,6 +20,26 @@ public enum WorkshopToolCatalog {
     private static var i: JSONValue { .object(["type": .string("integer")]) }
 
     public static let tools: [Tool] = [
+        Tool(name: "workshop_create_task",
+             description: "Create a durable Workshop task. Returns a receipt with task_id, committed_seq, state, status, and a workshop:// deep link when the app is registered.",
+             inputSchema: obj(["idempotency_key": s, "title": s, "objective": s,
+                               "phase": s, "participants":
+                                .object(["type": .string("array"),
+                                         "items": s]),
+                               "constraints": .object(["type": .string("array"),
+                                                       "items": s]),
+                               "sources": .object(["type": .string("array"),
+                                                   "items": s]),
+                               "acceptance_criteria":
+                                .object(["type": .string("array"),
+                                         "items": s]),
+                               "workspace_ref": s, "budget_policy_ref": s,
+                               "channel": s],
+                              required: ["idempotency_key", "title",
+                                         "objective", "phase"])),
+        Tool(name: "workshop_list_tasks",
+             description: "List Workshop tasks, newest first.",
+             inputSchema: obj([:])),
         Tool(name: "workshop_get_task",
              description: "Get the task detail: title, brief, acceptance criteria, state, participants, artifacts, latest usage.",
              inputSchema: obj(["task_id": s], required: ["task_id"])),

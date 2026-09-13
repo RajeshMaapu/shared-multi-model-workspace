@@ -5,3 +5,4 @@
 docs/evidence/**/tmp/
 .DS_Store
 xcuserdata/
+dist/

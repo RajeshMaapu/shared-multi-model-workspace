@@ -188,13 +188,22 @@ final class Phase2ServiceTests: XCTestCase {
 
     // MARK: - phase-gated tools
 
+    /// All catalog tools are implemented since Phase 5; unknown names get
+    /// methodNotFound, malformed create args get a decode/invalidRequest error.
     func testPhaseGatedToolsReturnMethodNotFound() async throws {
         let (svc, _) = try await service()
         do {
-            _ = try await svc.callTool("workshop_create_task", args: .object([:]),
+            _ = try await svc.callTool("workshop_fictional_tool",
+                                       args: .object([:]),
                                        principal: .engineer(.devin))
-            XCTFail("expected phaseNotImplemented")
-        } catch WorkshopError.phaseNotImplemented {}
+            XCTFail("expected methodNotFound")
+        } catch WorkshopError.methodNotFound {}
+        do {
+            _ = try await svc.callTool("workshop_create_task",
+                                       args: .object([:]),
+                                       principal: .engineer(.devin))
+            XCTFail("expected a decoding/invalidRequest error")
+        } catch WorkshopError.invalidRequest {}
     }
 
     // MARK: - wakeups (§5.4)

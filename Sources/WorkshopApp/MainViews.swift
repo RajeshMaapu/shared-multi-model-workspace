@@ -32,15 +32,36 @@ struct RootView: View {
         }
         .background(WorkshopColors.conversationSurface)
         .overlay(alignment: .top) {
-            if state.serviceUnavailable {
-                Text("Service unavailable — local changes are read-only")
-                    .font(.system(size: 12))
+            VStack(spacing: 6) {
+                if state.serviceUnavailable {
+                    Text("Service unavailable — local changes are read-only")
+                        .font(.system(size: 12))
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(WorkshopColors.attention.opacity(0.9))
+                        .foregroundStyle(.white)
+                        .clipShape(Capsule())
+                }
+                if let banner = state.updateBanner {
+                    Text(banner)
+                        .font(.system(size: 12, weight: .medium))
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(Color.orange.opacity(0.9))
+                        .foregroundStyle(.white)
+                        .clipShape(Capsule())
+                }
+                if let notice = state.deepLinkNotice {
+                    HStack(spacing: 8) {
+                        Text(notice).font(.system(size: 12))
+                        Button("Dismiss") { state.deepLinkNotice = nil }
+                            .font(.system(size: 12))
+                    }
                     .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(WorkshopColors.attention.opacity(0.9))
                     .foregroundStyle(.white)
                     .clipShape(Capsule())
-                    .padding(.top, 8)
+                }
             }
+            .padding(.top, 8)
         }
     }
 }
