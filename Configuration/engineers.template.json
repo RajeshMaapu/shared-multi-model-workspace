@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "engineers": [
+    {
+      "id": "devin",
+      "display_name": "Devin Fusion",
+      "adapter_kind": "acp-devin",
+      "qualified_binary_version": "3000.10.21",
+      "model_selection": "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium",
+      "credential_reference": {
+        "kind": "file",
+        "path": "~/.local/share/devin/credentials.toml",
+        "toml_path": "auth.token"
+      },
+      "notes": "ACP harness; retained native sidekick. Qualified selector may change with vendor configuration."
+    },
+    {
+      "id": "kimi",
+      "display_name": "Kimi K3",
+      "adapter_kind": "acp-kimi",
+      "qualified_binary_version": "0.42.0",
+      "model_selection": "kimi-code/k3",
+      "reasoning": "native default high",
+      "credential_reference": {
+        "kind": "file",
+        "path": "~/.kimi-code/config.toml",
+        "toml_path": "providers.kimi.api_key"
+      },
+      "notes": "KIMI_CODE_HOME minimal config, empty skills dir, agentsMdPaths=[]."
+    },
+    {
+      "id": "deepseek",
+      "display_name": "DeepSeek V4.1 Flash",
+      "adapter_kind": "deepseek-api",
+      "model_selection": "deepseek-flash",
+      "thinking": {"type": "enabled"},
+      "reasoning_effort": "max",
+      "credential_reference": {
+        "kind": "file",
+        "path": "~/.kimi-code/config.toml",
+        "toml_path": "providers.deepseek.api_key"
+      },
+      "notes": "API credential reference only; adapter-managed session memory, no native subagents."
+    }
+  ]
+}
