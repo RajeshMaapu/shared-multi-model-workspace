@@ -51,3 +51,75 @@ Known limitations:            Research/proposal phase is preserved-but-queued (P
                               outbox.
 Independent reviewer:         none (builder self-check only)
 ```
+
+# Validation report — Phase 2
+
+```text
+Commit / build ID:            7c0dafa (main)
+macOS / hardware / toolchain: macOS 15.6.1 / arm64 / Xcode 26.3 / Swift 6.2.4
+Harness versions:             devin 3000.10.21 (qualified) / kimi 0.42.0 (qualified)
+                              / DeepSeek api.deepseek.com (no binary)
+Effective model selectors:    devin: fusion-claude-fable-5-1-medium-sidekick-swe-2-medium
+                              kimi: kimi-code/k3 (high)   deepseek: deepseek-flash (max)
+
+Deterministic tests:          ./scripts/test.sh — exit 0 — ~7.7 s
+                              68 tests, 63 passed, 5 skipped (LiveSmokeTests
+                              opt-in), 0 failures
+Live tests:                   WORKSHOP_LIVE=1 swift test --filter LiveSmokeTests
+                              — exit 0 — ~70 s — 5/5 passed
+                              Evidence: docs/evidence/phase2/live/*.json,
+                              docs/evidence/phase2/live-matrix.md
+
+Live coverage:                L1 Devin ACP: session/new, project-file MCP,
+                              permission allow_once, tool-posted marker in DB,
+                              usage row (input 23179/out 3/cache r 22829/w 348).
+                              L2 Kimi ACP: mcpServers injection, tool-posted
+                              marker, usage row (counters nil — Kimi reports
+                              none over ACP). L3 DeepSeek: tool loop,
+                              tool-posted marker, managed session file,
+                              usage row (in 1164/out 139/cache r 0).
+                              L4 peer roundtrip: devin @kimi → kimi KIMI_ACK +
+                              @deepseek → deepseek DEEPSEEK_ACK; 2 wakeups done,
+                              0 suppressed, ≤5 turns. L5 restart recall: reopened
+                              on same home, packet omitted prior messages
+                              (last_read_seq), both Devin and Kimi native
+                              sessions recalled their nonces.
+
+Notable live defects fixed:   workshop-mcp toolCaller was @MainActor-isolated
+                              (top-level main.swift) and deadlocked against the
+                              blocking stdio loop — built nonisolated. Devin
+                              permission requests carry only toolCallId — policy
+                              now scans option labels for the workshop marker.
+                              Turn packet lacked a literal task_id — DeepSeek
+                              guessed the subtask UUID; packet now states it.
+                              dispatchMain() trapped in async main — daemon
+                              parks on Task.sleep.
+
+Failure injections:           session/load failure → session/new + visible
+                              uncertain system event; unavailable wakeup target
+                              → suppressed rows + one system event; workspace
+                              traversal/symlink/absolute-outside rejected (T26);
+                              malformed MCP/JSON-RPC lines bounded and
+                              recovered.
+
+Secret scan:                  docs/evidence/phase2/live grepped for "Bearer",
+                              "api_key", "sk-", and the DeepSeek key prefix —
+                              no matches.
+
+UI screenshots:               docs/evidence/phase2/ui-1440x960-{light,dark}.png,
+                              ui-980x680-{light,dark}.png — the L4 peer
+                              roundtrip task with real engineer messages;
+                              ui-usage-tab-light.png (Usage tab); 
+                              ui-engineer-card-dark.png (engineer popover).
+                              Rendered via the in-window view path (no
+                              screen-recording permission needed).
+
+Known limitations:            Kimi ACP surfaces no token usage (row recorded
+                              with nil counters). DeepSeek exposes no
+                              cache-write counter. Quota remains "unknown".
+                              L4 relies on model compliance with mention
+                              instructions — one earlier run had Kimi omit
+                              @deepseek; the brief now instructs each engineer
+                              explicitly. No PR/open items remain for 2b.
+Independent reviewer:         none (builder self-check only)
+```

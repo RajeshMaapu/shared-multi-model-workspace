@@ -91,12 +91,16 @@ struct WorkshopApp: App {
     }
 
     private func captureMainWindow(to path: String) {
-        guard let window = NSApp.windows.first else { return }
-        let windowNumber = CGWindowID(window.windowNumber)
-        var image = CGWindowListCreateImage(.null, .optionIncludingWindow, windowNumber,
-                                            [.boundsIgnoreFraming, .bestResolution])
-        if image == nil, let view = window.contentView {
-            // Fallback: render the view without screen-capture permission.
+        // When WORKSHOP_OPEN_CARD is set, capture the popover window if it is
+        // up — it is a separate NSPanel and not part of the main contentView.
+        let wantCard = ProcessInfo.processInfo.environment["WORKSHOP_OPEN_CARD"] != nil
+        let window = wantCard ? (NSApp.windows.last ?? NSApp.windows.first)
+                              : NSApp.windows.first
+        guard let window else { return }
+        // Prefer rendering the view directly: CGWindowList capture returns a
+        // blank image without screen-recording permission, which this dev
+        // path should not require.
+        if let view = window.contentView {
             view.layoutSubtreeIfNeeded()
             if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
                 view.cacheDisplay(in: view.bounds, to: rep)
@@ -106,12 +110,14 @@ struct WorkshopApp: App {
                 }
             }
         }
-        if let cgImage = image {
+        let windowNumber = CGWindowID(window.windowNumber)
+        if let cgImage = CGWindowListCreateImage(
+            .null, .optionIncludingWindow, windowNumber,
+            [.boundsIgnoreFraming, .bestResolution]) {
             let rep = NSBitmapImageRep(cgImage: cgImage)
             if let png = rep.representation(using: .png, properties: [:]) {
                 try? png.write(to: URL(fileURLWithPath: path))
             }
         }
-        image = nil
     }
 }

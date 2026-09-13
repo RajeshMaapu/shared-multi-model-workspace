@@ -13,7 +13,14 @@ enum TaskTab: String, CaseIterable {
 struct TaskPaneView: View {
     @EnvironmentObject var state: AppState
     var showBack: Bool = false
-    @State private var tab: TaskTab = .conversation
+    @State private var tab: TaskTab = {
+        // Dev hook for screenshots: WORKSHOP_TAB=usage|files|board|conversation
+        if let raw = ProcessInfo.processInfo.environment["WORKSHOP_TAB"],
+           let t = TaskTab(rawValue: raw.lowercased().capitalized) {
+            return t
+        }
+        return .conversation
+    }()
 
     var body: some View {
         VStack(spacing: 0) {

@@ -151,6 +151,13 @@ struct EngineerRow: View {
                                  .filter { $0.ownerID == probe.engineer } ?? [])
             }
             .accessibilityLabel("\(probe.engineer.displayName), \(probe.health.label)")
+            .onAppear {
+                // Dev hook for screenshots: WORKSHOP_OPEN_CARD=<engineer>
+                if ProcessInfo.processInfo.environment["WORKSHOP_OPEN_CARD"]
+                    == probe.engineer.rawValue {
+                    showCard = true
+                }
+            }
     }
 
     private var rowBody: some View {

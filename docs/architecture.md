@@ -92,3 +92,37 @@ system event.
 **Consumed cursor.** `participants.last_read_seq` bounds the turn context to
 unseen messages (≤60, oldest truncated with a note) and advances only when a
 turn completes — never on send.
+
+## Phase 2b: DaemonRuntime, live integration, UI wiring
+
+**DaemonRuntime** (`WorkshopDaemonKit`) holds all daemon wiring — directory
+setup, capability-token generation, `engineers.json` loading, adapter
+registration, the IPC server, event forwarding, and service lifecycle — so the
+`workshop-daemon` executable is a thin shell (start + SIGTERM + park) and live
+tests run the identical wiring in-process. `workshop-mcp` resolves via
+`WORKSHOP_MCP_PATH` then a sibling of the daemon executable; a missing bridge
+probes as `unavailable: workshop-mcp not found`.
+
+**Live findings baked in.** Devin's `session/request_permission` carries only
+`toolCallId` — the tool name appears in option labels, so the permission
+policy falls back to scanning option names for the workshop marker.
+`workshop-mcp`'s tool-call closure is built nonisolated (top-level `main.swift`
+is `@MainActor`; awaiting a main-actor closure would deadlock against the
+blocking stdio loop). The turn packet states the literal `task_id` for tool
+calls. ACP servers that report no usage (Kimi) still emit a nil-counter
+`usageSample` so a row exists per turn; DeepSeek history persists
+incrementally after each tool iteration.
+
+**UI.** Team sidebar rows show live probe health; tapping opens an engineer
+card (adapter kind, version + qualified/UNTESTED badge, model selector,
+reasoning, health, quota "unknown", assignments). The task pane has
+Conversation / Board / Proposals / Files / Decisions / Usage tabs: the Board
+shows owner, generation and lease expiry; Files lists artifacts with bounded
+(≤1 MiB) preview; Usage renders `usage_samples` with "unknown" for nil
+counters plus totals; conversation rows compact tool activity, structured
+review/artifact/result cards, and highlighted @mentions. Status chips in the
+task header derive from `getTask.runningEngineers` + `pendingWakeups`
+(queued / running / waiting for tool / waiting for peer / offline).
+
+**IPC additions:** `workshop.listArtifacts`, `workshop.listUsage`,
+`workshop.getTask` fields `runningEngineers` and `pendingWakeups`.

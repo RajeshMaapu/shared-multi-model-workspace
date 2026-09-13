@@ -2,7 +2,7 @@
 
 A local macOS community workspace where three AI engineers — Devin Fusion, Kimi K3, and DeepSeek V4.1 Flash — discuss and execute the user's tasks. It resembles a channel-and-thread chat: each top-level message creates a task, and opening it reveals the task's conversation, proposals, ownership, reviews, decisions, artifacts, and usage.
 
-The shared conversation is a first-class product surface. A single local daemon (`workshop-daemon`) owns task state, dispatch, ownership leases, and recovery over SQLite; the SwiftUI app talks to it over a private Unix-domain socket using JSON-RPC 2.0. Phase 1 uses a scripted fake adapter so every flow is deterministic; real harness adapters land in Phase 2.
+The shared conversation is a first-class product surface. A single local daemon (`workshop-daemon`) owns task state, dispatch, ownership leases, and recovery over SQLite; the SwiftUI app talks to it over a private Unix-domain socket using JSON-RPC 2.0. Phase 1 uses a scripted fake adapter so every flow is deterministic; the real Devin/Kimi/DeepSeek harness adapters landed in Phase 2.
 
 ## Prerequisites
 
@@ -24,11 +24,17 @@ make screenshots   # capture the four evidence PNGs into docs/evidence/phase1/
 - Durable state: `~/Library/Application Support/Workshop/` (override: `WORKSHOP_HOME`)
   — `db/workshop.sqlite`, plus `profiles/`, `sessions/`, `worktrees/`, `artifacts/`, `diagnostics/`.
 - Runtime socket/lock: `${DARWIN_USER_TEMP_DIR}/workshop/service.sock` (override: `WORKSHOP_RUNTIME_DIR`).
-- Engineers use the fake adapter by default (`WORKSHOP_ADAPTERS=fake`). Without it, engineers
-  probe as `unavailable: adapter not configured` — real adapters arrive in Phase 2.
+- Engineers use the fake adapter by default (`WORKSHOP_ADAPTERS=fake`).
+  `WORKSHOP_ADAPTERS=live` registers the real Devin (ACP, project-config MCP),
+  Kimi (ACP, `mcpServers` injection), and DeepSeek (direct tool loop) adapters;
+  `mixed:<engineer>=fake,…` is available for tests.
 
 ## Phase status
 
-Phase 0 + Phase 1 complete: task creation → durable commit → atomic single-engineer claim →
-streamed reply in-thread → state survives app/service restart. See `docs/architecture.md`,
-`docs/validation.md`, `docs/recovery.md`, and `docs/adr/`.
+Phase 0–2 complete: task creation → durable commit → atomic claim → streamed
+replies → restart recovery, plus real Devin/Kimi/DeepSeek adapters, the
+`workshop-mcp` tool bridge, wakeup policy, artifacts, usage samples, and the
+engineer-card/tabbed task UI. Live smoke suite (L1–L5) passes against the real
+accounts — `WORKSHOP_LIVE=1 swift test --filter LiveSmokeTests`, evidence in
+`docs/evidence/phase2/`. See `docs/architecture.md`, `docs/validation.md`,
+`docs/recovery.md`, `docs/credential-ownership.md`, and `docs/adr/`.

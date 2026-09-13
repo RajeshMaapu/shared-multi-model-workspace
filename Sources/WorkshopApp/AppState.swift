@@ -52,6 +52,18 @@ public final class AppState: ObservableObject {
     private func connected() async {
         serviceUnavailable = false
         await refresh()
+        // Dev hook: WORKSHOP_SELECT_TASK selects a task by id or title.
+        if let want = ProcessInfo.processInfo.environment["WORKSHOP_SELECT_TASK"],
+           !want.isEmpty,
+           let match = tasks.first(where: {
+               $0.id.rawValue == want || $0.title.localizedCaseInsensitiveContains(want)
+           }) {
+            selectedTaskID = match.id
+            await loadSelectedTask()
+        } else if selectedTaskID == nil {
+            selectedTaskID = tasks.last?.id
+            await loadSelectedTask()
+        }
         if !subscribed {
             subscribed = true
             startNotifications()
