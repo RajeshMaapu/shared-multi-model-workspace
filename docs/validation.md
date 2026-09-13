@@ -123,3 +123,68 @@ Known limitations:            Kimi ACP surfaces no token usage (row recorded
                               explicitly. No PR/open items remain for 2b.
 Independent reviewer:         none (builder self-check only)
 ```
+
+# Validation report — Phase 3
+
+```text
+Commit / build ID:            78e0e8b + Phase 3 UI/docs commits (main)
+macOS / hardware / toolchain: macOS 15.6.1 / arm64 / Xcode 26.3 / Swift 6.2.4
+
+Deterministic tests:          ./scripts/test.sh — exit 0 — ~8.8 s
+                              85 tests, 79 passed, 6 skipped (LiveSmokeTests
+                              opt-in), 0 failures
+Live tests:                   WORKSHOP_LIVE=1 swift test --filter
+                              testL6ResearchApprovalAllocation — exit 0 —
+                              231.5 s — passed
+                              Evidence: docs/evidence/phase3/live/l6.json,
+                              docs/evidence/phase3/live/live-l6.md
+
+Phase 3 coverage:             T12 draft privacy (peers see published + own
+                              draft only; get_task exposes counts), publish-
+                              together with missing participant recorded,
+                              exactly one cross_review wakeup per participant,
+                              Devin-only consolidation, unavailable-arbiter
+                              wait (no promotion), T07 approval gate on all
+                              implementation tools with no pre-approval turn,
+                              approval → subtasks + Devin allocate wakeup,
+                              stale revision -32008, engineer approval -32005,
+                              T27-lite engineer "approved" message inert,
+                              T08 revision invalidates approval, assign CAS +
+                              generation + dependency gating -32007, dispute
+                              wakes Devin, proportional review picks verifier
+                              ≠ owner and agree→done/passed, needs_changes→
+                              rework, small-task path unchanged, pause cancel
+                              with requested/acknowledged events, cancel while
+                              running requested→completed, escalate→pause→
+                              convert→researching, v2→v3 migration preserving
+                              data, F1 tool-message-before-reply ordering,
+                              F2 honest recovery wording (both cases).
+
+Live coverage (L6):           Research task with all three participants:
+                              3 drafts at t+87 s, publish, 3 cross-reviews at
+                              t+173 s, Devin report r1 at t+216 s, user
+                              approval, Devin allocation at t+231 s, owner
+                              result at t+231 s. 24 messages, 10 wakeup rows
+                              (7 done, 1 suppressed — a coalesced mention),
+                              usage rows for all three engineers.
+
+UI screenshots:               docs/evidence/phase3/proposals-1440x960-
+                              {light,dark}.png — L6 published proposal cards
+                              with peer reviews and the approved report card.
+                              approval-card-before-1440x960-light.png — the
+                              same task's report card before approval
+                              (rendered on a copy of the L6 home with
+                              approval_revision reset; noted here per spec).
+                              decisions-1440x960-light.png — decision log.
+                              board-1440x960-light.png — owner/verification
+                              columns.
+
+Known limitations:            L6 asserts stage rows exist; it does not grade
+                              proposal content quality. Kimi ACP reports no
+                              token usage (rows recorded with nil counters).
+                              Keyboard approval: Approve/Choose/Request-
+                              changes are standard focusable controls (Tab
+                              traversal) with .defaultAction on Approve;
+                              verified by build, not a scripted UI test.
+Independent reviewer:         none (builder self-check only)
+```

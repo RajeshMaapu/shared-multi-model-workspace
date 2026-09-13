@@ -47,6 +47,7 @@ struct TaskPaneView: View {
                         statusChips(detail)
                     }
                     Spacer()
+                    taskActionsMenu(detail.task)
                 }
                 .padding(12)
                 Divider().overlay(WorkshopColors.divider)
@@ -60,9 +61,9 @@ struct TaskPaneView: View {
                     switch tab {
                     case .conversation: ConversationView()
                     case .board: BoardView(subtasks: detail.subtasks)
-                    case .proposals: EmptyTabView(text: "Arrives in Phase 3")
+                    case .proposals: ProposalsView()
                     case .files: FilesView()
-                    case .decisions: EmptyTabView(text: "Arrives in Phase 3")
+                    case .decisions: DecisionsView()
                     case .usage: UsageView()
                     }
                 }
@@ -101,6 +102,32 @@ struct TaskPaneView: View {
             }
             .padding(.top, 4)
         }
+    }
+
+    /// Task-level actions (§8.2): pause/resume/cancel/accept/convert.
+    /// All are user-authority operations routed through the daemon.
+    @ViewBuilder
+    private func taskActionsMenu(_ task: WorkshopTask) -> some View {
+        Menu {
+            Button("Pause") { Task { await state.pauseTask() } }
+                .disabled(task.state != .working)
+            Button("Resume") { Task { await state.resumeTask() } }
+                .disabled(task.state != .paused)
+            Button("Cancel task") { Task { await state.cancelTask() } }
+                .disabled(![.ready, .working].contains(task.state))
+            Divider()
+            Button("Accept task") { Task { await state.acceptTask() } }
+                .disabled(task.state != .verifying)
+            Button("Convert to research") {
+                Task { await state.convertToResearch() }
+            }
+            .disabled(task.state != .paused)
+        } label: {
+            Text("Actions")
+                .font(.system(size: 12, weight: .medium))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
     }
 }
 
@@ -225,15 +252,33 @@ struct StructuredCard: View {
     let kind: MessageKind
     let payload: JSONValue
 
-    private static let fieldOrder = ["summary", "reviewer", "message",
-                                     "artifact_ids", "validation", "description"]
+    private static let fieldOrder = ["type", "summary", "reviewer", "message",
+                                     "artifact_ids", "validation", "description",
+                                     "proposal_id", "revision", "severity",
+                                     "disposition", "subtask", "proposed_owner",
+                                     "owner", "rationale", "kind", "scope",
+                                     "recommendation", "result_message_id",
+                                     "evidence"]
+
+    /// Ordered known fields first, then any remaining keys alphabetically, so
+    /// assignment/decision/review cards never silently drop fields.
+    private var orderedKeys: [String] {
+        var keys: [String] = []
+        for key in Self.fieldOrder where payload[key] != nil { keys.append(key) }
+        if case .object(let object) = payload {
+            for key in object.keys.sorted() where !keys.contains(key) {
+                keys.append(key)
+            }
+        }
+        return keys
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(kind.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(WorkshopColors.secondaryText)
-            ForEach(Self.fieldOrder, id: \.self) { key in
+            ForEach(orderedKeys, id: \.self) { key in
                 if let value = payload[key] {
                     fieldRow(key, value)
                 }
@@ -295,50 +340,80 @@ struct Avatar: View {
     }
 }
 
+/// Kanban board: one column per subtask state, cards show owner, generation,
+/// risk, verification outcome, and dependencies (§5.5 proportional review data).
 struct BoardView: View {
     let subtasks: [Subtask]
 
+    private static let columns: [SubtaskState] =
+        [.ready, .claimed, .working, .review, .blocked, .done]
+
+    private func title(for id: String) -> String {
+        subtasks.first { $0.id.rawValue == id }?.title ?? id
+    }
+
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 8) {
-                ForEach(SubtaskState.allCases, id: \.self) { state in
-                    let group = subtasks.filter { $0.state == state }
-                    if !group.isEmpty {
-                        Text(state.displayName.uppercased())
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(WorkshopColors.secondaryText)
-                            .padding(.top, 8)
-                        ForEach(group) { subtask in
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(subtask.title)
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(WorkshopColors.primaryText)
-                                Text(subtask.ownerID.map {
-                                    "\($0.displayName) owns · generation \(subtask.generation)"
-                                } ?? "Unowned")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(WorkshopColors.secondaryText)
-                                if let lease = subtask.leaseExpiresAt {
-                                    Text("Lease expires \(lease, style: .time) (\(lease.relativeDescription))")
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(WorkshopColors.secondaryText)
-                                }
+        if subtasks.isEmpty {
+            EmptyTabView(text: "No subtasks.")
+        } else {
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: 12) {
+                    ForEach(Self.columns, id: \.self) { column in
+                        let group = subtasks.filter { $0.state == column }
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("\(column.displayName.uppercased()) · \(group.count)")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(WorkshopColors.secondaryText)
+                            ForEach(group) { subtask in
+                                card(subtask)
                             }
-                            .padding(10)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(WorkshopColors.secondarySurface)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            Spacer(minLength: 0)
                         }
+                        .frame(width: 220, alignment: .top)
                     }
                 }
-                if subtasks.isEmpty {
-                    Text("No subtasks.")
-                        .font(.system(size: 13))
-                        .foregroundStyle(WorkshopColors.secondaryText)
-                }
+                .padding(16)
             }
-            .padding(16)
         }
+    }
+
+    private func card(_ subtask: Subtask) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(subtask.title)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(WorkshopColors.primaryText)
+            Text(subtask.ownerID.map {
+                "\($0.displayName) · gen \(subtask.generation)"
+            } ?? "Unowned · gen \(subtask.generation)")
+                .font(.system(size: 11))
+                .foregroundStyle(WorkshopColors.secondaryText)
+            HStack(spacing: 6) {
+                Chip(text: "risk: \(subtask.risk)",
+                     color: subtask.risk == "high"
+                        ? .orange : WorkshopColors.selectedNavigation.opacity(0.6))
+                Chip(text: "verify: \(subtask.verification)",
+                     color: subtask.verification == "passed"
+                        ? .green
+                        : (subtask.verification == "changes_requested"
+                           ? .orange : WorkshopColors.selectedNavigation.opacity(0.6)))
+            }
+            if !subtask.dependencies.isEmpty {
+                Text("depends on: "
+                     + subtask.dependencies.map(title(for:)).joined(separator: ", "))
+                    .font(.system(size: 10))
+                    .foregroundStyle(WorkshopColors.secondaryText)
+            }
+            if let lease = subtask.leaseExpiresAt {
+                Text("Lease expires \(lease, style: .time)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(WorkshopColors.secondaryText)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(WorkshopColors.secondarySurface)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(WorkshopColors.divider))
     }
 }
 
@@ -578,6 +653,347 @@ struct ComposerField: View {
             base.focused(focused)
         } else {
             base
+        }
+    }
+}
+
+// MARK: - Phase 3: Proposals / Report / Decisions
+
+/// Decoded fields shared by proposal and report JSON payloads.
+private func contentJSON(_ raw: String) -> JSONValue? {
+    try? JSONDecoder().decode(JSONValue.self, from: Data(raw.utf8))
+}
+
+private func strings(_ value: JSONValue?) -> [String] {
+    value?.arrayValue?.compactMap(\.stringValue) ?? []
+}
+
+/// Proposals tab: private draft progress while researching, published proposal
+/// cards with their reviews after publication, and the consolidated report
+/// with user-only approval controls (§5.3, T12, §12.5 keyboard access).
+struct ProposalsView: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                if let error = state.lastActionError {
+                    Text(error)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.orange)
+                }
+                if let detail = state.detail,
+                   detail.task.state == .researching {
+                    Text("\(detail.draftProposalCount) of "
+                         + "\(detail.participants.count) proposals drafted "
+                         + "(private until published)")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(WorkshopColors.secondaryText)
+                }
+                let published = state.proposals.filter { $0.visibility == "published" }
+                if !published.isEmpty {
+                    Text("PROPOSALS")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(WorkshopColors.secondaryText)
+                    // Cards side by side; scroll horizontally if they exceed width.
+                    ScrollView(.horizontal) {
+                        HStack(alignment: .top, spacing: 12) {
+                            ForEach(published) { proposal in
+                                ProposalCard(proposal: proposal,
+                                             reviews: reviews(for: proposal))
+                                    .frame(width: 320, alignment: .top)
+                            }
+                        }
+                    }
+                }
+                ForEach(state.reports) { report in
+                    ReportCard(report: report)
+                }
+                if published.isEmpty && state.reports.isEmpty,
+                   state.detail?.task.state != .researching {
+                    EmptyTabView(text: "No proposals or reports yet.")
+                }
+            }
+            .padding(16)
+        }
+    }
+
+    /// Review messages whose structured payload targets this proposal.
+    private func reviews(for proposal: Proposal) -> [Message] {
+        state.messages.filter { message in
+            guard message.kind == .review, let s = message.structured,
+                  let payload = contentJSON(s),
+                  payload["type"]?.stringValue == "review" else { return false }
+            return payload["proposal_id"]?.stringValue == proposal.id
+        }
+    }
+}
+
+/// One published proposal: title, summary, approach, alternatives, risks,
+/// proposed ownership — with peer reviews beneath.
+struct ProposalCard: View {
+    let proposal: Proposal
+    let reviews: [Message]
+
+    var body: some View {
+        let content = contentJSON(proposal.content)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(proposal.author.displayName)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(WorkshopColors.engineer(proposal.author))
+                Spacer()
+                Text(proposal.createdAt, style: .time)
+                    .font(.system(size: 10))
+                    .foregroundStyle(WorkshopColors.secondaryText)
+            }
+            Text(content?["title"]?.stringValue ?? "(untitled)")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(WorkshopColors.primaryText)
+            field("Summary", content?["summary"]?.stringValue)
+            field("Approach", content?["approach"]?.stringValue)
+            if let alternatives = content?["alternatives"]?.arrayValue,
+               !alternatives.isEmpty {
+                Text("Alternatives")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(WorkshopColors.secondaryText)
+                ForEach(alternatives.indices, id: \.self) { i in
+                    let alt = alternatives[i]
+                    Text("• \(alt["title"]?.stringValue ?? "") — "
+                         + (alt["summary"]?.stringValue ?? ""))
+                        .font(.system(size: 12))
+                        .foregroundStyle(WorkshopColors.primaryText)
+                }
+            }
+            field("Risks", strings(content?["risks"]).joined(separator: "; "))
+            if let ownership = content?["proposed_ownership"]?.arrayValue,
+               !ownership.isEmpty {
+                Text("Proposed ownership")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(WorkshopColors.secondaryText)
+                ForEach(ownership.indices, id: \.self) { i in
+                    let item = ownership[i]
+                    Text("• \(item["subtask_title"]?.stringValue ?? "") → "
+                         + (item["proposed_owner"]?.stringValue ?? "?"))
+                        .font(.system(size: 12))
+                        .foregroundStyle(WorkshopColors.primaryText)
+                }
+            }
+            if !reviews.isEmpty {
+                Divider().overlay(WorkshopColors.divider)
+                Text("REVIEWS")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(WorkshopColors.secondaryText)
+                ForEach(reviews) { review in
+                    ReviewRow(message: review)
+                }
+            }
+        }
+        .padding(12)
+        .background(WorkshopColors.secondarySurface)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(WorkshopColors.divider))
+    }
+
+    @ViewBuilder
+    private func field(_ label: String, _ value: String?) -> some View {
+        if let value, !value.isEmpty {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(WorkshopColors.secondaryText)
+            Text(value)
+                .font(.system(size: 12))
+                .foregroundStyle(WorkshopColors.primaryText)
+                .textSelection(.enabled)
+        }
+    }
+}
+
+/// One review under a proposal/result: severity + disposition chips and body.
+struct ReviewRow: View {
+    let message: Message
+
+    var body: some View {
+        let payload = message.structured.flatMap(contentJSON)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(message.author.displayName)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(WorkshopColors.primaryText)
+                if let severity = payload?["severity"]?.stringValue {
+                    Chip(text: severity, color: severity == "high" ? .red
+                         : (severity == "medium" ? .orange : .gray))
+                }
+                if let disposition = payload?["disposition"]?.stringValue {
+                    Chip(text: disposition.replacingOccurrences(of: "_", with: " "),
+                         color: disposition == "agree" ? .green
+                         : (disposition == "disagree" ? .red : .orange))
+                }
+            }
+            Text(message.body)
+                .font(.system(size: 12))
+                .foregroundStyle(WorkshopColors.primaryText)
+                .textSelection(.enabled)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+/// Consolidated report card with user-only approval controls. Buttons are
+/// standard focusable controls so approval is reachable by keyboard (§12.5).
+struct ReportCard: View {
+    @EnvironmentObject var state: AppState
+    let report: Report
+    @State private var changesComment = ""
+    @State private var alternativeIndex = 0
+
+    private var task: WorkshopTask? { state.detail?.task }
+
+    var body: some View {
+        let content = contentJSON(report.content)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Report r\(report.revision) · \(report.author)")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(WorkshopColors.secondaryText)
+                Spacer()
+                if task?.approvalRevision == report.revision {
+                    Chip(text: "Approved r\(report.revision)", color: .green)
+                } else if let approved = task?.approvalRevision,
+                          approved < report.revision {
+                    Chip(text: "Approval r\(approved) no longer covers "
+                         + "r\(report.revision)", color: .orange)
+                }
+            }
+            if let recommendation = content?["recommendation"]?.stringValue {
+                Text(recommendation)
+                    .font(.system(size: 13))
+                    .foregroundStyle(WorkshopColors.primaryText)
+                    .textSelection(.enabled)
+            }
+            if let alternatives = content?["alternatives"]?.arrayValue,
+               !alternatives.isEmpty {
+                ForEach(alternatives.indices, id: \.self) { i in
+                    Text("Alt \(i): \(alternatives[i]["title"]?.stringValue ?? "")")
+                        .font(.system(size: 12))
+                        .foregroundStyle(WorkshopColors.secondaryText)
+                }
+            }
+            if let disagreements = content?["disagreements"]?.arrayValue,
+               !disagreements.isEmpty {
+                Text("Disagreements")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(WorkshopColors.secondaryText)
+                ForEach(disagreements.indices, id: \.self) { i in
+                    let d = disagreements[i]
+                    let positions = (d["positions"]?.arrayValue ?? [])
+                        .map { "\($0["engineer"]?.stringValue ?? "?"): "
+                             + "\($0["position"]?.stringValue ?? "")" }
+                        .joined(separator: " · ")
+                    Text("• \(d["topic"]?.stringValue ?? "") — \(positions)")
+                        .font(.system(size: 12))
+                        .foregroundStyle(WorkshopColors.primaryText)
+                }
+            }
+            if task?.state == .awaitingArchitectureApproval {
+                HStack(spacing: 10) {
+                    Button("Approve architecture") {
+                        Task {
+                            await state.approveArchitecture(
+                                reportRevision: report.revision)
+                        }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    Picker("Alternative", selection: $alternativeIndex) {
+                        let count = content?["alternatives"]?.arrayValue?.count ?? 0
+                        ForEach(0..<max(count, 1), id: \.self) {
+                            Text("Alt \($0)").tag($0)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 90)
+                    Button("Choose alternative") {
+                        Task {
+                            await state.chooseAlternative(
+                                reportRevision: report.revision,
+                                index: alternativeIndex)
+                        }
+                    }
+                }
+                HStack(spacing: 8) {
+                    TextField("Request changes…", text: $changesComment)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12))
+                        .frame(maxWidth: 280)
+                    Button("Request changes") {
+                        let comment = changesComment
+                        changesComment = ""
+                        Task {
+                            await state.requestChanges(
+                                reportRevision: report.revision,
+                                comment: comment)
+                        }
+                    }
+                    .disabled(changesComment.trimmingCharacters(
+                        in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .padding(12)
+        .background(WorkshopColors.secondarySurface)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(WorkshopColors.divider))
+    }
+}
+
+/// Decisions tab: chronological record of approvals, allocations, disputes,
+/// escalations, acceptances, cancellations.
+struct DecisionsView: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        if state.decisions.isEmpty {
+            EmptyTabView(text: "No decisions recorded yet.")
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(state.decisions) { decision in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 8) {
+                                Chip(text: decision.kind.replacingOccurrences(
+                                    of: "_", with: " "),
+                                     color: WorkshopColors.selectedNavigation)
+                                if let revision = decision.revision {
+                                    Text("r\(revision)")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(WorkshopColors.secondaryText)
+                                }
+                                if let scope = decision.scope {
+                                    Text(scope)
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(WorkshopColors.secondaryText)
+                                }
+                                Text(decision.author)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(WorkshopColors.primaryText)
+                                Spacer()
+                                Text(decision.createdAt, style: .time)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(WorkshopColors.secondaryText)
+                            }
+                            Text(decision.body)
+                                .font(.system(size: 12))
+                                .foregroundStyle(WorkshopColors.primaryText)
+                                .textSelection(.enabled)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(WorkshopColors.secondarySurface)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+                .padding(16)
+            }
         }
     }
 }

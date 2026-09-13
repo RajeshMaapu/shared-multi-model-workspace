@@ -82,9 +82,10 @@ final class LiveSmokeTests: XCTestCase {
         return false
     }
 
-    /// Persist one test's evidence JSON under docs/evidence/phase2/live/.
-    private func record(_ name: String, _ data: [String: JSONValue]) {
-        let dir = Self.evidenceDir
+    /// Persist one test's evidence JSON under docs/evidence/<phase>/live/.
+    private func record(_ name: String, _ data: [String: JSONValue],
+                        phase: String = "phase2") {
+        let dir = Self.evidenceDir.replacingOccurrences(of: "phase2", with: phase)
         try? FileManager.default.createDirectory(atPath: dir,
                                                  withIntermediateDirectories: true)
         var payload = data
@@ -313,6 +314,134 @@ final class LiveSmokeTests: XCTestCase {
             XCTAssertTrue(recalledBy[engineer] == true,
                           "\(engineer.rawValue) did not recall its nonce after restart")
         }
+    }
+
+    /// L6: full Phase 3 loop — research → proposals → cross-review → Devin
+    /// report → user approval → Devin allocation → owner result. Each stage is
+    /// time-boxed; a timeout records the failure and fails the test.
+    func testL6ResearchApprovalAllocation() async throws {
+        let started = Date()
+        let runtime = try await boot()
+        let service = runtime.service
+        let nonce = Self.nonce()
+        var stageTimes: [String: Double] = [:]
+        func mark(_ stage: String) {
+            stageTimes[stage] = Date().timeIntervalSince(started)
+        }
+
+        let brief = "Decide whether Workshop should store artifact previews "
+            + "as PNG or SVG. Keep your proposal under 120 words; one "
+            + "alternative; one risk; propose one subtask named "
+            + "'Write preview decision note' owned by yourself. "
+            + "Marker: \(nonce)."
+        let receipt = try await service.createTask(CreateTaskRequest(
+            idempotencyKey: "live-l6-\(nonce)",
+            title: "Artifact preview format", objective: brief,
+            phase: .researchProposal,
+            participants: [.devin, .kimi, .deepseek]))
+        let taskID = receipt.taskID
+
+        // Stage 1: all three drafts (≤6 min), then publish.
+        var ok = await waitFor(runtime, taskID: taskID, timeout: 360) { _ in
+            ((try? self.repo().proposals(taskID)) ?? []).count == 3
+        }
+        mark("drafts")
+        XCTAssertTrue(ok, "timed out waiting for three proposal drafts")
+        guard ok else {
+            await recordL6(taskID, stageTimes, started, failed: "drafts"); return }
+        try await service.publishProposals(taskID)
+        mark("published")
+
+        // Stage 2: cross-review — every participant submits ≥1 review (≤6 min).
+        ok = await waitFor(runtime, taskID: taskID, timeout: 360) { messages in
+            let reviewers = Set(messages.filter { $0.kind == .review }
+                .compactMap { $0.author.engineerID })
+            return reviewers.count == 3
+        }
+        mark("reviews")
+        XCTAssertTrue(ok, "timed out waiting for cross-reviews")
+        guard ok else {
+            await recordL6(taskID, stageTimes, started, failed: "reviews"); return }
+
+        // Stage 3: Devin consolidates a report (≤4 min).
+        ok = await waitFor(runtime, taskID: taskID, timeout: 240) { _ in
+            ((try? self.repo().reports(taskID)) ?? []).isEmpty == false
+        }
+        mark("report")
+        XCTAssertTrue(ok, "timed out waiting for Devin's report")
+        guard ok else {
+            await recordL6(taskID, stageTimes, started, failed: "report"); return }
+        let revision = ((try? self.repo().reports(taskID)) ?? []).map(\.revision).max() ?? 0
+
+        // Stage 4: user approves the current revision.
+        try await service.approveArchitecture(taskID: taskID,
+                                              reportRevision: revision,
+                                              scope: nil, principal: .user)
+        mark("approved")
+
+        // Stage 5: Devin allocates — some subtask gains an owner (≤4 min).
+        ok = await waitFor(runtime, taskID: taskID, timeout: 240) { _ in
+            ((try? self.repo().subtasks(taskID)) ?? []).contains { $0.ownerID != nil }
+        }
+        mark("allocated")
+        XCTAssertTrue(ok, "timed out waiting for Devin's allocation")
+        guard ok else {
+            await recordL6(taskID, stageTimes, started, failed: "allocated"); return }
+
+        // Stage 6: the owner reports a result (≤4 min): a structured result
+        // card or the subtask leaving the working/claimed state.
+        ok = await waitFor(runtime, taskID: taskID, timeout: 240) { messages in
+            messages.contains {
+                $0.structured?.contains("result") == true && $0.kind != .systemEvent
+            } || ((try? self.repo().subtasks(taskID)) ?? []).contains {
+                $0.ownerID != nil && ($0.state == .review || $0.state == .done)
+            }
+        }
+        mark("result")
+        await recordL6(taskID, stageTimes, started, failed: ok ? nil : "result")
+        XCTAssertTrue(ok, "timed out waiting for the owner's result")
+    }
+
+    /// Write L6 evidence (docs/evidence/phase3/live/l6.json + live-l6.md).
+    private func recordL6(_ taskID: TaskID, _ stageTimes: [String: Double],
+                          _ started: Date, failed: String?) async {
+        guard let runtime = Self.runtime else { return }
+        let msgs = (try? await runtime.service.readMessages(taskID)) ?? []
+        let wakeups = (try? self.repo().wakeups(taskID)) ?? []
+        var usage: [String: JSONValue] = [:]
+        for e in EngineerID.allCases {
+            usage[e.rawValue] = (try? await usageEvidence(
+                runtime, taskID: taskID, engineer: e)) ?? .null
+        }
+        record("l6", [
+            "stage_times": .object(stageTimes.mapValues { .number($0) }),
+            "wall_seconds": .number(Date().timeIntervalSince(started)),
+            "failed_stage": failed.map(JSONValue.string) ?? .null,
+            "message_rows": .number(Double(msgs.count)),
+            "wakeup_rows": .number(Double(wakeups.count)),
+            "wakeups_done": .number(Double(wakeups.filter {
+                $0.state == "done" }.count)),
+            "wakeups_suppressed": .number(Double(wakeups.filter {
+                $0.state == "suppressed" }.count)),
+            "usage": .object(usage),
+        ], phase: "phase3")
+        var md = "# L6 live evidence — research → approval → allocation\n\n"
+        md += "| stage | t+seconds |\n|---|---|\n"
+        for stage in ["drafts", "published", "reviews", "report", "approved",
+                      "allocated", "result"] {
+            let cell = stageTimes[stage].map { String(format: "%.1f", $0) } ?? "—"
+            md += "| \(stage) | \(cell) |\n"
+        }
+        md += "\n- Wall time: "
+            + String(format: "%.1f", Date().timeIntervalSince(started)) + " s\n"
+        md += "- Messages: \(msgs.count); wakeups: \(wakeups.count) "
+            + "(done \(wakeups.filter { $0.state == "done" }.count), "
+            + "suppressed \(wakeups.filter { $0.state == "suppressed" }.count))\n"
+        if let failed { md += "- **Failed stage:** \(failed)\n" }
+        let dir = Self.evidenceDir.replacingOccurrences(of: "phase2",
+                                                      with: "phase3")
+        try? md.write(toFile: dir + "/live-l6.md", atomically: true,
+                      encoding: .utf8)
     }
 
     override class func tearDown() {

@@ -126,3 +126,81 @@ task header derive from `getTask.runningEngineers` + `pendingWakeups`
 
 **IPC additions:** `workshop.listArtifacts`, `workshop.listUsage`,
 `workshop.getTask` fields `runningEngineers` and `pendingWakeups`.
+
+## Phase 3: collaboration policy engine
+
+Phase 3 layers the substantial-task policy (§5.3, §5.5) onto the same
+service. Classification is the explicit `phase` field
+(`WorkshopTask.classification` → "small" | "substantial"); small tasks take
+exactly the Phase 1/2 path with no research overhead.
+
+**Schema v3.** `proposals` (draft|published), `reports` (UNIQUE task+revision),
+`decisions` (approval/request_changes/choose_alternative/allocation/dispute/
+escalation/acceptance/scope_change/cancellation), plus
+`tasks.report_revision`, `tasks.cancel_requested_at`,
+`subtasks.risk`, `subtasks.verification`.
+
+**Draft privacy (T12).** Proposals are written with `visibility=draft`;
+`workshop_read_proposals` returns published proposals plus the caller's own
+draft only, and `workshop_get_task` exposes draft/published counts. Drafts
+never appear in messages or context packets.
+
+**Publish-together.** When every *available* participant has a draft — or the
+research deadline (default 20 min) elapses — all drafts publish in one
+transaction, a system event records authors and `missing:` participants, and
+every participant gets exactly one `cross_review` wakeup.
+
+**Consolidation (ADR 0011).** After every available participant has ≥1 review
+(or the 15-min review deadline), only Devin is woken (`consolidate`); if Devin
+is unavailable the task waits with a system event — no other arbiter is
+promoted. `workshop_submit_report` writes revision N and moves the task to
+`awaiting_architecture_approval`.
+
+**User authority.** Approve / request-changes / choose-alternative are
+user-principal IPC calls; engineer callers get `-32005`, a stale revision gets
+`-32008`, and an engineer message merely containing "approved" changes nothing
+(T27-lite). Approval stamps `approval_revision`, creates subtasks from the
+report's `proposed_ownership` (dependencies resolved by title), and wakes
+Devin (`allocate`). A later report revision clears `approval_revision` and
+posts "prior approval no longer authorizes new work" (T08).
+
+**Approval gate (T07).** On substantial tasks the implementation tools
+(`assign`, `claim`, `propose_subtask`, `report_result`, `publish_artifact`)
+are refused with `-32006` unless `approval_revision == report_revision`; no
+execution turn is dispatched before approval. Small tasks are never gated.
+
+**Allocation.** Only Devin or the user may assign (`-32005` otherwise);
+assignment is a generation CAS, refuses unfinished dependencies (`-32007`),
+records an `allocation` decision plus a structured assignment card, and wakes
+the owner. `workshop_dispute_assignment` records a `dispute` decision and
+wakes Devin.
+
+**Proportional verification (§5.5).** `report_result` on a high-risk subtask
+or any substantial task picks a verifier ≠ owner (preferring Devin) via a
+`verify_result` wakeup; `agree` marks the subtask done/`verification=passed`,
+`needs_changes` returns it to the owner. Task-level completion waits for the
+user's `workshop.acceptTask`.
+
+**Task actions.** Pause cancels the in-flight turn and suppresses pending
+wakeups (requested/acknowledged system events); resume re-dispatches; cancel
+records `cancel_requested_at` and completes after the turn ends; escalation
+pauses + records a decision; `convertToResearch` moves a paused task to the
+research path (ADR 0010).
+
+**Stream ordering (F1).** Streaming placeholders carry a provisional
+`seq ≥ 1_000_000_000` so they sort last while streaming and are excluded from
+context packets and cursor advancement; at commit the row is reassigned
+`nextMessageSeq`, so a tool-posted message mid-turn ends up *before* the
+streamed reply.
+
+**Recovery wording (F2).** `recoverInterruptedStreams` reports what actually
+happened: "task blocked pending reconciliation" only when the transition was
+made, otherwise "stream marked uncertain; task remains <state>".
+
+**UI.** Proposals tab shows draft progress while researching, published
+proposal cards with severity/disposition-chipped reviews, and the report card
+with keyboard-reachable Approve / Request-changes / Choose-alternative
+controls plus approval-staleness badges. The Decisions tab lists the decision
+log; the Board is a six-column kanban with owner, generation, risk,
+verification, and dependency titles; the task header gains an Actions menu
+(pause/resume/cancel/accept/convert).

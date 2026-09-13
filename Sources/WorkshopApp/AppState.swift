@@ -14,6 +14,9 @@ public final class AppState: ObservableObject {
     @Published public var engineers: [AdapterProbe] = []
     @Published public var artifacts: [Artifact] = []
     @Published public var usageRows: [UsageSampleRecord] = []
+    @Published public var proposals: [Proposal] = []
+    @Published public var reports: [Report] = []
+    @Published public var decisions: [Decision] = []
 
     /// WORKSHOP_HOME for resolving artifact paths (previews read local files).
     public var workshopHome: String {
@@ -120,6 +123,15 @@ public final class AppState: ObservableObject {
         usageRows = (try? await client.call(WorkshopProtocol.listUsage,
                                             params: taskParams,
                                             as: [UsageSampleRecord].self)) ?? []
+        proposals = (try? await client.call(WorkshopProtocol.listProposals,
+                                            params: taskParams,
+                                            as: [Proposal].self)) ?? []
+        reports = (try? await client.call(WorkshopProtocol.listReports,
+                                          params: taskParams,
+                                          as: [Report].self)) ?? []
+        decisions = (try? await client.call(WorkshopProtocol.listDecisions,
+                                            params: taskParams,
+                                            as: [Decision].self)) ?? []
     }
 
     private func startNotifications() {
@@ -169,5 +181,55 @@ public final class AppState: ObservableObject {
             WorkshopProtocol.postMessage,
             params: .object(["task_id": .string(id.rawValue), "body": .string(body)]))
         await loadSelectedTask()
+    }
+
+    // MARK: - Phase 3 user actions
+
+    private func taskAction(_ method: String,
+                            extra: [String: JSONValue] = [:]) async -> String? {
+        guard let id = selectedTaskID else { return nil }
+        var params: [String: JSONValue] = ["task_id": .string(id.rawValue)]
+        for (k, v) in extra { params[k] = v }
+        do {
+            _ = try await client.call(method, params: .object(params),
+                                      as: JSONValue.self)
+            await loadSelectedTask()
+            return nil
+        } catch {
+            await loadSelectedTask()
+            return error.localizedDescription
+        }
+    }
+
+    /// Last action error, surfaced in the Proposals tab / header menu.
+    @Published public var lastActionError: String?
+
+    public func pauseTask() async { lastActionError = await taskAction(WorkshopProtocol.pauseTask) }
+    public func resumeTask() async { lastActionError = await taskAction(WorkshopProtocol.resumeTask) }
+    public func cancelTask() async { lastActionError = await taskAction(WorkshopProtocol.cancelTask) }
+    public func acceptTask() async { lastActionError = await taskAction(WorkshopProtocol.acceptTask) }
+    public func convertToResearch() async {
+        lastActionError = await taskAction(WorkshopProtocol.convertToResearch)
+    }
+
+    public func approveArchitecture(reportRevision: Int, scope: String? = nil) async {
+        var extra: [String: JSONValue] = ["report_revision": .number(Double(reportRevision))]
+        if let scope { extra["scope"] = .string(scope) }
+        lastActionError = await taskAction(WorkshopProtocol.approveArchitecture,
+                                           extra: extra)
+    }
+
+    public func requestChanges(reportRevision: Int, comment: String) async {
+        lastActionError = await taskAction(WorkshopProtocol.requestChanges, extra: [
+            "report_revision": .number(Double(reportRevision)),
+            "comment": .string(comment),
+        ])
+    }
+
+    public func chooseAlternative(reportRevision: Int, index: Int) async {
+        lastActionError = await taskAction(WorkshopProtocol.chooseAlternative, extra: [
+            "report_revision": .number(Double(reportRevision)),
+            "alternative_index": .number(Double(index)),
+        ])
     }
 }

@@ -38,3 +38,11 @@ engineer-card/tabbed task UI. Live smoke suite (L1–L5) passes against the real
 accounts — `WORKSHOP_LIVE=1 swift test --filter LiveSmokeTests`, evidence in
 `docs/evidence/phase2/`. See `docs/architecture.md`, `docs/validation.md`,
 `docs/recovery.md`, `docs/credential-ownership.md`, and `docs/adr/`.
+
+Phase 3 adds the collaboration policy for substantial tasks: private
+independent proposals (published together), cross-review with preserved
+disagreement, Devin-only consolidation, user-only architecture approval with
+stale-revision protection, arbiter allocation with dependency gating and
+disputes, proportional verification, and pause/resume/cancel/escalate/convert
+task actions — plus Proposals/Decisions tabs, a six-column board, and task
+actions in the UI. Live evidence: `docs/evidence/phase3/` (L6).
