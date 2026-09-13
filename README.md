@@ -1,6 +1,6 @@
 # Multi-model orchestration — Workshop, a macOS agent collaboration workspace
 
-License: not yet chosen.
+License: [Apache-2.0](LICENSE) — Copyright 2026 Maapu LLC.
 
 A local macOS community workspace where three AI engineers — Devin Fusion, Kimi K3, and DeepSeek V4.1 Flash — discuss and execute the user's tasks. It resembles a channel-and-thread chat: each top-level message creates a task, and opening it reveals the task's conversation, proposals, ownership, reviews, decisions, artifacts, and usage.
 
