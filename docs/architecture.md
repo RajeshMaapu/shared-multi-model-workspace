@@ -52,3 +52,43 @@ the same `EngineerAdapter` contract (probe → openTaskSession → sendTurn stre
 cancel) with deterministic output and configurable `delayPerDelta` (0 in tests), so
 dispatch, claiming, streaming, and recovery are all testable without network or
 credentials. `WORKSHOP_ADAPTERS=fake` is the default daemon configuration this phase.
+
+## Phase 2a: principals, bridge, real adapters, wakeups
+
+**Principals.** The daemon generates a per-engineer capability token at
+`<WORKSHOP_HOME>/profiles/<engineer>/token` (32 random bytes, mode 0600) on
+first start. `workshop.authenticate {token}` binds a connection to
+`.engineer(id)`; unauthenticated connections stay `.user` (same-uid socket —
+ADR 0003). Author identity always comes from the connection principal, never
+params. Engineer principals may only read/post on tasks where they are
+participants → `-32003 notAParticipant`; `workshop_report_result` additionally
+requires current ownership → `-32004 notOwner`.
+
+**workshop-mcp bridge.** A stdio MCP server (pinned protocolVersion
+2025-06-18) that forwards `tools/call` to the daemon over the UDS with the
+engineer's token. Devin finds it via `<worktree>/.devin/mcp_config.local.json`
+(ADR 0006); Kimi via ACP `session/new.mcpServers`.
+
+**Adapters** (`WorkshopAdapters`): `ACPClient` + `ACPHarnessAdapter` shared by
+Devin and Kimi (per-harness `HarnessLaunchSpec`, `MCPInjection` mode, warm
+process kept between turns, 10 min idle bound, process-group kill on cancel).
+`probe()` runs `<bin> --version` (10 s bound): equal to the qualified version →
+`available`/`tested`; different → `available` + "UNTESTED" + `tested:false`;
+missing binary → `unavailable`. `DeepSeekAdapter` owns a direct tool loop with
+in-process tool execution and file-backed visible-message history (ADR 0008).
+Adapter registration is `WORKSHOP_ADAPTERS=fake|live|mixed:<eng>=fake,…`;
+`live` reads `config/engineers.json` (seeded from
+`Configuration/engineers.template.json` — paths and model selectors only).
+
+**Wakeups (§5.4).** A committed message inserts pending `wakeups` rows for:
+@mentions of other participants, `request_review` targets, and — for user
+messages — the current owner. A coalescer (500 ms, 0 in tests) batches pending
+rows per (task, engineer) into one turn carrying a "you were mentioned"
+context. Engineer↔engineer messages with no mention wake nobody; system
+events never wake. Loop bound: 6 consecutive engineer wakeups without a user
+message → further rows `suppressed` + one "Discussion round limit reached"
+system event.
+
+**Consumed cursor.** `participants.last_read_seq` bounds the turn context to
+unseen messages (≤60, oldest truncated with a note) and advances only when a
+turn completes — never on send.

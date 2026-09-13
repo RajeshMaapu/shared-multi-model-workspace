@@ -12,7 +12,8 @@
         "path": "~/.local/share/devin/credentials.toml",
         "toml_path": "auth.token"
       },
-      "notes": "ACP harness; retained native sidekick. Qualified selector may change with vendor configuration."
+      "notes": "ACP harness; retained native sidekick. Qualified selector may change with vendor configuration.",
+      "executable": "~/.local/bin/devin"
     },
     {
       "id": "kimi",
@@ -26,14 +27,17 @@
         "path": "~/.kimi-code/config.toml",
         "toml_path": "providers.kimi.api_key"
       },
-      "notes": "KIMI_CODE_HOME minimal config, empty skills dir, agentsMdPaths=[]."
+      "notes": "KIMI_CODE_HOME minimal config, empty skills dir, agentsMdPaths=[].",
+      "executable": "~/.kimi-code/bin/kimi"
     },
     {
       "id": "deepseek",
       "display_name": "DeepSeek V4.1 Flash",
       "adapter_kind": "deepseek-api",
       "model_selection": "deepseek-flash",
-      "thinking": {"type": "enabled"},
+      "thinking": {
+        "type": "enabled"
+      },
       "reasoning_effort": "max",
       "credential_reference": {
         "kind": "file",
@@ -42,5 +46,6 @@
       },
       "notes": "API credential reference only; adapter-managed session memory, no native subagents."
     }
-  ]
+  ],
+  "mcp_bridge": ".build/debug/workshop-mcp"
 }

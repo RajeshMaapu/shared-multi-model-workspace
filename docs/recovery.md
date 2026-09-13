@@ -21,3 +21,17 @@
 - Sleep/wake reconciliation of in-flight requests and leases before redispatch (T29).
 - Artifact publication reconciliation (temp file → rename → DB reference) (T38).
 - Session binding resume across adapter restarts (§6.2).
+
+## Phase 2a additions
+
+- **Session bindings** are persisted (`session_bindings` table, schema v1) with
+  `native_session_id` + `recovery_state`; ACP adapters try `session/load` on
+  reopen and fall back to `session/new` (binding updated in place).
+- **Wakeups** left `pending`/`running` at crash are re-scanned by the
+  coalescer on the next committed message; rows never silently vanish because
+  they live in SQLite.
+- **Artifacts** copy via temp-file + fsync + rename; a torn publish leaves a
+  `.tmp-*` file, never a partial artifact row (row insert follows the rename).
+- **DeepSeek history** files are advisory state only — a missing/corrupt file
+  simply starts a fresh visible-message history; the SQLite transcript is the
+  source of truth.
