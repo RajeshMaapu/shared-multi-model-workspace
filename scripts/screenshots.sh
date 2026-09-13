@@ -48,16 +48,14 @@ trap cleanup EXIT
 
 capture() {
     local size="$1" appearance="$2" out="$3"
-    WORKSHOP_HOME="$THROWAWAY_HOME" \
+    # Run the app binary directly: `open` does not propagate environment variables.
     WORKSHOP_RUNTIME_DIR="$THROWAWAY_RUNTIME" \
-    WORKSHOP_ADAPTERS=fake \
     WORKSHOP_DAEMON_PATH="$PWD/.build/debug/workshop-daemon" \
     WORKSHOP_APPEARANCE="$appearance" \
     WORKSHOP_WINDOW_SIZE="$size" \
     WORKSHOP_SEED_TASK="Research caching architecture|||Propose a combined caching architecture with validation plan." \
     WORKSHOP_SCREENSHOT_PATH="$PWD/$EVIDENCE/$out" \
-    open -W "$APP" || true
-    # If a throwaway daemon is still running, stop only the one we spawned below.
+    "$APP/Contents/MacOS/Workshop" || true
 }
 
 # Start the throwaway daemon explicitly so we own its PID.

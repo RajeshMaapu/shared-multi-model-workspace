@@ -39,7 +39,7 @@ let adapters: [EngineerAdapter] = EngineerID.allCases.map {
 }
 
 let dbPath = home + "/db/workshop.sqlite"
-let service = try await CollaborationService(databasePath: dbPath, adapters: adapters)
+let service = try CollaborationService(databasePath: dbPath, adapters: adapters)
 log("opened database at \(dbPath)")
 
 let server = try IPCServer(socketPath: socketPath)
@@ -98,19 +98,20 @@ try server.start()
 log("listening on \(socketPath)")
 
 // Forward committed service events to subscribed connections.
-let eventTask = Task {
+Task.detached {
     for await event in await service.makeEventStream() {
         server.broadcastEvent(event)
     }
 }
 
-await service.start()
+Task.detached { await service.start() }
 
-let sigSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+let sigSrc = DispatchSource.makeSignalSource(signal: SIGTERM,
+                                             queue: DispatchQueue.global())
 signal(SIGTERM, SIG_IGN)
 sigSrc.setEventHandler {
     log("SIGTERM received, shutting down")
-    Task {
+    Task.detached {
         await service.shutdown()
         server.stop()
         exit(0)
@@ -118,4 +119,7 @@ sigSrc.setEventHandler {
 }
 sigSrc.resume()
 
-dispatchMain()
+// Park the main thread; the accept/reader threads do the work.
+while true {
+    Thread.sleep(forTimeInterval: 3600)
+}

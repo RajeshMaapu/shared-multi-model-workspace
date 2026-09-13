@@ -17,7 +17,8 @@ public actor CollaborationService {
     private var lastPublishedSeq: Int64 = 0
     private var isShutdown = false
 
-    public init(database: Database, adapters: [EngineerAdapter], dispatcherEnabled: Bool = true,
+    public init(database: Database, adapters: [EngineerAdapter],
+                dispatcherEnabled: Bool = true,
                 now: @escaping () -> Date = Date.init) throws {
         try Migrations.all.migrate(database)
         self.repo = WorkshopRepository(db: database)
