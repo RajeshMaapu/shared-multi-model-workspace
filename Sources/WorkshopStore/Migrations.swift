@@ -89,5 +89,64 @@ public enum Migrations {
         )
         """)
 
-    public static let all = Migrator(migrations: [v1])
+    /// Schema v2: artifacts, usage_samples, wakeups, checkpoints; participants.last_read_seq;
+    /// messages.structured.
+    public static let v2 = Migrator.Migration(version: 2, sql: """
+        CREATE TABLE artifacts(
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            content_hash TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            mime TEXT,
+            producer TEXT NOT NULL,
+            base_revision TEXT,
+            validation TEXT NOT NULL DEFAULT 'unverified',
+            description TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE usage_samples(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            engineer_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT,
+            native_session_id TEXT,
+            turn_id TEXT,
+            input INTEGER,
+            output INTEGER,
+            cache_read INTEGER,
+            cache_write INTEGER,
+            source TEXT NOT NULL,
+            observed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE wakeups(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            engineer_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            trigger_seq INTEGER,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE checkpoints(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            engineer_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            schema_version INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        ALTER TABLE participants ADD COLUMN last_read_seq INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE messages ADD COLUMN structured TEXT
+        """)
+
+    public static let all = Migrator(migrations: [v1, v2])
 }

@@ -41,13 +41,16 @@ public struct Message: Codable, Equatable, Sendable, Identifiable {
     public var correlationID: String?
     public var revision: Int
     public var deliveryState: DeliveryState
+    /// Optional JSON card payload (structured results, review requests).
+    public var structured: String?
     public var createdAt: Date
     public var updatedAt: Date
 
     public init(id: MessageID, taskID: TaskID, seq: Int64, author: Principal, kind: MessageKind,
                 body: String, replyTo: MessageID? = nil, correlationID: String? = nil,
                 revision: Int = 1, deliveryState: DeliveryState = .committed,
-                createdAt: Date, updatedAt: Date) {
+                structured: String? = nil, createdAt: Date, updatedAt: Date) {
+        self.structured = structured
         self.id = id
         self.taskID = taskID
         self.seq = seq
@@ -68,14 +71,17 @@ public struct Participant: Codable, Equatable, Sendable {
     public var engineerID: EngineerID
     public var membership: String
     public var readCursor: Int64
+    /// Highest message seq consumed by a completed turn (§8.5).
+    public var lastReadSeq: Int64
     public var subscriptions: [String]
 
     public init(taskID: TaskID, engineerID: EngineerID, membership: String = "member",
-                readCursor: Int64 = 0, subscriptions: [String] = []) {
+                readCursor: Int64 = 0, lastReadSeq: Int64 = 0, subscriptions: [String] = []) {
         self.taskID = taskID
         self.engineerID = engineerID
         self.membership = membership
         self.readCursor = readCursor
+        self.lastReadSeq = lastReadSeq
         self.subscriptions = subscriptions
     }
 }
@@ -182,6 +188,36 @@ public struct TaskDetail: Codable, Equatable, Sendable {
         self.participants = participants
         self.subtasks = subtasks
         self.usage = usage
+    }
+}
+
+/// A registered artifact with content-hash provenance (spec §8.1).
+public struct Artifact: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var taskID: TaskID
+    public var contentHash: String
+    public var relativePath: String
+    public var mime: String?
+    public var producer: String
+    public var baseRevision: String?
+    public var validation: String
+    public var description: String?
+    public var createdAt: Date
+
+    public init(id: String, taskID: TaskID, contentHash: String, relativePath: String,
+                mime: String? = nil, producer: String, baseRevision: String? = nil,
+                validation: String = "unverified", description: String? = nil,
+                createdAt: Date) {
+        self.id = id
+        self.taskID = taskID
+        self.contentHash = contentHash
+        self.relativePath = relativePath
+        self.mime = mime
+        self.producer = producer
+        self.baseRevision = baseRevision
+        self.validation = validation
+        self.description = description
+        self.createdAt = createdAt
     }
 }
 

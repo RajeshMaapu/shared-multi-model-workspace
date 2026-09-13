@@ -41,6 +41,11 @@ public enum JSONValue: Codable, Equatable, Sendable {
         return nil
     }
 
+    public var arrayValue: [JSONValue]? {
+        if case .array(let a) = self { return a }
+        return nil
+    }
+
     public subscript(key: String) -> JSONValue? {
         if case .object(let o) = self { return o[key] }
         return nil

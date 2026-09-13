@@ -179,13 +179,16 @@ public struct AdapterProbe: Codable, Equatable, Sendable {
     public var versions: [String: String]
     public var effectiveModel: String?
     public var capabilities: Set<String>
+    /// Whether the observed adapter version matches the qualified baseline (§7).
+    public var tested: Bool
 
     public init(engineer: EngineerID, health: EngineerHealth, versions: [String: String] = [:],
-                effectiveModel: String? = nil, capabilities: Set<String> = []) {
+                effectiveModel: String? = nil, capabilities: Set<String> = [], tested: Bool = true) {
         self.engineer = engineer
         self.health = health
         self.versions = versions
         self.effectiveModel = effectiveModel
         self.capabilities = capabilities
+        self.tested = tested
     }
 }

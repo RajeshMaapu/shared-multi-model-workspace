@@ -80,9 +80,23 @@ public final class WorkshopRepository {
                 engineerID: EngineerID(rawValue: r["engineer_id"]!.text!) ?? .devin,
                 membership: r["membership"]!.text!,
                 readCursor: r["read_cursor"]!.int ?? 0,
+                lastReadSeq: r["last_read_seq"]?.int ?? 0,
                 subscriptions: subs
             )
         }
+    }
+
+    public func participant(_ taskID: TaskID, _ engineerID: EngineerID) throws -> Participant? {
+        try participants(taskID).first { $0.engineerID == engineerID }
+    }
+
+    /// Advance the consumed-by-turn cursor (§8.5); only ever moves forward.
+    public func setLastReadSeq(_ taskID: TaskID, _ engineerID: EngineerID,
+                             seq: Int64, at now: Date) throws {
+        try db.execute("""
+            UPDATE participants SET last_read_seq=MAX(last_read_seq, ?)
+            WHERE task_id=? AND engineer_id=?
+            """, [.integer(seq), .text(taskID.rawValue), .text(engineerID.rawValue)])
     }
 
     // MARK: - Messages
@@ -96,8 +110,8 @@ public final class WorkshopRepository {
         try db.execute("""
             INSERT INTO messages(id, task_id, seq, author_kind, author_id, kind, body,
                                  reply_to, correlation_id, revision, delivery_state,
-                                 created_at, updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                 structured, created_at, updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, [
                 .text(m.id.rawValue), .text(m.taskID.rawValue), .integer(m.seq),
                 .text(m.author.kind), m.author.engineerID.map { .text($0.rawValue) },
@@ -105,6 +119,7 @@ public final class WorkshopRepository {
                 m.replyTo.map { .text($0.rawValue) },
                 m.correlationID.map(SQLiteValue.text),
                 .integer(Int64(m.revision)), .text(m.deliveryState.rawValue),
+                m.structured.map(SQLiteValue.text),
                 .text(WorkshopTime.string(m.createdAt)),
                 .text(WorkshopTime.string(m.updatedAt)),
             ])
@@ -148,6 +163,7 @@ public final class WorkshopRepository {
             correlationID: r["correlation_id"]?.text,
             revision: Int(r["revision"]!.int ?? 1),
             deliveryState: DeliveryState(rawValue: r["delivery_state"]!.text!) ?? .committed,
+            structured: r["structured"]?.text,
             createdAt: WorkshopTime.date(r["created_at"]!.text!),
             updatedAt: WorkshopTime.date(r["updated_at"]!.text!)
         )
@@ -303,6 +319,210 @@ public final class WorkshopRepository {
             SELECT * FROM subtasks WHERE task_id=? AND owner_id=?
             ORDER BY generation DESC, created_at DESC LIMIT 1
             """, [.text(taskID.rawValue), .text(owner.rawValue)]).first.map(subtaskFrom)
+    }
+
+    // MARK: - Artifacts
+
+    public func insertArtifact(_ a: Artifact) throws {
+        try db.execute("""
+            INSERT INTO artifacts(id, task_id, content_hash, relative_path, mime, producer,
+                                  base_revision, validation, description, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            """, [
+                .text(a.id), .text(a.taskID.rawValue), .text(a.contentHash),
+                .text(a.relativePath), a.mime.map(SQLiteValue.text), .text(a.producer),
+                a.baseRevision.map(SQLiteValue.text), .text(a.validation),
+                a.description.map(SQLiteValue.text), .text(WorkshopTime.string(a.createdAt)),
+            ])
+    }
+
+    public func artifacts(_ taskID: TaskID) throws -> [Artifact] {
+        try db.query("SELECT * FROM artifacts WHERE task_id=? ORDER BY created_at, id",
+                     [.text(taskID.rawValue)]).map(artifactFrom)
+    }
+
+    public func artifact(_ id: String) throws -> Artifact? {
+        try db.query("SELECT * FROM artifacts WHERE id=?", [.text(id)]).first.map(artifactFrom)
+    }
+
+    private func artifactFrom(_ r: Row) -> Artifact {
+        Artifact(id: r["id"]!.text!, taskID: TaskID(r["task_id"]!.text!),
+                 contentHash: r["content_hash"]!.text!,
+                 relativePath: r["relative_path"]!.text!,
+                 mime: r["mime"]?.text, producer: r["producer"]!.text!,
+                 baseRevision: r["base_revision"]?.text,
+                 validation: r["validation"]!.text!,
+                 description: r["description"]?.text,
+                 createdAt: WorkshopTime.date(r["created_at"]!.text!))
+    }
+
+    // MARK: - Usage samples
+
+    public func insertUsageSample(taskID: TaskID, engineerID: EngineerID, provider: String,
+                                  model: String?, nativeSessionID: String?, turnID: String?,
+                                  sample: UsageSample, at now: Date) throws {
+        try db.execute("""
+            INSERT INTO usage_samples(task_id, engineer_id, provider, model, native_session_id,
+                                      turn_id, input, output, cache_read, cache_write,
+                                      source, observed_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            """, [
+                .text(taskID.rawValue), .text(engineerID.rawValue), .text(provider),
+                model.map(SQLiteValue.text), nativeSessionID.map(SQLiteValue.text),
+                turnID.map(SQLiteValue.text),
+                sample.input.map { .integer(Int64($0)) },
+                sample.output.map { .integer(Int64($0)) },
+                sample.cacheRead.map { .integer(Int64($0)) },
+                sample.cacheWrite.map { .integer(Int64($0)) },
+                .text(sample.source), .text(WorkshopTime.string(now)),
+            ])
+    }
+
+    /// Latest usage sample recorded for a task, if any.
+    public func latestUsage(_ taskID: TaskID) throws -> UsageSample? {
+        try db.query("""
+            SELECT input, output, cache_read, cache_write, source FROM usage_samples
+            WHERE task_id=? ORDER BY id DESC LIMIT 1
+            """, [.text(taskID.rawValue)]).first.map { r in
+                UsageSample(input: r["input"]?.int.map(Int.init),
+                            output: r["output"]?.int.map(Int.init),
+                            cacheRead: r["cache_read"]?.int.map(Int.init),
+                            cacheWrite: r["cache_write"]?.int.map(Int.init),
+                            source: r["source"]!.text!)
+            }
+    }
+
+    // MARK: - Wakeups
+
+    public struct Wakeup {
+        public let id: Int64
+        public let taskID: TaskID
+        public let engineerID: EngineerID
+        public let reason: String
+        public let triggerSeq: Int64?
+    }
+
+    @discardableResult
+    public func insertWakeup(taskID: TaskID, engineerID: EngineerID, reason: String,
+                             triggerSeq: Int64?, state: String = "pending", at now: Date) throws -> Int64 {
+        try db.execute("""
+            INSERT INTO wakeups(task_id, engineer_id, reason, trigger_seq, state,
+                                created_at, updated_at)
+            VALUES(?,?,?,?,?,?,?)
+            """, [.text(taskID.rawValue), .text(engineerID.rawValue), .text(reason),
+                  triggerSeq.map(SQLiteValue.integer) ?? nil, .text(state),
+                  .text(WorkshopTime.string(now)), .text(WorkshopTime.string(now))])
+        return db.lastInsertRowID()
+    }
+
+    public func pendingWakeups(taskID: TaskID? = nil) throws -> [Wakeup] {
+        let sql = taskID == nil
+            ? "SELECT * FROM wakeups WHERE state='pending' ORDER BY id"
+            : "SELECT * FROM wakeups WHERE state='pending' AND task_id=? ORDER BY id"
+        let args: [SQLiteValue?] = taskID.map { [.text($0.rawValue)] } ?? []
+        return try db.query(sql, args).map { r in
+            Wakeup(id: r["id"]!.int ?? 0, taskID: TaskID(r["task_id"]!.text!),
+                   engineerID: EngineerID(rawValue: r["engineer_id"]!.text!) ?? .devin,
+                   reason: r["reason"]!.text!, triggerSeq: r["trigger_seq"]?.int)
+        }
+    }
+
+    public func setWakeupState(_ id: Int64, _ state: String, at now: Date) throws {
+        try db.execute("UPDATE wakeups SET state=?, updated_at=? WHERE id=?", [
+            .text(state), .text(WorkshopTime.string(now)), .integer(id),
+        ])
+    }
+
+    /// Consecutive engineer-triggered wakeups in a task with no intervening user
+    /// message (loop bound, T11).
+    public func engineerWakeupsSinceLastUserMessage(_ taskID: TaskID) throws -> Int {
+        let r = try db.query("""
+            SELECT COUNT(*) AS n FROM wakeups
+            WHERE task_id=? AND state != 'suppressed'
+              AND id > COALESCE((SELECT MAX(id) FROM wakeups w2
+                                 WHERE w2.task_id=? AND w2.reason='user_message'), 0)
+            """, [.text(taskID.rawValue), .text(taskID.rawValue)]).first
+        return Int(r?["n"]?.int ?? 0)
+    }
+
+    // MARK: - Checkpoints
+
+    @discardableResult
+    public func insertCheckpoint(taskID: TaskID, engineerID: EngineerID, role: String,
+                                 workerID: String, generation: Int, schemaVersion: Int,
+                                 content: String, at now: Date) throws -> Int64 {
+        try db.execute("""
+            INSERT INTO checkpoints(task_id, engineer_id, role, worker_id, generation,
+                                    schema_version, content, created_at)
+            VALUES(?,?,?,?,?,?,?,?)
+            """, [.text(taskID.rawValue), .text(engineerID.rawValue), .text(role),
+                  .text(workerID), .integer(Int64(generation)),
+                  .integer(Int64(schemaVersion)), .text(content),
+                  .text(WorkshopTime.string(now))])
+        return db.lastInsertRowID()
+    }
+
+    // MARK: - Session bindings
+
+    /// Persisted (task, engineer, role, worker) → native session mapping (§6.2).
+    public struct SessionBindingRecord {
+        public var taskID: TaskID
+        public var engineerID: EngineerID
+        public var role: String
+        public var workerID: String
+        public var nativeSessionID: String?
+        public var profileRevision: Int
+        public var modelSelection: String?
+        public var recoveryState: String
+
+        public init(taskID: TaskID, engineerID: EngineerID, role: String, workerID: String,
+                    nativeSessionID: String? = nil, profileRevision: Int = 1,
+                    modelSelection: String? = nil, recoveryState: String = "new") {
+            self.taskID = taskID
+            self.engineerID = engineerID
+            self.role = role
+            self.workerID = workerID
+            self.nativeSessionID = nativeSessionID
+            self.profileRevision = profileRevision
+            self.modelSelection = modelSelection
+            self.recoveryState = recoveryState
+        }
+    }
+
+    /// Upsert a session binding (native session id + model selection) (§6.2).
+    public func saveSessionBinding(_ b: SessionBindingRecord) throws {
+        try db.execute("""
+            INSERT INTO session_bindings(task_id, engineer_id, role, worker_id,
+                                         native_session_id, profile_revision,
+                                         model_selection, recovery_state)
+            VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(task_id, engineer_id, role, worker_id) DO UPDATE SET
+                native_session_id=excluded.native_session_id,
+                profile_revision=excluded.profile_revision,
+                model_selection=excluded.model_selection,
+                recovery_state=excluded.recovery_state
+            """, [.text(b.taskID.rawValue), .text(b.engineerID.rawValue), .text(b.role),
+                  .text(b.workerID), b.nativeSessionID.map(SQLiteValue.text),
+                  .integer(Int64(b.profileRevision)), b.modelSelection.map(SQLiteValue.text),
+                  .text(b.recoveryState)])
+    }
+
+    public func sessionBinding(taskID: TaskID, engineerID: EngineerID, role: String,
+                               workerID: String) throws -> SessionBindingRecord? {
+        try db.query("""
+            SELECT * FROM session_bindings
+            WHERE task_id=? AND engineer_id=? AND role=? AND worker_id=?
+            """, [.text(taskID.rawValue), .text(engineerID.rawValue), .text(role),
+                  .text(workerID)]).first.map { r in
+            SessionBindingRecord(
+                taskID: taskID,
+                engineerID: EngineerID(rawValue: r["engineer_id"]!.text!) ?? .devin,
+                role: r["role"]!.text!, workerID: r["worker_id"]!.text!,
+                nativeSessionID: r["native_session_id"]?.text,
+                profileRevision: Int(r["profile_revision"]!.int ?? 1),
+                modelSelection: r["model_selection"]?.text,
+                recoveryState: r["recovery_state"]!.text!)
+        }
     }
 
     private func outboxFrom(_ r: Row) -> OutboxEvent {
