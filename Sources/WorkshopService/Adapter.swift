@@ -40,13 +40,63 @@ public struct SessionBinding: Codable, Equatable, Sendable {
 /// Context handed to an adapter for one turn.
 public struct TurnContext: Sendable {
     public var task: WorkshopTask
-    public var subtask: Subtask
+    /// The subtask this turn is about; nil for pure discussion wakeups.
+    public var subtask: Subtask?
+    /// Messages after the engineer's consumed cursor, already bounded.
     public var recentMessages: [Message]
+    /// Why this turn was woken (nil = owner-execution turn).
+    public var wakeReason: String?
+    /// Note about omitted older messages, if the context was truncated.
+    public var truncatedNote: String?
 
-    public init(task: WorkshopTask, subtask: Subtask, recentMessages: [Message]) {
+    public init(task: WorkshopTask, subtask: Subtask?, recentMessages: [Message],
+                wakeReason: String? = nil, truncatedNote: String? = nil) {
         self.task = task
         self.subtask = subtask
         self.recentMessages = recentMessages
+        self.wakeReason = wakeReason
+        self.truncatedNote = truncatedNote
+    }
+
+    /// Render the turn context packet (spec §G): stable header, task brief,
+    /// unseen messages, wakeup reason.
+    public func packetText(for engineer: EngineerID) -> String {
+        var lines: [String] = []
+        lines.append("# Workshop")
+        lines.append("You are \(engineer.displayName), one of three AI engineers in a "
+            + "local macOS community workspace: Devin, Kimi, and DeepSeek.")
+        lines.append("Use workshop_post_message to speak; mention @devin, @kimi, or "
+            + "@deepseek to wake a peer. Do not post secrets.")
+        if let subtask {
+            lines.append("You are owner/participant of subtask \(subtask.id.rawValue) "
+                + "\"\(subtask.title)\" (generation \(subtask.generation)).")
+        } else {
+            lines.append("You are a participant of this task (no owned subtask).")
+        }
+        lines.append("")
+        lines.append("## Task: \(task.title)")
+        lines.append(task.brief)
+        if let subtask, !subtask.acceptance.isEmpty {
+            lines.append("Acceptance: " + subtask.acceptance.joined(separator: "; "))
+        }
+        if let truncatedNote { lines.append("(\(truncatedNote))") }
+        if !recentMessages.isEmpty {
+            lines.append("")
+            lines.append("## Conversation")
+            for m in recentMessages where m.deliveryState == .committed {
+                lines.append("[\(m.seq)] \(m.author.displayName): \(m.body)")
+            }
+        }
+        if let wakeReason {
+            lines.append("")
+            switch wakeReason {
+            case "mention": lines.append("You were mentioned in the conversation above.")
+            case "review_request": lines.append("Your review was requested.")
+            case "user_message": lines.append("The user replied; you are the current owner.")
+            default: lines.append("Wakeup reason: \(wakeReason)")
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -61,6 +111,10 @@ public enum AdapterEvent: Sendable, Equatable {
     case turnCompleted
     case authRequired
     case quotaLimited
+    /// A non-message tool activity update (title + status) for UI display.
+    case toolActivity(title: String, status: String)
+    /// A tool call was denied by the permission policy (Phase 3 adds user cards).
+    case permissionDenied(String)
     case uncertain(String)
 }
 

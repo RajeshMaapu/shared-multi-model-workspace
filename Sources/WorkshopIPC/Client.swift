@@ -3,9 +3,10 @@ import WorkshopCore
 
 /// Line-delimited JSON-RPC client for the Workshop Unix socket.
 public actor WorkshopClient {
-    public struct RemoteError: Error, Equatable {
+    public struct RemoteError: WorkshopRPCError, Equatable {
         public let code: Int
         public let message: String
+        public var rpcCode: Int { code }
     }
 
     private var fd: Int32 = -1

@@ -14,6 +14,8 @@ public final class Connection: @unchecked Sendable {
     let fd: Int32
     private let writeLock = NSLock()
     private var closed = false
+    /// Principal bound to this connection by workshop.authenticate; .user default.
+    var principal: Principal = .user
 
     init(fd: Int32) { self.fd = fd }
 
@@ -56,8 +58,11 @@ public final class IPCServer: @unchecked Sendable {
     private var subscribers: Set<Int32> = []
     private let lock = NSLock()
 
-    /// Async method handler; throws IPCError.remoteError-style errors or WorkshopError.
-    public var handler: ((String, JSONValue?) async throws -> JSONValue)?
+    /// Async method handler; the third arg is the connection's authenticated
+    /// principal (.user when unauthenticated). Throws WorkshopError.
+    public var handler: ((String, JSONValue?, Principal) async throws -> JSONValue)?
+    /// Resolve a capability token to a principal (workshop.authenticate).
+    public var authenticator: ((String) async throws -> Principal)?
     /// Replay events after a seq for a new subscriber.
     public var replayEvents: ((Int64) -> [OutboxEvent])?
 
@@ -202,14 +207,40 @@ public final class IPCServer: @unchecked Sendable {
                 handleSubscribe(request: request, conn: conn)
                 return
             }
+            if request.method == WorkshopProtocol.authenticate {
+                handleAuthenticate(request: request, conn: conn)
+                return
+            }
             guard let handler else {
                 sendError(id: request.id, code: WorkshopProtocol.ErrorCode.methodNotFound,
                           message: "Method not found: \(request.method)", to: conn)
                 return
             }
             do {
-                let result = try await handler(request.method, request.params)
+                let result = try await handler(request.method, request.params, conn.principal)
                 respond(id: request.id, result: result, to: conn)
+            } catch let error as WorkshopRPCError {
+                sendError(id: request.id, code: error.rpcCode, message: error.message, to: conn)
+            } catch {
+                sendError(id: request.id, code: WorkshopProtocol.ErrorCode.internalError,
+                          message: String(describing: error), to: conn)
+            }
+        }
+    }
+
+    private func handleAuthenticate(request: JSONRPCRequest, conn: Connection) {
+        Task {
+            guard let token = request.params?["token"]?.stringValue,
+                  let authenticator else {
+                sendError(id: request.id, code: WorkshopProtocol.ErrorCode.invalidParams,
+                          message: "Authentication not supported", to: conn)
+                return
+            }
+            do {
+                conn.principal = try await authenticator(token)
+                respond(id: request.id,
+                        result: .object(["principal": .string(conn.principal.displayName)]),
+                        to: conn)
             } catch let error as WorkshopRPCError {
                 sendError(id: request.id, code: error.rpcCode, message: error.message, to: conn)
             } catch {

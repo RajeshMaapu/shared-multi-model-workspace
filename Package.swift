@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "WorkshopService", targets: ["WorkshopService"]),
         .library(name: "WorkshopIPC", targets: ["WorkshopIPC"]),
         .executable(name: "workshop-daemon", targets: ["workshop-daemon"]),
+        .executable(name: "workshop-mcp", targets: ["workshop-mcp"]),
         .executable(name: "Workshop", targets: ["WorkshopApp"]),
     ],
     targets: [
@@ -21,9 +22,17 @@ let package = Package(
         ),
         .target(name: "WorkshopService", dependencies: ["WorkshopCore", "WorkshopStore"]),
         .target(name: "WorkshopIPC", dependencies: ["WorkshopCore"]),
+        .target(name: "WorkshopMCP", dependencies: ["WorkshopCore", "WorkshopService"]),
+        .target(name: "WorkshopAdapters",
+                dependencies: ["WorkshopCore", "WorkshopService"]),
         .executableTarget(
             name: "workshop-daemon",
-            dependencies: ["WorkshopCore", "WorkshopStore", "WorkshopService", "WorkshopIPC"]
+            dependencies: ["WorkshopCore", "WorkshopStore", "WorkshopService", "WorkshopIPC",
+                           "WorkshopAdapters"]
+        ),
+        .executableTarget(
+            name: "workshop-mcp",
+            dependencies: ["WorkshopCore", "WorkshopIPC", "WorkshopMCP"]
         ),
         .executableTarget(
             name: "WorkshopApp",
@@ -33,6 +42,9 @@ let package = Package(
         .testTarget(name: "StoreTests", dependencies: ["WorkshopStore", "WorkshopCore"]),
         .testTarget(name: "ServiceTests", dependencies: ["WorkshopService", "WorkshopStore", "WorkshopCore"]),
         .testTarget(name: "IPCTests", dependencies: ["WorkshopIPC", "WorkshopService", "WorkshopStore", "WorkshopCore"]),
+        .testTarget(name: "MCPTests", dependencies: ["WorkshopMCP", "WorkshopIPC", "WorkshopService", "WorkshopStore", "WorkshopCore"]),
+        .testTarget(name: "AdapterContractTests",
+                    dependencies: ["WorkshopAdapters", "WorkshopService", "WorkshopCore"]),
         .testTarget(name: "LiveSmokeTests", dependencies: ["WorkshopCore"]),
     ]
 )

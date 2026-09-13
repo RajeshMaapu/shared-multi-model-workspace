@@ -22,7 +22,7 @@ final class IPCTests: XCTestCase {
                                                  adapters: adapters)
         let svc = service!
         server = try IPCServer(socketPath: socketPath)
-        server.handler = { method, params in
+        server.handler = { method, params, _ in
             switch method {
             case WorkshopProtocol.health:
                 return .object([
