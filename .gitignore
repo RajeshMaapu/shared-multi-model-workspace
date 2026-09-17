@@ -142,3 +142,17 @@ id_ed25519_*
 /Configuration/*.local.json
 docs/evidence/**/private/
 docs/evidence/**/transcripts/
+AGENTS.local.md
+!/.devin/rules/
+/.devin/rules/*
+!/.devin/rules/publication-safety.md
+!/.devin/security/
+/.devin/security/*
+!/.devin/security/publication_guard.py
+!/.devin/security/install_hooks.py
+!/.devin/security/policy.json
+!/.devin/git-hooks/
+/.devin/git-hooks/*
+!/.devin/git-hooks/pre-commit
+!/.devin/git-hooks/pre-merge-commit
+!/.devin/git-hooks/pre-push

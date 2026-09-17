@@ -29,3 +29,7 @@ This Mac has a 30-day npm release-age guard and `ignore-scripts=true`. Keep thos
 ## Codex skill
 
 Versioned source: `.devin/skills/team/`. The user explicitly requested installation into the existing `~/.codex/skills/team`, not a competing skill. `scripts/install-team-skill.py` installs only managed skill files and saves drift-safe rollback backups outside the skills discovery tree. Do not edit prompt policy through delegated authoring or put the entry-point skill into engineer runtime profiles.
+
+## Public commits and pushes
+
+Follow `.devin/rules/publication-safety.md` for every commit and push. Install local guards with `python3 .devin/security/install_hooks.py`; review staged content and outgoing history, never bypass findings, and never reintroduce pre-cleanup/private ancestry. Guard tests: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s Tests/SecurityTests -v`.

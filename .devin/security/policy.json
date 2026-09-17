@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "clean_base": "058c8a193dd340ae4693e79c4c803e7227101b52",
+  "blocked_commits": [
+    "74e62453804aed859d7479df5ea0c73c52a58b80",
+    "b270da75231f08b00c67a0080cdfb1d2ab817335",
+    "34b9dda3fb14aa29c3eaa23f17036e962668a63d",
+    "eeaa48213e21cab6baa68480d52ca9c237b796be",
+    "cd39f051d1ce58451803b1d733f9853b2db8a0a7",
+    "27eac6b21646c502551511f031cf122b6b5740de",
+    "092c36a1ce237b8b6712fe6c22315a0ef03fb914",
+    "38a293506b49a99c14a328eeae5370dc1a8aa277",
+    "94baa5c4d6474a0869354191c496c6845bd321e6",
+    "66c1d286ac21bff8a3bf75ebc5702af8a8a2e9f0",
+    "b7aea2ed1ca40099eb9794278c6de2136206acf7",
+    "4ddfddadcd575a1444d5d1a9e8381a9db0576329",
+    "5fe3cdc68e8255604e330275bd7e8773f5c12690",
+    "e93ad0b4c1087c58872d947a8c201158e69cb5ef"
+  ],
+  "max_blob_bytes": 8388608,
+  "fixture_literals": {
+    "Tests/ServiceTests/Phase4ServiceTests.swift": [
+      "sk-abc123def456ghi789",
+      "sk-testSECRETvalue999"
+    ]
+  }
+}
