@@ -530,6 +530,15 @@ public final class WorkshopRepository {
                      [.integer(afterSeq), .integer(Int64(limit))]).map(outboxFrom)
     }
 
+    public func workActivity(taskID: TaskID, afterSeq: Int64, limit: Int) throws -> [WorkActivity] {
+        try db.query("SELECT * FROM outbox WHERE task_id=? AND event_type='work.activity' AND seq>? ORDER BY seq LIMIT ?",
+          [.text(taskID.rawValue), .integer(afterSeq), .integer(Int64(limit))]).map(outboxFrom).compactMap { row in
+            guard var activity = try? JSONDecoder().decode(WorkActivity.self, from: Data(row.payload.utf8)) else { return nil }
+            activity.seq = row.seq
+            return activity
+        }
+    }
+
     public func markOutboxDelivered(_ seq: Int64, at now: Date) throws {
         try db.execute("UPDATE outbox SET delivery_state='delivered', delivered_at=? WHERE seq=?", [
             .text(WorkshopTime.string(now)), .integer(seq),

@@ -10,8 +10,10 @@ const ROOT = path.dirname(DESKTOP_DIR);
 
 assertWebValidated(ROOT);
 
-const daemon = path.join(ROOT, ".build", "debug", "workshop-daemon");
-const mcp = path.join(ROOT, ".build", "debug", "workshop-mcp");
+const installed = process.argv.includes("--installed");
+const binaryDir = process.env.WORKSHOP_PACKAGE_BIN_DIR || path.join(ROOT, ".build", "debug");
+const daemon = path.join(binaryDir, "workshop-daemon");
+const mcp = path.join(binaryDir, "workshop-mcp");
 for (const required of [daemon, mcp]) {
   if (!existsSync(required)) {
     throw new Error(`Required packaging input missing: ${required}`);
@@ -35,6 +37,7 @@ const manifest = JSON.parse(readFileSync(
 const stagedManifest = {
   name: manifest.name,
   version: manifest.version,
+  productName: installed ? "Workshop" : "Workshop Preview",
   private: true,
   type: "module",
   main: "Desktop/main.mjs",
@@ -45,7 +48,7 @@ mkdirSync(path.join(stage, "Web"), { recursive: true });
 writeFileSync(path.join(stage, "package.json"),
   JSON.stringify(stagedManifest, null, 2) + "\n");
 for (const file of [
-  "main.mjs", "preload.cjs", "ipc-policy.mjs",
+  "main.mjs", "preload.cjs", "ipc-policy.mjs", "lifecycle.mjs",
 ]) {
   cpSync(path.join(DESKTOP_DIR, file), path.join(stage, "Desktop", file));
 }
@@ -69,9 +72,9 @@ const paths = await packager({
   out,
   platform: "darwin",
   arch: "arm64",
-  appBundleId: "ai.maapu.workshop.community-preview",
+  appBundleId: installed ? "ai.maapu.workshop" : "ai.maapu.workshop.community-preview",
   appVersion: "0.2.0",
-  name: "Workshop Preview",
+  name: installed ? "Workshop" : "Workshop Preview",
   icon,
   asar: true,
   overwrite: false,

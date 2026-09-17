@@ -15,6 +15,8 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
         case toolCall(String, JSONValue)
         /// Emit a streamed text delta.
         case text(String)
+        /// Deterministic provider event for activity contract tests.
+        case event(AdapterEvent)
         /// Suspend the stream until this turn is cancelled (pause/cancel tests).
         case waitForCancel
     }
@@ -97,6 +99,8 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
                         switch action {
                         case .toolCall(let name, let args):
                             _ = try? await runner?(name, args, principal)
+                        case .event(let event):
+                            continuation.yield(event)
                         case .text(let text):
                             emitDelta(text)
                         case .waitForCancel:

@@ -361,6 +361,24 @@ public actor CollaborationService {
         try repo.outboxEvents(afterSeq: afterSeq)
     }
 
+    public func readActivity(_ taskID: TaskID, afterSeq: Int64 = 0, limit: Int = 200) throws -> [WorkActivity] {
+        guard afterSeq >= 0, limit > 0, limit <= 200 else { throw WorkshopError.invalidRequest("Invalid activity cursor or limit") }
+        guard try repo.task(taskID) != nil else { throw WorkshopError.taskNotFound(taskID) }
+        return try repo.workActivity(taskID: taskID, afterSeq: afterSeq, limit: limit)
+    }
+
+    private func recordActivity(taskID: TaskID, turnID: String, engineer: EngineerID,
+                                kind: String, title: String, status: String, callID: String? = nil) {
+        _ = attempt("recordActivity") {
+            let item = WorkActivity(taskID: taskID, turnID: turnID, engineer: engineer,
+                kind: kind, title: title, status: status, callID: callID, createdAt: now())
+            let payload = String(decoding: try JSONEncoder().encode(item), as: UTF8.self)
+            _ = try repo.insertOutbox(taskID: taskID, eventType: "work.activity", payload: payload,
+                                      deliveryState: "pending", at: item.createdAt)
+        }
+        publishCommitted()
+    }
+
     // MARK: - Commands
 
     /// Create a task: idempotent on `idempotency_key`; single commit for task + root
@@ -1965,6 +1983,9 @@ public actor CollaborationService {
 
         let stream = adapter.sendTurn(ref: ref, turnID: turnID, context: context,
                                       deadline: timestamp.addingTimeInterval(300))
+        recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                       kind: "lifecycle", title: "Worker turn opened", status: "started")
+        var providerMessageObserved = false
         var firstEventMarked = false
         do {
             for try await event in stream {
@@ -1975,7 +1996,33 @@ public actor CollaborationService {
                     }
                 }
                 switch event {
+                case .toolStarted(let title):
+                    recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                                   kind: "tool", title: title, status: "started")
+                case .toolCompleted(let title):
+                    recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                                   kind: "tool", title: title, status: "completed")
+                case .checkpointReady:
+                    recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                                   kind: "status", title: "Provider checkpoint ready", status: "completed")
+                case .toolActivity(let title, let status, let callID):
+                    recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                                   kind: "tool", title: title, status: status, callID: callID)
+                case .permissionDenied:
+                    recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                                   kind: "permission", title: "Tool permission denied", status: "denied")
+                case .authRequired:
+                    recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                                   kind: "status", title: "Authentication required", status: "failed")
+                case .quotaLimited:
+                    recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                                   kind: "status", title: "Provider quota limit reported", status: "failed")
                 case .messageDelta(let delta):
+                    if !providerMessageObserved && !delta.isEmpty {
+                        providerMessageObserved = true
+                        recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                                       kind: "message", title: "Provider message received; text appears in the conversation when committed", status: "started")
+                    }
                     body += delta
                     _ = attempt("updateMessageBody",
                                 { try repo.updateMessageBody(messageID, body: body, at: now()) })
@@ -1993,6 +2040,8 @@ public actor CollaborationService {
                                                    turnID: turnID, sample: usage, at: now())
                     }
                 case .uncertain(let note):
+                    recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                                   kind: "status", title: "Provider reported an uncertain outcome", status: "uncertain")
                     sawUncertain = true
                     _ = attempt("uncertainNote") {
                         let t = now()
@@ -2038,6 +2087,9 @@ public actor CollaborationService {
                 try repo.updateTurnState(turnRowID, turnFinal, at: endTime)
             }
         }
+        recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                       kind: "lifecycle", title: cancelled ? "Worker turn cancelled" : failedReason != nil ? "Worker turn failed; outcome uncertain" : "Worker turn ended; outcome requires verification",
+                       status: turnFinal)
         reconcileReservation(reservationID, usage: usage, at: endTime)
         _ = attempt("commitTurn") {
             try repo.db.transaction {

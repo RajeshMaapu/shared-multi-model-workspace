@@ -27,6 +27,7 @@ test("validateInvocation accepts each allowed operation with exact arity", () =>
     ["listTasks", []],
     ["getEngineers", []],
     ["getCapacity", []],
+    ["getActivity", ["task_a", 0]],
     ["getTask", ["task_abc"]],
     ["getProposals", ["task_abc"]],
     ["getDecisions", ["task_abc"]],
@@ -229,7 +230,7 @@ function loadPreload(respond) {
 }
 
 const EXPECTED_API = [
-  "createTask", "getCapacity", "getDecisions", "getEngineers",
+  "createTask", "getActivity", "getCapacity", "getDecisions", "getEngineers",
   "getFiles", "getMessages", "getProposals", "getTask", "listTasks",
   "postMessage", "subscribe",
 ];

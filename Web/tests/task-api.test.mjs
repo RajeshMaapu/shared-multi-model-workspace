@@ -190,3 +190,11 @@ test("event normalization via normalize()", () => {
   assert.equal(event.task_id, "task_2");
   assert.equal(event.seq, 3);
 });
+
+test('activity history requires bounded valid cursor and task scope', async () => {
+  const rpc = mockRPC([]); const api = createTaskAPI(rpc);
+  await api.getActivity('task_a', 15);
+  assert.deepEqual(rpc.calls[0], { method: 'workshop.readActivity', params: { task_id: 'task_a', after_seq: 15, limit: 200 } });
+  for (const bad of [-1, 1.5, Infinity, '12']) await assert.rejects(() => api.getActivity('task_a', bad), ValidationError);
+  await assert.rejects(() => api.getActivity('../secret', 0), ValidationError);
+});

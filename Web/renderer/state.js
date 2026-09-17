@@ -119,3 +119,26 @@ export function parseProposal(content) {
     return null;
   }
 }
+
+// A running adapter turn is not evidence of token output or forward progress.
+export function taskActivity(task, detail, { connected, observedAt, now = Date.now() }) {
+  if (!connected) return { kind: 'unknown', text: 'Activity unknown · disconnected', animate: false };
+  const fresh = Number.isFinite(observedAt) && now >= observedAt && now - observedAt <= 15000;
+  if (!fresh || !detail) return { kind: 'unknown', text: 'Activity unknown · checking worker', animate: false };
+  const current = detail.task?.state ?? task?.state;
+  if (current !== 'working') return { kind: 'idle', text: String(current ?? 'Unknown').replaceAll('_', ' '), animate: false };
+  if (!Array.isArray(detail.runningEngineers)) return { kind: 'unknown', text: 'Activity unknown', animate: false };
+  if (detail.runningEngineers.length === 0) return { kind: 'waiting', text: 'Waiting · no active worker turn', animate: false };
+  return { kind: 'working', text: 'Worker turn active', animate: true,
+    engineers: detail.runningEngineers, note: 'Worker turn is open; this does not confirm new output or forward progress.' };
+}
+
+export function mergeActivity(existing, page, taskID) {
+  const bySeq = new Map();
+  for (const item of [...existing, ...page]) {
+    if (item.taskID !== taskID || !Number.isSafeInteger(item.seq) || item.seq < 1) continue;
+    if (!['tool', 'lifecycle', 'message', 'permission', 'status'].includes(item.kind)) continue;
+    bySeq.set(item.seq, item);
+  }
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+}

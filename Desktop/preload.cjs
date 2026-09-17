@@ -20,6 +20,7 @@ const invoke = async (operation, args) => {
 
 const api = {
   listTasks: () => invoke("listTasks", []),
+  getActivity: (taskID, afterSeq = 0) => invoke("getActivity", [taskID, afterSeq]),
   getTask: (taskID) => invoke("getTask", [taskID]),
   getMessages: (taskID, beforeSeq) => invoke("getMessages",
     beforeSeq === undefined ? [taskID] : [taskID, beforeSeq]),

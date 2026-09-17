@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeMessages, isFresh, filterTasks, buildTaskPayload, authorName, displayMessageBody } from '../renderer/state.js';
+import { mergeMessages, isFresh, filterTasks, buildTaskPayload, authorName, displayMessageBody, taskActivity, mergeActivity } from '../renderer/state.js';
 
 const message = (id, seq, body = id) => ({ id, seq, body, deliveryState: 'committed' });
 
@@ -49,4 +49,34 @@ test('displayMessageBody strips legacy generation marker only for system', () =>
   assert.equal(displayMessageBody({ author: 'engineer:devin',
     body: 'Fusion claimed T (generation 12)' }),
     'Fusion claimed T (generation 12)');
+});
+
+
+test('activity needs a fresh connected active turn, not a claimed task', () => {
+  const task = { state: 'working' };
+  const detail = { task, runningEngineers: ['devin'] };
+  const options = { connected: true, observedAt: 1000, now: 2000 };
+  assert.equal(taskActivity(task, detail, options).animate, true);
+  assert.match(taskActivity(task, detail, options).note, /does not confirm/);
+  for (const change of [{ connected: false }, { observedAt: undefined }, { now: 16001 }, { now: 999 }]) {
+    const result = taskActivity(task, detail, { ...options, ...change });
+    assert.equal(result.animate, false);
+    assert.equal(result.kind, 'unknown');
+  }
+  assert.equal(taskActivity(task, { task, runningEngineers: [] }, options).kind, 'waiting');
+  assert.equal(taskActivity(task, { task }, options).kind, 'unknown');
+});
+
+test('fresh non-working states stop activity even if worker list lags', () => {
+  for (const state of ['blocked', 'paused', 'awaiting_architecture_approval', 'verifying', 'completed', 'cancelled', 'failed']) {
+    const result = taskActivity({ state: 'working' }, { task: { state }, runningEngineers: ['devin'] },
+      { connected: true, observedAt: 1000, now: 2000 });
+    assert.equal(result.animate, false, state);
+    assert.equal(result.kind, 'idle', state);
+  }
+});
+
+test('activity replay dedupes ordered task-scoped allowlisted events', () => {
+  const event = seq => ({ seq, taskID: 'task_a', kind: 'tool', title: 'Read file' });
+  assert.deepEqual(mergeActivity([event(2)], [event(1), event(2), { ...event(3), taskID: 'task_b' }, { ...event(4), kind: 'agent_thought' }], 'task_a').map(x => x.seq), [1, 2]);
 });

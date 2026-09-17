@@ -35,6 +35,9 @@ export function createHTTPClient() {
     getTask(taskID) {
       return request("/api/tasks/" + encodeURIComponent(taskID));
     },
+    getActivity(taskID, afterSeq = 0) {
+      return request("/api/tasks/" + encodeURIComponent(taskID) + "/activity?after_seq=" + afterSeq);
+    },
     getMessages(taskID, beforeSeq) {
       const query = beforeSeq !== undefined ? "?before_seq=" + beforeSeq : "";
       return request("/api/tasks/" + encodeURIComponent(taskID)

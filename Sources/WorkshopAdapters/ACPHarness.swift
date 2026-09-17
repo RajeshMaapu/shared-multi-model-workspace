@@ -346,11 +346,11 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                         case "tool_call":
                             continuation.yield(.toolActivity(
                                 title: u["title"]?.stringValue ?? "tool",
-                                status: "started"))
+                                status: "started", callID: u["toolCallId"]?.stringValue))
                         case "tool_call_update":
                             continuation.yield(.toolActivity(
                                 title: u["title"]?.stringValue ?? "tool",
-                                status: u["status"]?.stringValue ?? "updated"))
+                                status: u["status"]?.stringValue ?? "updated", callID: u["toolCallId"]?.stringValue))
                         default: break
                         }
                     } else if case .permissionDenied(let title) = event {

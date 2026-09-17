@@ -34,3 +34,23 @@ input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus
   .sidebar .space { padding-top: 4px; padding-bottom: 4px; }
 }
 
+
+.task-activity { flex-shrink: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 8px 22px; border-bottom: 1px solid #eee; color: #52645d; background: #f7faf8; font-size: 12px; }
+.activity-label { font-weight: 600; text-transform: capitalize; }
+.activity-worker { color: #5c5860; }
+.activity-note { flex-basis: 100%; color: #777; font-size: 10px; }
+.activity-dots { display: inline-flex; gap: 3px; align-items: center; height: 12px; }
+.activity-dots i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; animation: activity-pulse 1.4s infinite ease-in-out; }
+.activity-dots i:nth-child(2) { animation-delay: .18s; }
+.activity-dots i:nth-child(3) { animation-delay: .36s; }
+@keyframes activity-pulse { 0%, 70%, 100% { opacity: .35; transform: translateY(0); } 35% { opacity: 1; transform: translateY(-2px); } }
+@media (prefers-reduced-motion: reduce) { .activity-dots i { animation: none; opacity: .7; } }
+
+.activity-history-container { flex-shrink: 0; padding: 0 16px; border-bottom: 1px solid #eee; font-size: 12px; }
+#activity-history summary { cursor: pointer; padding: 7px 0; color: #594662; }
+#activity-history ol { max-height: 180px; overflow-y: auto; padding: 0 0 0 18px; margin: 6px 0; }
+#activity-history li { padding: 5px 0; overflow-wrap: anywhere; }
+#activity-history li > * { display: block; margin: 0; font-size: 11px; }
+#activity-history li b { font-size: 12px; font-weight: 500; }
+#activity-history p { font-size: 11px; color: #716479; }
+@media (max-height: 750px) { #activity-history ol { max-height: 110px; } }

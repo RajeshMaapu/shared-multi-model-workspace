@@ -31,5 +31,17 @@ test('isolated Swift daemon persists owner tasks, retries, peers and replies', {
   assert.ok(messages.some(item => item.id === reply.id && item.body === reply.body));
   assert.equal(new Set(messages.map(item => item.id)).size, messages.length);
   assert.equal((await api.listTasks()).length, before.length + 3);
+  let activity = [];
+  for (let attempt = 0; attempt < 20 && activity.length === 0; attempt++) {
+    activity = await api.getActivity(receipt.task_id);
+    if (!activity.length) await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.ok(activity.length > 0, 'Actual isolated daemon persisted activity');
+  assert.ok(activity.every(item => item.taskID === receipt.task_id));
+  assert.equal(new Set(activity.map(item => item.seq)).size, activity.length);
+  const replay = await reconnected.getActivity(receipt.task_id);
+  assert.deepEqual(replay.slice(0, activity.length), activity);
+  const cursor = activity[0].seq;
+  assert.ok((await reconnected.getActivity(receipt.task_id, cursor)).every(item => item.seq > cursor));
   rpc.close();
 });

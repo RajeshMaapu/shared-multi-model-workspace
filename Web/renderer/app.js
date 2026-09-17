@@ -1,5 +1,5 @@
 import { createHTTPClient } from './client.js';
-import { mergeMessages, filterTasks, taskNeedsInput, buildTaskPayload, authorName, authorColor, parseProposal, displayMessageBody } from './state.js';
+import { mergeMessages, filterTasks, taskNeedsInput, buildTaskPayload, authorName, authorColor, parseProposal, displayMessageBody, taskActivity, mergeActivity } from './state.js';
 
 const api = window.workshop ?? createHTTPClient();
 const root = document.getElementById('root');
@@ -17,7 +17,7 @@ const state = {
   optionsOpen: false, pendingCreate: null, submitting: false, details: new Map(),
   messages: new Map(), proposals: new Map(), decisions: new Map(), files: new Map(),
   replyDrafts: new Map(), replyPending: new Set(), replyUncertain: new Set(),
-  hasEarlier: new Map(), earlierLoading: false,
+  hasEarlier: new Map(), earlierLoading: false, activityObserved: new Map(), activity: new Map(), activityError: new Set(), activityMore: new Set(), activityOpen: new Set(),
 };
 let selectionGeneration = 0;
 let refreshGeneration = 0;
@@ -40,6 +40,76 @@ const probe = id => state.engineers.find(item => item.engineer === id);
 const selectedTask = () => state.tasks.find(task => task.id === state.selected);
 const visibleTasks = () => filterTasks(state.tasks, state);
 const disabledNav = (icon, name) => `<button type="button" disabled title="Not available in this build">${symbol(icon)}<span>${name}</span></button>`;
+
+function activityMarkup(task, detail) {
+  const activity = taskActivity(task, detail, { connected: state.connected,
+    observedAt: state.activityObserved.get(task.id) });
+  const names = (activity.engineers ?? []).map(id => member(id)?.name ?? id).join(', ');
+  return `<span class="activity-label">${esc(activity.text)}</span>${activity.animate ? '<span class="activity-dots" aria-hidden="true"><i></i><i></i><i></i></span>' : ''}${names ? `<span class="activity-worker">${esc(names)} · active turn</span>` : ''}${activity.note ? `<span class="activity-note">${esc(activity.note)}</span>` : ''}`;
+}
+
+function activityHistory(task) {
+  const items = state.activity.get(task.id) ?? [];
+  const ended = new Set(items.filter(item => item.kind === 'lifecycle' && ['completed', 'cancelled', 'uncertain', 'failed'].includes(item.status)).map(item => item.turnID));
+  return `<details id="activity-history" ${state.activityOpen.has(task.id) ? 'open' : ''}><summary>Work activity · ${items.length} events</summary><p class="activity-disclosure">Reported tool events and turn lifecycle. This is not a thinking transcript.</p>${state.activityError.has(task.id) ? '<p role="status">Activity history unavailable · retrying</p>' : ''}<ol>${items.map(item => `<li><time>${esc(dateText(item.createdAt))}</time><span>${esc(member(item.engineer)?.name ?? item.engineer)} · ${esc(item.kind === 'lifecycle' ? 'Turn lifecycle' : 'Reported ' + item.kind)}</span><b>${esc(item.title)}</b><span>${esc(label(item.status))}${item.kind === 'tool' && ended.has(item.turnID) && !['completed', 'failed', 'denied', 'cancelled'].includes(item.status) ? ' · turn ended; no final tool result in this event' : ''}</span>${item.callID ? `<small>Tool reference: ${esc(item.callID.slice(0, 12))}</small>` : ''}</li>`).join('')}</ol>${!items.length && !state.activityError.has(task.id) ? '<p>No recorded activity. Earlier turns may predate activity recording.</p>' : ''}${state.activityMore.has(task.id) ? button('more-activity', 'Load more activity', 'Load more activity', 'text-link') : ''}</details>`;
+}
+
+function updateActivityHistory() {
+  const element = document.getElementById('activity-history-container');
+  const task = selectedTask();
+  if (!element || !task) return;
+  const markup = activityHistory(task);
+  if (element._activityMarkup !== markup) {
+    element._activityMarkup = markup;
+    const top = element.querySelector('ol')?.scrollTop ?? 0;
+    element.innerHTML = markup;
+    if (element.querySelector('ol')) element.querySelector('ol').scrollTop = top;
+    element.querySelector('details')?.addEventListener('toggle', event => {
+      if (event.target.open) state.activityOpen.add(task.id); else state.activityOpen.delete(task.id);
+    });
+  }
+}
+
+async function loadActivity(id) {
+  const existing = state.activity.get(id) ?? [];
+  try {
+    const page = await api.getActivity(id, existing.at(-1)?.seq ?? 0);
+    state.activity.set(id, mergeActivity(state.activity.get(id) ?? [], page, id));
+    state.activityError.delete(id);
+    if (page.length === 200) state.activityMore.add(id); else state.activityMore.delete(id);
+  } catch { state.activityError.add(id); }
+  updateActivityHistory();
+}
+
+function updateActivity() {
+  const element = document.getElementById('task-activity');
+  const task = selectedTask();
+  if (!element || !task) return;
+  const markup = activityMarkup(task, state.details.get(task.id));
+  // Preserve animation and avoid repeated screen-reader announcements when unchanged.
+  if (element.innerHTML !== markup) element.innerHTML = markup;
+}
+
+let activityPolling = false;
+async function pollActivity() {
+  updateActivity();
+  const id = state.selected;
+  if (!id || !state.connected || activityPolling) return;
+  activityPolling = true;
+  const observedAt = Date.now();
+  try {
+    const detail = await api.getTask(id);
+    if (id !== state.selected || !state.connected || (state.activityObserved.get(id) ?? 0) > observedAt) return;
+    state.details.set(id, detail);
+    state.activityObserved.set(id, observedAt);
+  } catch {
+    state.activityObserved.delete(id);
+  } finally {
+    activityPolling = false;
+    updateActivity();
+    if (id === state.selected) void loadActivity(id);
+  }
+}
 
 function taskOptions() {
   return `<details id="task-options" ${state.optionsOpen ? 'open' : ''}>
@@ -149,9 +219,10 @@ function render() {
     <p class="section-label">TASK SPACES ${symbol('chevron.down')}</p>${['engineering', 'research', 'product', 'projects'].map(space => button(`space:${space}`, space, `${symbol('number')}${space}`, `space ${space === state.space ? 'selected' : ''}`)).join('')}
     <p class="section-label">ENGINEERS ${symbol('chevron.down')}</p>${members.map(person => `<div class="engineer"><span class="presence ${probe(person.id)?.health?.kind === 'available' ? person.color : 'unknown'}"></span><span>${person.name}<small>${person.id === 'astra' ? 'Not connected' : probe(person.id)?.effectiveModel === 'fake-model' ? 'Test adapter' : esc(label(probe(person.id)?.health?.kind))}</small></span>${person.id === 'astra' ? symbol('display') : ''}</div>`).join('')}${button('capacity', 'Team capacity', 'Team capacity', 'capacity-link')}<div class="account">${avatar()}<div><b>You</b><small>Local workspace</small></div>${symbol('ellipsis')}</div></aside>
     <section class="task-column"><div class="column-head"><h1>${symbol('number')} ${state.space}</h1><p>Every message starts a task</p><div class="subtabs"><b>Messages</b>${button('tab:Files', 'Files', 'Files')}${button('new', 'Add task', symbol('plus'))}</div></div><div class="connection-status" role="status">${testAdapters() ? 'Test adapters · persisted local data · ' : ''}${state.connected ? 'Connected' : 'Disconnected · reconnecting'}</div><div class="task-scroll">${taskList()}</div>${taskComposer()}</section>
-    <section class="thread">${state.threadOpen ? `<div class="thread-head"><div><h1>Thread</h1><p>${task ? esc(task.title) : 'Choose a task'}</p></div><span>${button('close-thread', 'Close thread', symbol('xmark'))}</span></div><div class="thread-tabs" role="tablist" aria-label="Task details">${tabs.map(tab => `<button type="button" id="tab-${tab}" role="tab" aria-selected="${state.tab === tab}" aria-controls="task-panel" tabindex="${state.tab === tab ? '0' : '-1'}" class="${state.tab === tab ? 'active' : ''}" data-action="tab:${tab}">${tab}</button>`).join('')}</div><div class="thread-body" id="task-panel" role="tabpanel" aria-labelledby="tab-${state.tab}" tabindex="0">${task ? taskPanel(task, detail) : state.tab === 'Ownership' ? capacityPanel() : '<div class="empty-thread"><h2>Your work, in one conversation</h2><p>Select a task or start one to see committed replies, proposals, decisions, and evidence.</p></div>'}</div>${replyComposer(task)}` : `<div class="empty-thread"><h2>Choose a task to open its conversation</h2>${button('open-thread', 'Open conversation', 'Open conversation', 'text-link')}</div>`}</section>
+    <section class="thread">${state.threadOpen ? `<div class="thread-head"><div><h1>Thread</h1><p>${task ? esc(task.title) : 'Choose a task'}</p></div><span>${button('close-thread', 'Close thread', symbol('xmark'))}</span></div><div class="thread-tabs" role="tablist" aria-label="Task details">${tabs.map(tab => `<button type="button" id="tab-${tab}" role="tab" aria-selected="${state.tab === tab}" aria-controls="task-panel" tabindex="${state.tab === tab ? '0' : '-1'}" class="${state.tab === tab ? 'active' : ''}" data-action="tab:${tab}">${tab}</button>`).join('')}</div>${task ? `<div id="task-activity" class="task-activity" role="status" aria-live="polite">${activityMarkup(task, detail)}</div>` : ''}${task ? '<div id="activity-history-container" class="activity-history-container"></div>' : ''}<div class="thread-body" id="task-panel" role="tabpanel" aria-labelledby="tab-${state.tab}" tabindex="0">${task ? taskPanel(task, detail) : state.tab === 'Ownership' ? capacityPanel() : '<div class="empty-thread"><h2>Your work, in one conversation</h2><p>Select a task or start one to see committed replies, proposals, decisions, and evidence.</p></div>'}</div>${replyComposer(task)}` : `<div class="empty-thread"><h2>Choose a task to open its conversation</h2>${button('open-thread', 'Open conversation', 'Open conversation', 'text-link')}</div>`}</section>
     </div>${state.error ? `<div class="toast" role="alert">${esc(state.error)}${button('dismiss', 'Dismiss notice', symbol('xmark'))}</div>` : ''}</div>
     <dialog id="icon-dialog" aria-labelledby="icon-title"><button type="button" class="close" data-action="close-icon" aria-label="Close details">${symbol('xmark')}</button><img class="icon-preview" src="/assets/workshop-icon.png" alt="Workshop woven W app icon"><h2 id="icon-title">Workshop</h2><p>Original interwoven ribbon mark in aubergine, lavender and mint.</p></dialog>`;
+  updateActivityHistory();
   for (const [className, top] of scroll) { const element = document.querySelector(`.${className}`); if (element) element.scrollTop = top; }
   const replacement = focusID ? document.getElementById(focusID) : null;
   if (replacement) { replacement.focus({ preventScroll: true }); if (selection && replacement.setSelectionRange) replacement.setSelectionRange(...selection); }
@@ -163,6 +234,8 @@ async function loadSelected() {
   const id = state.selected;
   if (!id) return;
   const generation = ++selectionGeneration;
+  const observedAt = Date.now();
+  void loadActivity(id);
   const results = await Promise.allSettled([api.getTask(id), api.getMessages(id), api.getProposals(id), api.getDecisions(id), api.getFiles(id)]);
   if (id !== state.selected || generation !== selectionGeneration) return;
   const caches = [state.details, state.messages, state.proposals, state.decisions, state.files];
@@ -172,8 +245,16 @@ async function loadSelected() {
         state.messages.set(id, mergeMessages(state.messages.get(id) ?? [], result.value));
         const messages = state.messages.get(id);
         state.hasEarlier.set(id, messages.length > 0 && messages[0].seq > 1);
-      } else caches[index].set(id, result.value);
-    } else state.error = 'Some task details could not be loaded. Refresh to retry.';
+      } else {
+        if (index !== 0 || (state.activityObserved.get(id) ?? 0) <= observedAt) {
+          caches[index].set(id, result.value);
+          if (index === 0 && state.connected) state.activityObserved.set(id, observedAt);
+        }
+      }
+    } else {
+      if (index === 0) state.activityObserved.delete(id);
+      state.error = 'Some task details could not be loaded. Refresh to retry.';
+    }
   });
   render();
   return results[1].status === 'fulfilled';
@@ -327,6 +408,7 @@ root.addEventListener('click', async event => {
     if (await loadSelected()) { state.replyUncertain.delete(id); state.error = 'Conversation refreshed. Check whether your previous reply arrived before sending.'; }
   }
   if (action === 'tab') { state.tab = value; state.threadOpen = true; }
+  if (action === 'more-activity') { void loadActivity(state.selected); return; }
   if (action === 'capacity') { state.tab = 'Ownership'; state.threadOpen = true; }
   if (action === 'close-thread') state.threadOpen = false;
   if (action === 'open-thread') state.threadOpen = true;
@@ -349,10 +431,12 @@ const unsubscribe = api.subscribe(event => {
   if (event.type === 'connection') {
     const wasConnected = state.connected;
     state.connected = event.connected === true;
+    if (!state.connected) state.activityObserved.clear();
     render();
     if (!state.connected || wasConnected) return;
   }
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => { void refresh(); }, 100);
 });
-window.addEventListener('pagehide', () => { unsubscribe(); clearTimeout(refreshTimer); });
+const activityTimer = setInterval(() => { void pollActivity(); }, 5000);
+window.addEventListener('pagehide', () => { unsubscribe(); clearTimeout(refreshTimer); clearInterval(activityTimer); });

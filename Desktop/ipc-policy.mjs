@@ -3,6 +3,7 @@ const ARITY = new Map([
   ["getEngineers", [0]],
   ["getCapacity", [0]],
   ["getTask", [1]],
+  ["getActivity", [1, 2]],
   ["getProposals", [1]],
   ["getDecisions", [1]],
   ["getFiles", [1]],

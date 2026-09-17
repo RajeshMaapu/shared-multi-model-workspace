@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WorkshopRPC } from "../Web/rpc-client.mjs";
 import { createTaskAPI } from "../Web/task-api.mjs";
+import { defaultInstalledPaths, ensureDaemon, launchInstalledDaemon } from "./lifecycle.mjs";
 import { validateInvocation } from "./ipc-policy.mjs";
 
 const DESKTOP_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -76,14 +77,18 @@ function rendererFile(url) {
   }
 }
 
-const socketPath = parseSocketArg(process.argv);
+const explicitSocket = parseSocketArg(process.argv);
+const installed = app.isPackaged && !app.getName().includes("Preview") && explicitSocket === undefined;
+const paths = installed ? defaultInstalledPaths(process.resourcesPath) : null;
+const socketPath = installed ? paths.socket : explicitSocket;
 const SMOKE = process.env.WORKSHOP_PREVIEW_SMOKE === "1";
 const SMOKE_DIR = process.env.WORKSHOP_PREVIEW_SMOKE_DIR
   || path.join(ROOT, ".build", "desktop-qa");
 
-app.setPath("userData",
-  path.join(app.getPath("appData"), "Workshop-Community-Preview"));
-app.setName("Workshop Preview");
+app.setPath("userData", SMOKE
+  ? path.join(SMOKE_DIR, "user-data")
+  : path.join(app.getPath("appData"), installed ? "Workshop-Desktop" : "Workshop-Community-Preview"));
+app.setName(installed ? "Workshop" : "Workshop Preview");
 
 const lockGranted = app.requestSingleInstanceLock();
 if (!lockGranted) {
@@ -270,7 +275,7 @@ function buildMenu() {
 
 async function runSmoke() {
   const expected = [
-    "createTask", "getCapacity", "getDecisions", "getEngineers",
+    "createTask", "getActivity", "getCapacity", "getDecisions", "getEngineers",
     "getFiles", "getMessages", "getProposals", "getTask", "listTasks",
     "postMessage", "subscribe",
   ];
@@ -326,7 +331,7 @@ async function runSmoke() {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   if (!lockGranted) return;
   if (socketPath === undefined || socketPath === null) {
     dialog.showMessageBoxSync({
@@ -366,6 +371,14 @@ app.whenReady().then(() => {
 
   rpc = new WorkshopRPC(socketPath);
   api = createTaskAPI(rpc);
+  if (installed) {
+    try {
+      await ensureDaemon(paths, () => rpc.call("workshop.listTasks", {}), launchInstalledDaemon);
+    } catch (error) {
+      dialog.showErrorBox("Workshop background service", error.message);
+      rpc.close(); app.quit(); return;
+    }
+  }
 
   win = new BrowserWindow({
     width: 1586,
@@ -373,7 +386,7 @@ app.whenReady().then(() => {
     useContentSize: true,
     minWidth: 980,
     minHeight: 680,
-    title: "Workshop Preview",
+    title: installed ? "Workshop" : "Workshop Preview",
     webPreferences: {
       preload: path.join(DESKTOP_DIR, "preload.cjs"),
       sandbox: true,

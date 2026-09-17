@@ -48,6 +48,7 @@ final class AdapterContractTests: XCTestCase {
                 return [result(.object(["sessionId": .string(sessionID)]))]
             case "session/prompt":
                 return [
+                    #"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"\#(sessionID)","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"HIDDEN_TEST_THOUGHT"}}}}"#,
                     #"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"\#(sessionID)","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}}}"#,
                     #"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"\#(sessionID)","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"workshop_ping","rawInput":{}}}}"#,
                     #"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"\#(sessionID)","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed","title":"workshop_ping"}}}"#,
@@ -132,7 +133,9 @@ final class AdapterContractTests: XCTestCase {
             events.append(e)
         }
         XCTAssertTrue(events.contains(.messageDelta("Hello")))
-        XCTAssertTrue(events.contains(.toolActivity(title: "workshop_ping", status: "started")))
+        XCTAssertFalse(events.contains(.messageDelta("HIDDEN_TEST_THOUGHT")))
+        XCTAssertTrue(events.contains(.toolActivity(title: "workshop_ping", status: "started", callID: "t1")))
+        XCTAssertTrue(events.contains(.toolActivity(title: "workshop_ping", status: "completed", callID: "t1")))
         XCTAssertTrue(events.contains(.turnCompleted))
         let usage = events.first { if case .usageSample = $0 { return true }; return false }
         guard case .usageSample(let i, let o, let cr, let cw, let src)? = usage else {

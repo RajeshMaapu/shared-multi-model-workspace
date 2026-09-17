@@ -229,6 +229,12 @@ export function createTaskAPI(rpc) {
       }
       return result;
     },
+    async getActivity(taskID, afterSeq = 0) {
+      if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) throw new ValidationError("Invalid activity cursor");
+      const result = await call("workshop.readActivity", { task_id: requireTaskID(taskID), after_seq: afterSeq, limit: 200 });
+      if (!Array.isArray(result)) throw new UpstreamError("Unexpected daemon response");
+      return result;
+    },
     async getMessages(taskID, beforeSeq) {
       const params = { task_id: requireTaskID(taskID), limit: 100 };
       const before = optionalBeforeSeq(beforeSeq);

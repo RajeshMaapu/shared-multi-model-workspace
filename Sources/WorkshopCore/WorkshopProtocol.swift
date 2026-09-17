@@ -8,6 +8,7 @@ public enum WorkshopProtocol {
     public static let createTask = "workshop.createTask"
     public static let listTasks = "workshop.listTasks"
     public static let getTask = "workshop.getTask"
+    public static let readActivity = "workshop.readActivity"
     public static let readMessages = "workshop.readMessages"
     public static let postMessage = "workshop.postMessage"
     public static let listEngineers = "workshop.listEngineers"

@@ -68,31 +68,28 @@ func makeOutput() -> (String) -> Void {
 // The closures must be nonisolated: top-level code here is @MainActor, and a
 // main-actor async toolCaller would deadlock — awaiting it hops to the main
 // thread, which is blocked in runStdio.
-func makeToolCaller(_ client: WorkshopClient)
+// Connect for each call so startup-before-daemon and daemon restarts recover.
+// Never replay a request after dispatch: a dropped response can be ambiguous.
+func makeToolCaller(socketPath: String, token: String)
     -> (String, JSONValue) async throws -> JSONValue {
-    { method, args in try await client.call(method, params: args) }
-}
-func makeOfflineCaller() -> (String, JSONValue) async throws -> JSONValue {
-    { _, _ in throw ServiceUnavailable() }
+    { method, args in
+        let client = WorkshopClient(socketPath: socketPath)
+        do { try await client.connect() }
+        catch { throw ServiceUnavailable() }
+        do {
+            _ = try await client.call(WorkshopProtocol.authenticate,
+                                     params: .object(["token": .string(token)]))
+            let result = try await client.call(method, params: args)
+            await client.disconnect()
+            return result
+        } catch {
+            await client.disconnect()
+            throw error
+        }
+    }
 }
 
-let bridge: MCPBridge
-do {
-    let client = WorkshopClient(socketPath: socketPath)
-    try await client.connect()
-    _ = try await client.call(WorkshopProtocol.authenticate,
-                              params: .object(["token": .string(token)]))
-    FileHandle.standardError.write(
-        Data("workshop-mcp: connected as \(principalName)\n".utf8))
-    bridge = MCPBridge(engineer: .devin,
-                       toolCaller: makeToolCaller(client),
-                       output: makeOutput())
-} catch {
-    FileHandle.standardError.write(Data(
-        ("workshop-mcp: daemon not reachable at \(socketPath); "
-            + "serving degraded tools\n").utf8))
-    bridge = MCPBridge(engineer: .devin,
-                       toolCaller: makeOfflineCaller(),
-                       output: makeOutput())
-}
+let bridge = MCPBridge(engineer: .devin,
+    toolCaller: makeToolCaller(socketPath: socketPath, token: token),
+    output: makeOutput())
 bridge.runStdio()

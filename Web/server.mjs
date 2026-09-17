@@ -266,7 +266,7 @@ export function createWebServer({ socketPath, port = 4176,
         && segments[1] === "tasks")
       || (segments.length === 4 && segments[0] === "api"
         && segments[1] === "tasks"
-        && ["messages", "proposals", "decisions", "files"]
+        && ["messages", "proposals", "decisions", "files", "activity"]
           .includes(segments[3]));
     try {
       if (req.method === "GET" && url.pathname === "/api/tasks") {
@@ -280,6 +280,9 @@ export function createWebServer({ socketPath, port = 4176,
       } else if (segments.length === 3 && segments[0] === "api"
           && segments[1] === "tasks" && req.method === "GET") {
         sendJSON(res, 200, await api.getTask(segments[2]));
+      } else if (segments.length === 4 && segments[0] === "api"
+          && segments[1] === "tasks" && segments[3] === "activity" && req.method === "GET") {
+        sendJSON(res, 200, await api.getActivity(segments[2], Number(url.searchParams.get("after_seq") ?? 0)));
       } else if (segments.length === 4 && segments[0] === "api"
           && segments[1] === "tasks" && segments[3] === "messages"
           && req.method === "GET") {

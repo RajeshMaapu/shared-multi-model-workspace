@@ -1,22 +1,28 @@
 {
   "schema_version": 1,
-  "result": "passed",
+  "result": "pending",
   "scope": "Web renderer visual and interaction validation against an isolated Swift daemon with fake engineer adapters; not live engineer, Astra bridge, accessibility certification, or Electron qualification.",
-  "reviewed_at": "2026-09-16T06:18:00Z",
+  "reviewed_at": null,
   "reference": "docs/review/workshop-approved-reference.png",
   "evidence": ".build/web-qa/evidence.json",
-  "screenshots": [".build/web-qa/full-final.png", ".build/web-qa/compact-final.png"],
-  "viewports": ["1586x992", "980x680"],
+  "screenshots": [
+    ".build/web-qa/full-final.png",
+    ".build/web-qa/compact-final.png"
+  ],
+  "viewports": [
+    "1586x992",
+    "980x680"
+  ],
   "renderer_file_sha256": {
+    "client.js": "ecff87e91e69374ed4476ac62d5d0839ac0ef184595550e188dd728811ac5ec2",
     "index.html": "ee48dd96a0e37e68e50665a85597526bd47285afd342746f38fe8f0a10bb5a02",
-    "app.js": "d9227eda5646549454bba3d1f19f6345d69e3a3d35662eb34d0e43c35ec12497",
-    "client.js": "f902fdb1a0659588dd6009b23c245cb48d500d63531a3a974bccdd12f6de7060",
-    "state.js": "7100103622167be9bcb46d3f25ffddc16e5af556020543d3275acab957b674a5",
-    "style.css": "2ee328f1d3520cd2663272074e17b226bf24217c2d1c35fd5d6ef38c3ece0256"
+    "state.js": "6e0b47dc200361c3f3ff885e5953912325f84e89946dd5841acfae873859ea7e",
+    "style.css": "45c376fb6866bb702ac28040e3d160e78e3b243e286abf6529f76f268cd4bb8b",
+    "app.js": "a58b332173dd9be8f1154df35020f785e03d44e59c03915f1e2292a74b4f522b"
   },
   "review_notes": [
-    "Current system-message formatting, post-create options reset, requested-peer display and both layouts freshly checked.",
-    "Unchanged reply persistence, search, tabs, dialog, capacity, draft retention and console checks carried from preceding web revision.",
-    "Task-state chip has cosmetic accessibility text adjacency; no visual concatenation."
-  ]
+    "Fresh browser validation of the activity renderer is pending; listed prior evidence paths are not current proof."
+  ],
+  "pending_reason": "Activity renderer changed; fresh supported browser validation required before packaging.",
+  "previous_reviewed_at": "2026-09-16T06:18:00Z"
 }

@@ -33,3 +33,9 @@ Versioned source: `.devin/skills/team/`. The user explicitly requested installat
 ## Public commits and pushes
 
 Follow `.devin/rules/publication-safety.md` for every commit and push. Install local guards with `python3 .devin/security/install_hooks.py`; review staged content and outgoing history, never bypass findings, and never reintroduce pre-cleanup/private ancestry. Guard tests: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s Tests/SecurityTests -v`.
+
+## Clean-history transfers and installed-runtime connection checks
+
+This is the canonical target for approved Workshop changes. Keep old development checkouts as source evidence only. Transfer reviewed code with scoped patches or fresh commits on a feature branch based on this repository's cleaned history; never merge old branches or import their ancestry. Preserve other authors' work. A transfer does not authorize publication beyond the user's stated scope.
+
+After every installed app/backend/MCP bridge replacement, use a supported refresh of the actual configured Codex connection and verify a fresh read-only tool call plus its current callable schema from the originating session before claiming end-to-end completion or submitting a saved task. Source-only pushes do not trigger this step. Installed binary versions, process age, advertised schemas alone and separate fresh CLI sessions are insufficient evidence. If refresh is unavailable, record installed/connection unverified and the required supported user action; preserve idempotency records. Do not kill Codex or unrelated processes, repeat unchanged failed proxies, or bypass restrictions. See [desktop update status](docs/WORKSHOP_DESKTOP_UPDATES.md) and [browser validation procedure](docs/review/WORKSHOP_BROWSER_VALIDATION.md).

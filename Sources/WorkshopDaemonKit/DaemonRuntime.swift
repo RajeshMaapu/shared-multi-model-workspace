@@ -326,6 +326,11 @@ public final class DaemonRuntime: @unchecked Sendable {
                 return try .from(try await service.createTask(request))
             case WorkshopProtocol.listTasks:
                 return try .from(try await service.listTasks())
+            case WorkshopProtocol.readActivity:
+                return try .from(try await service.readActivity(
+                    TaskID(params?["task_id"]?.stringValue ?? ""),
+                    afterSeq: params?["after_seq"]?.intValue ?? 0,
+                    limit: Int(params?["limit"]?.intValue ?? 200)))
             case WorkshopProtocol.getTask:
                 let id = TaskID(params?["task_id"]?.stringValue ?? "")
                 return try .from(try await service.getTask(id))

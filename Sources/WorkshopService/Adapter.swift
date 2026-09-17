@@ -211,7 +211,7 @@ public enum AdapterEvent: Sendable, Equatable {
     case authRequired
     case quotaLimited
     /// A non-message tool activity update (title + status) for UI display.
-    case toolActivity(title: String, status: String)
+    case toolActivity(title: String, status: String, callID: String? = nil)
     /// A tool call was denied by the permission policy (Phase 3 adds user cards).
     case permissionDenied(String)
     case uncertain(String)
