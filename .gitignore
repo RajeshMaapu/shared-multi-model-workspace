@@ -1,4 +1,5 @@
 .build/
+node_modules/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
@@ -17,3 +18,9 @@ docs/evidence/**/raw/
 Configuration/*.local.json
 *.bundle
 .swiftpm/
+__pycache__/
+!/.devin/
+/.devin/*
+!/.devin/skills/
+/.devin/skills/*
+!/.devin/skills/team/

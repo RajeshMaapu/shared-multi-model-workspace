@@ -250,5 +250,37 @@ public enum Migrations {
         ALTER TABLE checkpoints ADD COLUMN valid INTEGER NOT NULL DEFAULT 1
         """)
 
-    public static let all = Migrator(migrations: [v1, v2, v3, v4])
+    public static let v5 = Migrator.Migration(version: 5, sql: """
+        CREATE TABLE task_ingress(
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+            principal TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            source_task_id TEXT,
+            invocation_id TEXT,
+            last_acknowledged_seq INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(principal, source_task_id, invocation_id)
+        )
+        """)
+
+    public static let v6 = Migrator.Migration(version: 6, sql: """
+        CREATE TABLE task_workspaces(
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+            repository_path TEXT,
+            branch TEXT,
+            path TEXT NOT NULL UNIQUE,
+            base_revision TEXT,
+            state TEXT NOT NULL
+        )
+        """)
+
+    public static let v7 = Migrator.Migration(version: 7, sql: """
+        CREATE TABLE writer_generations(
+            id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+            engineer TEXT NOT NULL, path TEXT NOT NULL UNIQUE, base_path TEXT NOT NULL,
+            state TEXT NOT NULL, snapshot_path TEXT UNIQUE, digest TEXT, token_hash TEXT UNIQUE
+        );
+        CREATE UNIQUE INDEX one_current_writer ON writer_generations(task_id)
+            WHERE state IN ('writing','sealed');
+        """)
+    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7])
 }

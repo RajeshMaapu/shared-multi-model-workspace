@@ -1,0 +1,10 @@
+{
+  "passed": true,
+  "root": "<isolated-runtime>",
+  "task_id": "<fixture-task-id>",
+  "schema_v2": true,
+  "retry_same_task": true,
+  "native_mcp": true,
+  "sealed_file": "<isolated-runtime>/home/writer-snapshots/<fixture-writer-id>/probe.txt",
+  "task_state": "verifying"
+}

@@ -1,6 +1,36 @@
 import Foundation
 import CryptoKit
 
+public enum CollaborationMode: String, Codable, Sendable {
+    case ownerOnly = "owner_only"
+    case requestedPeers = "requested_peers"
+}
+
+public struct TaskOrigin: Codable, Equatable, Sendable {
+    public var sourceTaskID: String
+    public var invocationID: String
+    enum CodingKeys: String, CodingKey {
+        case sourceTaskID = "source_task_id"
+        case invocationID = "invocation_id"
+    }
+    public init(sourceTaskID: String, invocationID: String) {
+        self.sourceTaskID = sourceTaskID
+        self.invocationID = invocationID
+    }
+}
+
+public struct TaskIngress: Codable, Equatable, Sendable {
+    public var request: CreateTaskRequest
+    public var source: String
+    public var lastAcknowledgedSeq: Int64
+
+    public init(request: CreateTaskRequest, source: String, lastAcknowledgedSeq: Int64 = 0) {
+        self.request = request
+        self.source = source
+        self.lastAcknowledgedSeq = lastAcknowledgedSeq
+    }
+}
+
 /// Create-task contract (spec §8.4). `channel` defaults to "projects".
 public struct CreateTaskRequest: Codable, Equatable, Sendable {
     public var schemaVersion: Int
@@ -15,6 +45,8 @@ public struct CreateTaskRequest: Codable, Equatable, Sendable {
     public var acceptanceCriteria: [String]
     public var budgetPolicyRef: String?
     public var channel: String
+    public var collaborationMode: CollaborationMode?
+    public var origin: TaskOrigin?
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -24,13 +56,17 @@ public struct CreateTaskRequest: Codable, Equatable, Sendable {
         case acceptanceCriteria = "acceptance_criteria"
         case budgetPolicyRef = "budget_policy_ref"
         case channel
+        case collaborationMode = "collaboration_mode"
+        case origin
     }
 
     public init(schemaVersion: Int = 1, idempotencyKey: String, title: String, objective: String,
                 phase: TaskPhase, participants: [EngineerID], constraints: [String] = [],
                 sources: [String] = [], workspaceRef: String? = nil,
                 acceptanceCriteria: [String] = [], budgetPolicyRef: String? = nil,
-                channel: String = "projects") {
+                channel: String = "projects",
+                collaborationMode: CollaborationMode? = nil,
+                origin: TaskOrigin? = nil) {
         self.schemaVersion = schemaVersion
         self.idempotencyKey = idempotencyKey
         self.title = title
@@ -43,6 +79,8 @@ public struct CreateTaskRequest: Codable, Equatable, Sendable {
         self.acceptanceCriteria = acceptanceCriteria
         self.budgetPolicyRef = budgetPolicyRef
         self.channel = channel
+        self.collaborationMode = collaborationMode
+        self.origin = origin
     }
 
     public init(from decoder: Decoder) throws {
@@ -59,6 +97,8 @@ public struct CreateTaskRequest: Codable, Equatable, Sendable {
         acceptanceCriteria = try c.decodeIfPresent([String].self, forKey: .acceptanceCriteria) ?? []
         budgetPolicyRef = try c.decodeIfPresent(String.self, forKey: .budgetPolicyRef)
         channel = try c.decodeIfPresent(String.self, forKey: .channel) ?? "projects"
+        collaborationMode = try c.decodeIfPresent(CollaborationMode.self, forKey: .collaborationMode)
+        origin = try c.decodeIfPresent(TaskOrigin.self, forKey: .origin)
     }
 }
 

@@ -225,11 +225,14 @@ public struct TaskDetail: Codable, Equatable, Sendable {
     /// Proposal visibility counts (T12: drafts are private; only counts show).
     public var draftProposalCount: Int
     public var publishedProposalCount: Int
+    public var ingress: TaskIngress?
+    public var workspace: TaskWorkspace?
 
     public init(task: WorkshopTask, participants: [Participant], subtasks: [Subtask],
                 usage: UsageSample? = nil, runningEngineers: [EngineerID] = [],
                 pendingWakeups: [WakeupInfo] = [], draftProposalCount: Int = 0,
-                publishedProposalCount: Int = 0) {
+                publishedProposalCount: Int = 0, ingress: TaskIngress? = nil,
+                workspace: TaskWorkspace? = nil) {
         self.task = task
         self.participants = participants
         self.subtasks = subtasks
@@ -238,6 +241,8 @@ public struct TaskDetail: Codable, Equatable, Sendable {
         self.pendingWakeups = pendingWakeups
         self.draftProposalCount = draftProposalCount
         self.publishedProposalCount = publishedProposalCount
+        self.ingress = ingress
+        self.workspace = workspace
     }
 }
 

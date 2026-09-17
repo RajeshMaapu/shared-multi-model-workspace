@@ -21,8 +21,20 @@ public enum WorkshopToolCatalog {
 
     public static let tools: [Tool] = [
         Tool(name: "workshop_create_task",
-             description: "Create a durable Workshop task. Returns a receipt with task_id, committed_seq, state, status, and a workshop:// deep link when the app is registered.",
+             description: "Create a durable Workshop task. Use schema_version 2 with owner_only or requested_peers collaboration. Reuse an invocation id only for retries. Returns a truthful task receipt; no automatic Codex callback is implied.",
              inputSchema: obj(["idempotency_key": s, "title": s, "objective": s,
+                               "schema_version": i,
+                               "collaboration_mode":
+                                .object(["type": .string("string"),
+                                         "enum": .array([.string("owner_only"),
+                                                         .string("requested_peers")])]),
+                               "origin":
+                                .object(["type": .string("object"),
+                                         "properties": .object([
+                                            "source_task_id": s,
+                                            "invocation_id": s]),
+                                         "required": .array([.string("source_task_id"),
+                                                             .string("invocation_id")])]),
                                "phase": s, "participants":
                                 .object(["type": .string("array"),
                                          "items": s]),

@@ -341,7 +341,7 @@ Codex run results:            run 1 created <redacted-task-id> via
                               Run 2 (same brief): model emitted the FULL
                               64-char sha (skill says truncate to 32) →
                               distinct idempotency key → second task
-                              <redacted-task-id> created. FIXED defensively in
+                              task_<redacted>… created. FIXED defensively in
                               rc1: the skill now prescribes an exact
                               `shasum -a 256 | cut -c1-32` recipe (key MUST
                               be 38 chars) and the service normalizes

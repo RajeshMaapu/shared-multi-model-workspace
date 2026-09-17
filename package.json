@@ -1,0 +1,16 @@
+{
+  "name": "workshop-community",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "Desktop/main.mjs",
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "electron": "42.9.1"
+  },
+  "scripts": {
+    "desktop": "electron .",
+    "test:desktop": "node --test Desktop/tests/*.test.mjs",
+    "package:desktop": "node Desktop/package.mjs"
+  }
+}

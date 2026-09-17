@@ -56,16 +56,26 @@ public struct HarnessLaunchSpec: Sendable {
 /// turns for the same session; bounded idle timeout.
 public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     public let engineer: EngineerID
+    /// Qualified path: generation sandbox + relay-backed native Fusion. Other
+    /// models/harnesses remain gated until their live writer probes pass.
+    public var supportsIsolatedWorkspaceTurns: Bool {
+        engineer == .devin && spec.executable == "/usr/bin/sandbox-exec"
+            && spec.sandboxProfilePath != nil && spec.worktreeRoot != nil
+            && spec.versionProbePath == NSHomeDirectory() + "/projects/fusion-codex-relay/bin/devin-fusion"
+            && spec.modelSelection == "fusion-gpt-6-astra-high-sidekick-swe-2-medium"
+    }
     private let spec: HarnessLaunchSpec
     private let transportFactory: @Sendable (HarnessLaunchSpec, String) throws -> ACPTransport
     private let versionProbe: @Sendable (String) -> String?
     private let lock = NSLock()
     private var client: ACPClient?
     private var sessionID: String?
+    private var activeTaskID: TaskID?
+    private var activeWorkspacePath: String?
     private var lastActivity = Date.distantPast
     /// turnID → waiter resumed when the in-flight session/prompt call returns
     /// (T23 cancel acknowledgement) and turns whose prompt already finished.
-    private var promptWaiters: [String: CheckedContinuation<Void, Never>] = [:]
+    private let cancellationTimeout: Duration
     private var promptFinished: Set<String> = []
     /// Notes produced outside a turn stream (e.g. session/load fallback);
     /// emitted as `.uncertain` at the start of the next sendTurn.
@@ -76,7 +86,9 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                 transportFactory: @escaping @Sendable (HarnessLaunchSpec, String) throws -> ACPTransport
                     = { try ProcessACPTransport(argv: $0.argv, env: $0.env, cwd: $1) },
                 versionProbe: @escaping @Sendable (String) -> String?
-                    = ACPHarnessAdapter.defaultVersionProbe) {
+                    = ACPHarnessAdapter.defaultVersionProbe,
+                cancellationTimeout: Duration = .seconds(10)) {
+        self.cancellationTimeout = cancellationTimeout
         self.engineer = spec.engineer
         self.spec = spec
         self.transportFactory = transportFactory
@@ -132,7 +144,18 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     }
 
     public func openTaskSession(binding: SessionBinding) async throws -> SessionRef {
-        let cwd = sessionCwd(for: binding)
+        guard binding.profileRevision >= 2 else {
+            throw WorkshopError.invalidRequest("Legacy instruction profile requires a fresh task")
+        }
+        let requestedCwd = try sessionCwd(for: binding)
+        if client != nil && (activeTaskID != binding.taskID || activeWorkspacePath != requestedCwd) {
+            await client?.close()
+            client = nil
+            sessionID = nil
+        }
+        activeTaskID = binding.taskID
+        let cwd = requestedCwd
+        activeWorkspacePath = cwd
         try await ensureClient(cwd: cwd)
         guard let client else { throw WorkshopError.adapterUnavailable(engineer) }
         if spec.mcpInjection == .devinProjectConfigFile {
@@ -171,14 +194,12 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
 
     /// Directory the harness session runs in: the per-task worktree when a
     /// worktree root is configured, else the spec cwd.
-    private func sessionCwd(for binding: SessionBinding) -> String {
+    private func sessionCwd(for binding: SessionBinding) throws -> String {
+        if let workspace = binding.workspace { return workspace.path }
         guard let root = spec.worktreeRoot else { return spec.cwd }
         let home = (root as NSString).deletingLastPathComponent
-        if let (path, _) = try? WorkspaceManager.prepareWorkspace(
-            homeDir: home, taskID: binding.taskID, workspaceRef: nil) {
-            return path
-        }
-        return spec.cwd
+        return try WorkspaceManager.prepareTaskWorkspace(
+            homeDir: home, taskID: binding.taskID, workspaceRef: nil).path
     }
 
     /// Bridge path + token file: the launch spec's env first (set by
@@ -192,8 +213,12 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                 ?? ProcessInfo.processInfo.environment[tokenKey] else {
             return []
         }
+        let effectiveToken: String
+        if let cwd = activeWorkspacePath, cwd.contains("/writer-runs/") {
+            effectiveToken = (cwd as NSString).deletingLastPathComponent + "/token"
+        } else { effectiveToken = tokenFile }
         return [.string("--engineer"), .string(engineer.rawValue),
-                .string("--token-file"), .string(tokenFile)]
+                .string("--token-file"), .string(effectiveToken)]
     }
 
     private func bridgeCommand() -> String? {
@@ -250,7 +275,24 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
             lock.lock(); client = nil; sessionID = nil; lock.unlock()
         }
         guard client == nil else { return }
-        let transport = try transportFactory(spec, cwd)
+        var launch = spec
+        if let sandbox = spec.sandboxProfilePath, let root = spec.worktreeRoot {
+            let home = (root as NSString).deletingLastPathComponent
+            if cwd.hasPrefix(home + "/writer-runs/") {
+                let profile = (sandbox as NSString).deletingLastPathComponent
+                try ProfileBuilder.writerSandboxProfile(workshopHome: home, worktree: cwd,
+                    profile: profile, token: (cwd as NSString).deletingLastPathComponent + "/token",
+                    destination: sandbox)
+                let tmp = (cwd as NSString).deletingLastPathComponent + "/tmp"
+                try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+                launch.env["TMPDIR"] = tmp
+                launch.env["PYTHONDONTWRITEBYTECODE"] = "1"
+                launch.env["PATH"] = NSHomeDirectory() + "/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
+            } else {
+                try ProfileBuilder.devinSandboxProfile(workshopHome: home, worktree: cwd, destination: sandbox)
+            }
+        }
+        let transport = try transportFactory(launch, cwd)
         let c = ACPClient(transport: transport)
         client = c
         _ = try await c.call("initialize", params: .object([
@@ -368,50 +410,43 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     private func finishPrompt(turnID: String) {
         lock.lock()
         promptFinished.insert(turnID)
-        let waiter = promptWaiters.removeValue(forKey: turnID)
         lock.unlock()
-        waiter?.resume()
     }
 
-    /// Resolves when the turn's session/prompt call returns (any outcome).
-    private func awaitPromptFinish(turnID: String) async {
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            lock.lock()
-            if promptFinished.contains(turnID) {
-                lock.unlock()
-                c.resume()
-            } else {
-                promptWaiters[turnID] = c
-                lock.unlock()
-            }
-        }
+    private func isPromptFinished(_ turnID: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return promptFinished.contains(turnID)
+    }
+
+    private func clearClient() {
+        lock.lock(); defer { lock.unlock() }
+        client = nil
+        sessionID = nil
     }
 
     private func touchActivity() {
         lock.lock(); lastActivity = Date(); lock.unlock()
     }
 
-    /// T23: send session/cancel, then wait ≤10 s for the prompt call to
-    /// return. No response → kill the process group and report uncertain.
+    /// ACP v1 cancellation is a notification. Bound the wait for the original
+    /// prompt, including agents that never respond to cancellation. A returned
+    /// prompt is protocol acknowledgment, NOT proof of descendant quiescence.
     public func cancelTurn(ref: SessionRef, turnID: String) async -> Bool {
         guard let client else { return false }
-        _ = try? await client.call("session/cancel", params: .object([
-            "sessionId": .string(ref.nativeSessionID)]))
-        let acknowledged = await withTaskGroup(of: Bool.self) { group in
-            group.addTask { await self.awaitPromptFinish(turnID: turnID); return true }
-            group.addTask { try? await Task.sleep(for: .seconds(10)); return false }
-            let result = await group.next() ?? false
-            group.cancelAll()
-            return result
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: cancellationTimeout)
+        do {
+            try await client.notify("session/cancel", params: .object([
+                "sessionId": .string(ref.nativeSessionID)]))
+            while !Task.isCancelled && clock.now < deadline {
+                if isPromptFinished(turnID) { return true }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+        } catch {
+            // Transport failure or caller cancellation must also close the client.
         }
-        if !acknowledged {
-            await client.close()
-            lock.lock()
-            self.client = nil
-            self.sessionID = nil
-            lock.unlock()
-        }
-        return acknowledged
+        await client.close()
+        clearClient()
+        return false
     }
 }
-

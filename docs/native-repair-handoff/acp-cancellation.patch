@@ -1,0 +1,157 @@
+--- a/Sources/WorkshopAdapters/ACPClient.swift
++++ b/Sources/WorkshopAdapters/ACPClient.swift
+@@ -170,6 +170,14 @@
+         }
+     }
+ 
++    /// JSON-RPC notification: intentionally no id and no response waiter.
++    public func notify(_ method: String, params: JSONValue? = nil) throws {
++        var message: [String: JSONValue] = ["jsonrpc": .string("2.0"), "method": .string(method)]
++        if let params { message["params"] = params }
++        let data = try JSONEncoder().encode(JSONValue.object(message))
++        try transport.send(String(decoding: data, as: UTF8.self))
++    }
++
+     public func close() {
+         transport.terminate()
+         readerTask?.cancel()
+--- a/Sources/WorkshopAdapters/ACPHarness.swift
++++ b/Sources/WorkshopAdapters/ACPHarness.swift
+@@ -66,7 +66,7 @@
+     private var lastActivity = Date.distantPast
+     /// turnID → waiter resumed when the in-flight session/prompt call returns
+     /// (T23 cancel acknowledgement) and turns whose prompt already finished.
+-    private var promptWaiters: [String: CheckedContinuation<Void, Never>] = [:]
++    private let cancellationTimeout: Duration
+     private var promptFinished: Set<String> = []
+     /// Notes produced outside a turn stream (e.g. session/load fallback);
+     /// emitted as `.uncertain` at the start of the next sendTurn.
+@@ -77,7 +77,9 @@
+                 transportFactory: @escaping @Sendable (HarnessLaunchSpec, String) throws -> ACPTransport
+                     = { try ProcessACPTransport(argv: $0.argv, env: $0.env, cwd: $1) },
+                 versionProbe: @escaping @Sendable (String) -> String?
+-                    = ACPHarnessAdapter.defaultVersionProbe) {
++                    = ACPHarnessAdapter.defaultVersionProbe,
++                cancellationTimeout: Duration = .seconds(10)) {
++        self.cancellationTimeout = cancellationTimeout
+         self.engineer = spec.engineer
+         self.spec = spec
+         self.transportFactory = transportFactory
+@@ -381,49 +383,43 @@
+     private func finishPrompt(turnID: String) {
+         lock.lock()
+         promptFinished.insert(turnID)
+-        let waiter = promptWaiters.removeValue(forKey: turnID)
+         lock.unlock()
+-        waiter?.resume()
+-    }
+-
+-    /// Resolves when the turn's session/prompt call returns (any outcome).
+-    private func awaitPromptFinish(turnID: String) async {
+-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+-            lock.lock()
+-            if promptFinished.contains(turnID) {
+-                lock.unlock()
+-                c.resume()
+-            } else {
+-                promptWaiters[turnID] = c
+-                lock.unlock()
+-            }
+-        }
++    }
++
++    private func isPromptFinished(_ turnID: String) -> Bool {
++        lock.lock(); defer { lock.unlock() }
++        return promptFinished.contains(turnID)
++    }
++
++    private func clearClient() {
++        lock.lock(); defer { lock.unlock() }
++        client = nil
++        sessionID = nil
+     }
+ 
+     private func touchActivity() {
+         lock.lock(); lastActivity = Date(); lock.unlock()
+     }
+ 
+-    /// T23: send session/cancel, then wait ≤10 s for the prompt call to
+-    /// return. No response → kill the process group and report uncertain.
++    /// ACP v1 cancellation is a notification. Bound the wait for the original
++    /// prompt, including agents that never respond to cancellation. A returned
++    /// prompt is protocol acknowledgment, NOT proof of descendant quiescence.
+     public func cancelTurn(ref: SessionRef, turnID: String) async -> Bool {
+         guard let client else { return false }
+-        _ = try? await client.call("session/cancel", params: .object([
+-            "sessionId": .string(ref.nativeSessionID)]))
+-        let acknowledged = await withTaskGroup(of: Bool.self) { group in
+-            group.addTask { await self.awaitPromptFinish(turnID: turnID); return true }
+-            group.addTask { try? await Task.sleep(for: .seconds(10)); return false }
+-            let result = await group.next() ?? false
+-            group.cancelAll()
+-            return result
+-        }
+-        if !acknowledged {
+-            await client.close()
+-            lock.lock()
+-            self.client = nil
+-            self.sessionID = nil
+-            lock.unlock()
+-        }
+-        return acknowledged
++        let clock = ContinuousClock()
++        let deadline = clock.now.advanced(by: cancellationTimeout)
++        do {
++            try await client.notify("session/cancel", params: .object([
++                "sessionId": .string(ref.nativeSessionID)]))
++            while !Task.isCancelled && clock.now < deadline {
++                if isPromptFinished(turnID) { return true }
++                try await Task.sleep(for: .milliseconds(20))
++            }
++        } catch {
++            // Transport failure or caller cancellation must also close the client.
++        }
++        await client.close()
++        clearClient()
++        return false
+     }
+ }
+--- a/Tests/AdapterContractTests/AdapterContractTests.swift
++++ b/Tests/AdapterContractTests/AdapterContractTests.swift
+@@ -78,6 +78,36 @@
+ 
+     // MARK: - ACPClient
+ 
++    func testCancelNotificationHasNoResponseID() async throws {
++        let transport = FakeACPTransport(responder: { line in
++            let message = try! JSONDecoder().decode(JSONValue.self, from: Data(line.utf8))
++            XCTAssertNil(message["id"])
++            XCTAssertEqual(message["method"]?.stringValue, "session/cancel")
++            return [] // Correct agents do not respond to a notification.
++        })
++        let client = ACPClient(transport: transport)
++        try await client.notify("session/cancel", params: .object(["sessionId": .string("s")]))
++        await client.close()
++    }
++
++    func testUnresponsiveCancelReturnsAndSessionCanReopen() async throws {
++        let responder = happyResponder()
++        let adapter = ACPHarnessAdapter(spec: spec(), transportFactory: { _, _ in
++            FakeACPTransport(responder: { line in
++                if line.contains("session/cancel") { return [] }
++                return responder(line)
++            })
++        }, cancellationTimeout: .milliseconds(60))
++        let ref = try await adapter.openTaskSession(binding: binding())
++        let start = ContinuousClock.now
++        let result = await adapter.cancelTurn(ref: ref, turnID: "missing-prompt")
++        XCTAssertFalse(result)
++        XCTAssertLessThan(start.duration(to: .now), .seconds(2))
++        let reopened = try await adapter.openTaskSession(binding: binding())
++        XCTAssertEqual(reopened.nativeSessionID, "sess-1")
++        _ = await adapter.cancelTurn(ref: reopened, turnID: "cleanup")
++    }
++
+     func testCallCorrelatesByID() async throws {
+         let transport = FakeACPTransport(responder: happyResponder())
+         let client = ACPClient(transport: transport)

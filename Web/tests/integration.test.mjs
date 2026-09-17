@@ -1,0 +1,35 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { WorkshopRPC } from '../rpc-client.mjs';
+import { createTaskAPI } from '../task-api.mjs';
+
+const socketPath = process.env.WORKSHOP_TEST_SOCKET;
+test('isolated Swift daemon persists owner tasks, retries, peers and replies', { skip: !socketPath, timeout: 30000 }, async () => {
+  const rpc = new WorkshopRPC(socketPath);
+  const api = createTaskAPI(rpc);
+  const engineers = await api.getEngineers();
+  assert.ok(engineers.length > 0 && engineers.every(item => item.effectiveModel === 'fake-model'), 'Integration test requires fake adapters only');
+  const before = await api.listTasks();
+  const request = { idempotency_key: `web-${randomUUID()}`, title: 'Web integration owner test', objective: 'Persist this isolated test brief', phase: 'execution', collaboration_mode: 'owner_only', participants: [], channel: 'engineering' };
+  const receipt = await api.createTask(request);
+  const retry = await api.createTask(request);
+  assert.equal(receipt.task_id, retry.task_id);
+  assert.equal((await api.listTasks()).length, before.length + 1);
+  const detail = await api.getTask(receipt.task_id);
+  assert.deepEqual(detail.participants.map(item => item.engineerID), ['devin']);
+  assert.equal(detail.ingress.request.objective, request.objective);
+  const identical = await api.createTask({ ...request, idempotency_key: `web-${randomUUID()}` });
+  assert.notEqual(identical.task_id, receipt.task_id);
+  const peers = await api.createTask({ ...request, title: 'Web integration requested peer test', idempotency_key: `web-${randomUUID()}`, collaboration_mode: 'requested_peers', participants: ['kimi'] });
+  assert.deepEqual(new Set((await api.getTask(peers.task_id)).participants.map(item => item.engineerID)), new Set(['devin', 'kimi']));
+  const reply = await api.postMessage(receipt.task_id, 'Persist this follow-up in the same task');
+  assert.ok(Number.isSafeInteger(reply.seq));
+  assert.equal(reply.deliveryState, 'committed');
+  const reconnected = createTaskAPI(new WorkshopRPC(socketPath));
+  const messages = await reconnected.getMessages(receipt.task_id);
+  assert.ok(messages.some(item => item.id === reply.id && item.body === reply.body));
+  assert.equal(new Set(messages.map(item => item.id)).size, messages.length);
+  assert.equal((await api.listTasks()).length, before.length + 3);
+  rpc.close();
+});

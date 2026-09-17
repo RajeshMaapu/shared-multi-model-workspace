@@ -272,9 +272,37 @@ public final class DaemonRuntime: @unchecked Sendable {
 
         let server = try IPCServer(socketPath: socket)
         self.server = server
-        server.authenticator = { token in try await service.authenticate(token: token) }
+        let userTokenPath = runtime + "/user.token"
+        guard (try? fm.destinationOfSymbolicLink(atPath: userTokenPath)) == nil else {
+            throw WorkshopError.invalidRequest("User token path is a symlink")
+        }
+        if !fm.fileExists(atPath: userTokenPath) {
+            var random = [UInt8](repeating: 0, count: 32)
+            guard SecRandomCopyBytes(kSecRandomDefault, random.count, &random) == errSecSuccess else {
+                throw WorkshopError.invalidRequest("Unable to generate desktop authentication")
+            }
+            try random.map { String(format: "%02x", $0) }.joined().write(toFile: userTokenPath, atomically: true, encoding: .utf8)
+            chmod(userTokenPath, 0o600)
+        }
+        let userToken = try String(contentsOfFile: userTokenPath).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard userToken.count == 64 else { throw WorkshopError.invalidRequest("Invalid desktop authentication file") }
+        server.requiresAuthentication = true
+        server.authenticator = { token in
+            if token == userToken { return .user }
+            return try await service.authenticate(token: token)
+        }
+        server.requestAuthorizer = { token, method, params in
+            try await service.authorizeWriterRequest(token: token, method: method, params: params)
+        }
         server.handler = { method, params, principal in
+            if principal != .user && !method.hasPrefix("workshop_") {
+                throw WorkshopError.invalidRequest("Desktop command requires authenticated user")
+            }
             switch method {
+            case "workshop.promoteWriterSnapshot":
+                try await service.promoteWriterSnapshot(id: params?["writer_id"]?.stringValue ?? "",
+                    verifiedDigest: params?["verified_digest"]?.stringValue ?? "", principal: principal)
+                return .object(["accepted": .bool(true)])
             case WorkshopProtocol.health:
                 return .object([
                     "status": .string("ok"),

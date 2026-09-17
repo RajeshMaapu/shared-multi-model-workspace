@@ -1,0 +1,6 @@
+interface:
+  display_name: "Team"
+  short_description: "Send a scoped task to Workshop; Fusion owns delivery"
+  default_prompt: "Use $team to submit the task we discussed to Workshop. Default to Fusion only; request Kimi and/or DeepSeek collaboration only when explicitly asked. Preserve the approved phase and report the real receipt and any unavailable integrations."
+policy:
+  allow_implicit_invocation: false

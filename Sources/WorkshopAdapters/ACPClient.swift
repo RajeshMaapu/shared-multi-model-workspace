@@ -95,10 +95,11 @@ public final class ProcessACPTransport: ACPTransport, @unchecked Sendable {
 
     public func terminate() {
         let pid = process.processIdentifier
-        if pid > 0 {
-            // Kill the process group (start_new_session semantics).
-            kill(-pid, SIGKILL)
-            process.terminate()
+        if pid > 0, process.isRunning {
+            // Foundation's post-spawn setpgid can fail. Never signal a group
+            // we have not verified, and never reuse an exited child's PID.
+            if getpgid(pid) == pid { kill(-pid, SIGKILL) }
+            if process.isRunning { process.terminate() }
         }
         try? stdinHandle.close()
     }
@@ -168,6 +169,14 @@ public actor ACPClient {
                 continuation.resume(throwing: error)
             }
         }
+    }
+
+    /// JSON-RPC notification: intentionally no id and no response waiter.
+    public func notify(_ method: String, params: JSONValue? = nil) throws {
+        var message: [String: JSONValue] = ["jsonrpc": .string("2.0"), "method": .string(method)]
+        if let params { message["params"] = params }
+        let data = try JSONEncoder().encode(JSONValue.object(message))
+        try transport.send(String(decoding: data, as: UTF8.self))
     }
 
     public func close() {

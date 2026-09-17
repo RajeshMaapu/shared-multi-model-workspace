@@ -1,16 +1,31 @@
-# Multi-model orchestration — Workshop, a macOS agent collaboration workspace
+# Shared Multi-Model Workspace
+
+Workshop — a macOS agent collaboration workspace.
 
 License: [Apache-2.0](LICENSE) — Copyright 2026 Maapu LLC.
 
 A local macOS community workspace where three AI engineers — Devin Fusion, Kimi K3, and DeepSeek V4.1 Flash — discuss and execute the user's tasks. It resembles a channel-and-thread chat: each top-level message creates a task, and opening it reveals the task's conversation, proposals, ownership, reviews, decisions, artifacts, and usage.
 
+![Workshop workspace showing channels, AI engineers, task threads, and the task board](docs/evidence/workspace-overview.png)
+
+*SwiftUI workspace shown with fake-adapter smoke-test data. The newer community web/Electron interface is a separate development preview.*
+
 The shared conversation is a first-class product surface. A single local daemon (`workshop-daemon`) owns task state, dispatch, ownership leases, and recovery over SQLite; the SwiftUI app talks to it over a private Unix-domain socket using JSON-RPC 2.0. Phase 1 uses a scripted fake adapter so every flow is deterministic; the real Devin/Kimi/DeepSeek harness adapters landed in Phase 2.
+
+## Development status
+
+This source snapshot includes the community web/Electron preview, explicit owner-only or requested-peer collaboration, durable task ingress, isolated writer-generation proposals, and authenticated desktop IPC. It is **development software, not a production-qualified release**. The SwiftUI app and its build commands remain available.
+
+Native writer qualification is limited to the specifically tested Fusion route. Other native routes, the Astra computer-operator integration, shared provider-capacity telemetry, and parts of the Electron lifecycle remain unqualified or incomplete. Local ad-hoc signing is not Developer ID signing or notarization.
+
+See the [community implementation status](docs/COMMUNITY_IMPLEMENTATION_STATUS.md), [native generation repair](docs/NATIVE_GENERATION_REPAIR.md), and [recorded validation](docs/evidence/native-generation-repair/validation.md). These reports describe their respective milestones; historical test results are not new live qualification.
 
 ## Prerequisites
 
 - macOS 14+ (developed on macOS 15.6.1, Apple Silicon)
 - Xcode 26.3 toolchain / Swift 6.2.4 (`swift` on PATH)
-- No third-party dependencies. SQLite via the system `libsqlite3`.
+- The Swift targets have no third-party package dependencies; SQLite uses the system `libsqlite3`.
+- The optional community web/Electron preview also uses Node.js and the pinned development dependencies in `package.json`.
 
 ## Commands
 
@@ -31,7 +46,7 @@ make screenshots   # capture the four evidence PNGs into docs/evidence/phase1/
   Kimi (ACP, `mcpServers` injection), and DeepSeek (direct tool loop) adapters;
   `mixed:<engineer>=fake,…` is available for tests.
 
-## Phase status
+## SwiftUI release history
 
 Phase 0–2 complete: task creation → durable commit → atomic claim → streamed
 replies → restart recovery, plus real Devin/Kimi/DeepSeek adapters, the

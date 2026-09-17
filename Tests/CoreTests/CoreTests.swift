@@ -54,6 +54,49 @@ final class CoreTests: XCTestCase {
         XCTAssertNotEqual(try canonicalJSONHash(of: ra), try canonicalJSONHash(of: rc))
     }
 
+    func testV1CanonicalHashUnchangedByV2Fields() throws {
+        struct LegacyRequest: Encodable {
+            var schemaVersion: Int
+            var idempotencyKey: String
+            var title: String
+            var objective: String
+            var phase: TaskPhase
+            var participants: [EngineerID]
+            var constraints: [String]
+            var sources: [String]
+            var workspaceRef: String?
+            var acceptanceCriteria: [String]
+            var budgetPolicyRef: String?
+            var channel: String
+            enum CodingKeys: String, CodingKey {
+                case schemaVersion = "schema_version"
+                case idempotencyKey = "idempotency_key"
+                case title, objective, phase, participants, constraints, sources
+                case workspaceRef = "workspace_ref"
+                case acceptanceCriteria = "acceptance_criteria"
+                case budgetPolicyRef = "budget_policy_ref"
+                case channel
+            }
+        }
+        let request = CreateTaskRequest(
+            idempotencyKey: "legacy-key", title: "T", objective: "O",
+            phase: .execution, participants: [.devin],
+            constraints: ["c"], sources: ["s"], workspaceRef: "w",
+            acceptanceCriteria: ["a"], budgetPolicyRef: "b", channel: "main")
+        let data = try JSONEncoder().encode(request)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNil(object["collaboration_mode"])
+        XCTAssertNil(object["origin"])
+        let legacy = LegacyRequest(
+            schemaVersion: 1, idempotencyKey: "legacy-key", title: "T",
+            objective: "O", phase: .execution, participants: [.devin],
+            constraints: ["c"], sources: ["s"], workspaceRef: "w",
+            acceptanceCriteria: ["a"], budgetPolicyRef: "b", channel: "main")
+        XCTAssertEqual(try canonicalJSONHash(of: request),
+                       try canonicalJSONHash(of: legacy))
+    }
+
     func testTaskStateTransitions() {
         // Every §8.2 edge.
         let edges: [(TaskState, TaskState)] = [

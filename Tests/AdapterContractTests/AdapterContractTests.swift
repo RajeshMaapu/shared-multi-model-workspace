@@ -78,6 +78,36 @@ final class AdapterContractTests: XCTestCase {
 
     // MARK: - ACPClient
 
+    func testCancelNotificationHasNoResponseID() async throws {
+        let transport = FakeACPTransport(responder: { line in
+            let message = try! JSONDecoder().decode(JSONValue.self, from: Data(line.utf8))
+            XCTAssertNil(message["id"])
+            XCTAssertEqual(message["method"]?.stringValue, "session/cancel")
+            return [] // Correct agents do not respond to a notification.
+        })
+        let client = ACPClient(transport: transport)
+        try await client.notify("session/cancel", params: .object(["sessionId": .string("s")]))
+        await client.close()
+    }
+
+    func testUnresponsiveCancelReturnsAndSessionCanReopen() async throws {
+        let responder = happyResponder()
+        let adapter = ACPHarnessAdapter(spec: spec(), transportFactory: { _, _ in
+            FakeACPTransport(responder: { line in
+                if line.contains("session/cancel") { return [] }
+                return responder(line)
+            })
+        }, cancellationTimeout: .milliseconds(60))
+        let ref = try await adapter.openTaskSession(binding: binding())
+        let start = ContinuousClock.now
+        let result = await adapter.cancelTurn(ref: ref, turnID: "missing-prompt")
+        XCTAssertFalse(result)
+        XCTAssertLessThan(start.duration(to: .now), .seconds(2))
+        let reopened = try await adapter.openTaskSession(binding: binding())
+        XCTAssertEqual(reopened.nativeSessionID, "sess-1")
+        _ = await adapter.cancelTurn(ref: reopened, turnID: "cleanup")
+    }
+
     func testCallCorrelatesByID() async throws {
         let transport = FakeACPTransport(responder: happyResponder())
         let client = ACPClient(transport: transport)
@@ -251,7 +281,8 @@ final class AdapterContractTests: XCTestCase {
                                                worktree: dir + "/worktrees/task_1",
                                                destination: dest)
         let text = try String(contentsOfFile: dest)
-        XCTAssertTrue(text.contains(#"(subpath "\#(dir!)/worktrees/task_1")"#))
+        let canonicalDir = ProfileBuilder.canonicalPath(dir!)
+        XCTAssertTrue(text.contains(#"(subpath "\#(canonicalDir)/worktrees/task_1")"#))
         XCTAssertTrue(text.contains(".local/share/devin/cli"))
         XCTAssertTrue(text.contains(#"(subpath "\#(NSHomeDirectory())/.claude")"#))
     }
@@ -363,7 +394,7 @@ final class AdapterContractTests: XCTestCase {
         XCTAssertEqual(tool?["tool_call_id"]?.stringValue, "call_1")
         XCTAssertEqual(tool?["content"]?.stringValue, #"{"ok":true}"#)
         // Session history persisted without reasoning_content.
-        let hist = dir + "/sessions/task_x/main.json"
+        let hist = dir + "/sessions/clean-v2/task_x/main.json"
         let histText = try String(contentsOfFile: hist)
         XCTAssertFalse(histText.contains("reasoning_content"))
         XCTAssertTrue(histText.contains("done"))

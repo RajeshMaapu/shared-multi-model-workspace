@@ -633,13 +633,13 @@ final class Phase4ServiceTests: XCTestCase {
         let version = try backupDB.query(
             "SELECT MAX(version) AS v FROM schema_migrations")
             .first?["v"]?.int
-        XCTAssertEqual(version, 4)
+        XCTAssertEqual(version, 7)
         let count = try backupDB.query("SELECT COUNT(*) AS c FROM tasks")
             .first?["c"]?.int ?? 0
         XCTAssertGreaterThanOrEqual(count, 1)
         let manifest = try JSONDecoder().decode(JSONValue.self, from: Data(
             contentsOf: URL(fileURLWithPath: dest + "/manifest.json")))
-        XCTAssertEqual(manifest["schema_version"]?.intValue, 4)
+        XCTAssertEqual(manifest["schema_version"]?.intValue, 7)
         if case .object(let hashes) = manifest["artifact_hashes"] {
             XCTAssertFalse(hashes.isEmpty)
         } else {

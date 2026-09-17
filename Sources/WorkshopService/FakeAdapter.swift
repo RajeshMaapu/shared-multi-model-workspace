@@ -20,6 +20,7 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
     }
 
     public let engineer: EngineerID
+    public let supportsIsolatedWorkspaceTurns = true
     /// Delay between streamed deltas. 0 in tests.
     public var delayPerDelta: Duration
     /// If set, the stream throws after emitting this many deltas.

@@ -16,6 +16,7 @@ public final class Connection: @unchecked Sendable {
     private var closed = false
     /// Principal bound to this connection by workshop.authenticate; .user default.
     var principal: Principal = .user
+    var token: String?
 
     init(fd: Int32) { self.fd = fd }
 
@@ -62,6 +63,8 @@ public final class IPCServer: @unchecked Sendable {
     /// principal (.user when unauthenticated). Throws WorkshopError.
     public var handler: ((String, JSONValue?, Principal) async throws -> JSONValue)?
     /// Resolve a capability token to a principal (workshop.authenticate).
+    public var requestAuthorizer: ((String?, String, JSONValue?) async throws -> Void)?
+    public var requiresAuthentication = false
     public var authenticator: ((String) async throws -> Principal)?
     /// Replay events after a seq for a new subscriber.
     public var replayEvents: ((Int64) -> [OutboxEvent])?
@@ -203,12 +206,30 @@ public final class IPCServer: @unchecked Sendable {
             return
         }
         Task {
-            if request.method == WorkshopProtocol.subscribe {
-                handleSubscribe(request: request, conn: conn)
-                return
-            }
             if request.method == WorkshopProtocol.authenticate {
                 handleAuthenticate(request: request, conn: conn)
+                return
+            }
+            if requiresAuthentication {
+                guard let token = conn.token, let authenticator else {
+                    sendError(id: request.id, code: -32001, message: "Authentication required", to: conn)
+                    return
+                }
+                do { conn.principal = try await authenticator(token) }
+                catch {
+                    sendError(id: request.id, code: -32001, message: "Authentication expired", to: conn)
+                    return
+                }
+            }
+            if let requestAuthorizer {
+                do { try await requestAuthorizer(conn.token, request.method, request.params) }
+                catch {
+                    sendError(id: request.id, code: -32001, message: "Request outside capability scope", to: conn)
+                    return
+                }
+            }
+            if request.method == WorkshopProtocol.subscribe {
+                handleSubscribe(request: request, conn: conn)
                 return
             }
             guard let handler else {
@@ -238,6 +259,7 @@ public final class IPCServer: @unchecked Sendable {
             }
             do {
                 conn.principal = try await authenticator(token)
+                conn.token = token
                 respond(id: request.id,
                         result: .object(["principal": .string(conn.principal.displayName)]),
                         to: conn)

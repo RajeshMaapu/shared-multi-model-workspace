@@ -100,6 +100,21 @@ final class MCPTests: XCTestCase {
         XCTAssertTrue(names.contains("workshop_renew_lease"))
         XCTAssertTrue(names.contains("workshop_release_lease"))
         XCTAssertEqual(names.count, 22)
+        let create = r["result"]?["tools"]?.arrayValue?
+            .first { $0["name"]?.stringValue == "workshop_create_task" }
+        let props = create?["inputSchema"]?["properties"]
+        for field in ["schema_version", "collaboration_mode", "origin",
+                      "idempotency_key", "title", "objective", "phase",
+                      "participants", "constraints", "sources", "workspace_ref",
+                      "acceptance_criteria", "budget_policy_ref", "channel"] {
+            XCTAssertNotNil(props?[field], "missing create_task field \(field)")
+        }
+        let modes = props?["collaboration_mode"]?["enum"]?.arrayValue?
+            .compactMap { $0.stringValue }
+        XCTAssertEqual(modes, ["owner_only", "requested_peers"])
+        let origin = props?["origin"]
+        XCTAssertEqual(origin?["required"]?.arrayValue?
+            .compactMap { $0.stringValue }, ["source_task_id", "invocation_id"])
     }
 
     func testUnknownToolIsError() async {

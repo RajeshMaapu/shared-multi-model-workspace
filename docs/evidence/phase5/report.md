@@ -1,7 +1,8 @@
 # Phase 5 evidence index
 
 - Codex transcripts (raw evidence retained privately, see
-  `docs/evidence/README.md`): run 1 created <redacted-task-id> via workshop_create_task (committed_seq 2, queued, deep
+  `docs/evidence/README.md`): run 1 created `<redacted-task-id>`
+  via workshop_create_task (committed_seq 2, queued, deep
   link present; model gpt-5.6-luna — configured gpt-6-astra needed a newer
   CLI); run 2 re-sent the same brief but the model used the untruncated
   64-char sha → distinct key → second task (fixed by key normalization,

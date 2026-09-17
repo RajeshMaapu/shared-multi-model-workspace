@@ -59,6 +59,31 @@ final class IPCTests: XCTestCase {
         return c
     }
 
+    func testAuthenticationRequiredAndRevokedOnExistingConnection() async throws {
+        actor Gate {
+            var enabled = true
+            func resolve(_ token: String) throws -> Principal {
+                guard enabled, token == "test-capability" else { throw IPCError.peerRejected }
+                return .codex
+            }
+            func revoke() { enabled = false }
+        }
+        let gate = Gate()
+        server.requiresAuthentication = true
+        server.authenticator = { try await gate.resolve($0) }
+        let c = try await client()
+        do { _ = try await c.call(WorkshopProtocol.health); XCTFail("Unauthenticated request succeeded") }
+        catch let error as WorkshopClient.RemoteError { XCTAssertEqual(error.code, -32001) }
+        do { _ = try await c.call(WorkshopProtocol.subscribe, params: .object(["after_seq": .number(0)])); XCTFail("Unauthenticated subscription succeeded") }
+        catch let error as WorkshopClient.RemoteError { XCTAssertEqual(error.code, -32001) }
+        _ = try await c.call(WorkshopProtocol.authenticate, params: .object(["token": .string("test-capability")]))
+        _ = try await c.call(WorkshopProtocol.health)
+        await gate.revoke()
+        do { _ = try await c.call(WorkshopProtocol.health); XCTFail("Revoked token succeeded on existing connection") }
+        catch let error as WorkshopClient.RemoteError { XCTAssertEqual(error.code, -32001) }
+        await c.disconnect()
+    }
+
     /// Raw socket for malformed input.
     private func rawConnect() throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)

@@ -445,6 +445,64 @@ public final class WorkshopRepository {
                   .text(WorkshopTime.string(now))])
     }
 
+    public func insertTaskWorkspace(_ workspace: TaskWorkspace) throws {
+        try db.execute("""
+            INSERT INTO task_workspaces(task_id, repository_path, branch, path, base_revision, state)
+            VALUES(?,?,?,?,?,?)
+            """, [.text(workspace.taskID.rawValue), workspace.repositoryPath.map(SQLiteValue.text),
+                  workspace.branch.map(SQLiteValue.text), .text(workspace.path),
+                  workspace.baseRevision.map(SQLiteValue.text), .text(workspace.state)])
+    }
+
+    public func taskWorkspace(_ taskID: TaskID) throws -> TaskWorkspace? {
+        guard let row = try db.query("SELECT * FROM task_workspaces WHERE task_id=?",
+                                     [.text(taskID.rawValue)]).first else { return nil }
+        return TaskWorkspace(taskID: taskID, repositoryPath: row["repository_path"]?.text,
+                             branch: row["branch"]?.text, path: row["path"]!.text!,
+                             baseRevision: row["base_revision"]?.text, state: row["state"]!.text!)
+    }
+
+    public func insertTaskIngress(taskID: TaskID, request: CreateTaskRequest,
+                                  principal: String) throws {
+        let requestJSON = String(decoding: try JSONEncoder().encode(request),
+                                 as: UTF8.self)
+        var sourceTaskID: SQLiteValue?
+        var invocationID: SQLiteValue?
+        if let origin = request.origin {
+            sourceTaskID = SQLiteValue.text(origin.sourceTaskID)
+            invocationID = SQLiteValue.text(origin.invocationID)
+        }
+        try db.execute("""
+            INSERT INTO task_ingress(task_id, principal, request_json,
+                                     source_task_id, invocation_id,
+                                     last_acknowledged_seq)
+            VALUES(?,?,?,?,?,0)
+            """, [
+                .text(taskID.rawValue), .text(principal), .text(requestJSON),
+                sourceTaskID, invocationID,
+            ])
+    }
+
+    public func taskIngress(_ taskID: TaskID) throws -> TaskIngress? {
+        guard let row = try db.query("""
+            SELECT request_json, principal, last_acknowledged_seq FROM task_ingress
+            WHERE task_id=?
+            """, [.text(taskID.rawValue)]).first else { return nil }
+        let request = try JSONDecoder().decode(CreateTaskRequest.self,
+                                               from: Data(row["request_json"]!.text!.utf8))
+        return TaskIngress(request: request, source: row["principal"]!.text!,
+                           lastAcknowledgedSeq: row["last_acknowledged_seq"]!.int ?? 0)
+    }
+
+    public func taskIDForOrigin(principal: String, sourceTaskID: String,
+                                invocationID: String) throws -> TaskID? {
+        try db.query("""
+            SELECT task_id FROM task_ingress
+            WHERE principal=? AND source_task_id=? AND invocation_id=?
+            """, [.text(principal), .text(sourceTaskID), .text(invocationID)])
+            .first?["task_id"]?.text.map { TaskID($0) }
+    }
+
     // MARK: - Outbox
 
     @discardableResult

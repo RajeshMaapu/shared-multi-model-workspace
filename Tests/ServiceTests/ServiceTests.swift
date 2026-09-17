@@ -50,6 +50,49 @@ final class ServiceTests: XCTestCase {
         XCTAssertEqual(adapters[0].turnCount, 1)
     }
 
+    func testExplicitCollaborationKeepsExistingPeersAndCleanInstructions() async throws {
+        let adapters = fakes()
+        let svc = try service(adapters: adapters)
+        let receipt = try await svc.createTask(request(
+            objective: "Collaborate with Kimi and DeepSeek on a joint architecture audit",
+            phase: .researchProposal))
+        await svc.start()
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline && adapters.contains(where: { $0.turnCount == 0 }) {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        for adapter in adapters {
+            XCTAssertEqual(adapter.turnCount, 1)
+            let packet = try XCTUnwrap(adapter.receivedContexts.first).packetText(for: adapter.engineer)
+            XCTAssertTrue(packet.contains("engage the existing requested peers"))
+            XCTAssertTrue(packet.contains("Incorporate their responses"))
+            XCTAssertTrue(packet.contains("do not spawn additional agents"))
+        }
+        let detail = try await svc.getTask(receipt.taskID)
+        XCTAssertEqual(detail.participants.count, 3)
+        await svc.shutdown()
+    }
+
+    func testLegacySessionIsPreservedAndNeverDispatched() async throws {
+        let setup = try service(adapters: fakes(), dispatcher: false, file: "legacy.sqlite")
+        let receipt = try await setup.createTask(request())
+        await setup.shutdown()
+        let repo = WorkshopRepository(db: try Database(path: dir + "/legacy.sqlite"))
+        try repo.saveSessionBinding(.init(taskID: receipt.taskID, engineerID: .devin,
+            role: "owner", workerID: "main", nativeSessionID: "personal-history-canary",
+            profileRevision: 1))
+        let adapters = fakes()
+        let resumed = try service(adapters: adapters, file: "legacy.sqlite")
+        await resumed.start(); await resumed.awaitIdle()
+        XCTAssertEqual(adapters.map(\.turnCount).reduce(0, +), 0)
+        let stored = try repo.sessionBinding(taskID: receipt.taskID, engineerID: .devin,
+                                             role: "owner", workerID: "main")
+        XCTAssertEqual(stored?.nativeSessionID, "personal-history-canary")
+        let messages = try await resumed.readMessages(receipt.taskID)
+        XCTAssertTrue(messages.contains { $0.body.contains("old history was not resumed") })
+        await resumed.shutdown()
+    }
+
     func testT02IdempotencyConflict() async throws {
         let svc = try service(adapters: fakes())
         _ = try await svc.createTask(request())

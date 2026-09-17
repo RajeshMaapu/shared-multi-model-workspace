@@ -1,0 +1,554 @@
+Building for debugging...
+[0/10] Write sources
+[2/10] Write swift-version--58304C5D6DBC2206.txt
+[4/8] Emitting module WorkshopAdapters
+<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:80:41: warning: converting non-Sendable function value to '@Sendable (String) -> String?' may introduce data races
+ 78 |                     = { try ProcessACPTransport(argv: $0.argv, env: $0.env, cwd: $1) },
+ 79 |                 versionProbe: @escaping @Sendable (String) -> String?
+ 80 |                     = ACPHarnessAdapter.defaultVersionProbe) {
+    |                                         `- warning: converting non-Sendable function value to '@Sendable (String) -> String?' may introduce data races
+ 81 |         self.engineer = spec.engineer
+ 82 |         self.spec = spec
+
+<isolated-checkout>/Sources/WorkshopAdapters/ACPClient.swift:135:20: warning: cannot access property 'readerTask' here in nonisolated initializer; this is an error in the Swift 6 language mode
+133 |         self.transport = transport
+134 |         let t = transport
+135 |         readerTask = Task { await self.readLoop(t.lines) }
+    |                    |      `- note: after making a copy of 'self', only nonisolated properties of 'self' can be accessed from this init
+    |                    `- warning: cannot access property 'readerTask' here in nonisolated initializer; this is an error in the Swift 6 language mode
+136 |     }
+137 | 
+[5/8] Compiling WorkshopAdapters Profiles.swift
+[6/9] Compiling WorkshopAdapters ACPHarness.swift
+<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:80:41: warning: converting non-Sendable function value to '@Sendable (String) -> String?' may introduce data races
+ 78 |                     = { try ProcessACPTransport(argv: $0.argv, env: $0.env, cwd: $1) },
+ 79 |                 versionProbe: @escaping @Sendable (String) -> String?
+ 80 |                     = ACPHarnessAdapter.defaultVersionProbe) {
+    |                                         `- warning: converting non-Sendable function value to '@Sendable (String) -> String?' may introduce data races
+ 81 |         self.engineer = spec.engineer
+ 82 |         self.spec = spec
+
+<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:161:22: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+159 |             } catch {
+160 |                 sessionID = try await newSession(client: client, cwd: cwd)
+161 |                 lock.lock()
+    |                      `- warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+162 |                 pendingNotes.append(
+163 |                     "Native session for \(engineer.rawValue) could not be loaded; "
+
+Foundation.NSLock.lock:2:11: note: 'lock()' declared here
+1 | class NSLock {
+2 | open func lock()}
+  |           `- note: 'lock()' declared here
+3 | 
+
+<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:165:22: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+163 |                     "Native session for \(engineer.rawValue) could not be loaded; "
+164 |                     + "started a new session (no checkpoint available yet)")
+165 |                 lock.unlock()
+    |                      `- warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+166 |             }
+167 |         } else if sessionID == nil {
+
+Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
+1 | class NSLock {
+2 | open func unlock()}
+  |           `- note: 'unlock()' declared here
+3 | 
+
+<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:199:19: warning: immutable value 'bridge' was never used; consider replacing with '_' or removing it [#no-usage]
+197 |         let env = spec.env
+198 |         let tokenKey = "WORKSHOP_TOKEN_\(engineer.rawValue.uppercased())"
+199 |         guard let bridge = env["WORKSHOP_MCP_PATH"]
+    |                   `- warning: immutable value 'bridge' was never used; consider replacing with '_' or removing it [#no-usage]
+200 |                 ?? ProcessInfo.processInfo.environment["WORKSHOP_MCP_PATH"],
+201 |               let tokenFile = env[tokenKey]
+
+<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:255:14: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+253 |     private func ensureClient(cwd: String) async throws {
+254 |         // Terminate a warm process after the idle bound.
+255 |         lock.lock()
+    |              `- warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+256 |         let stale = client != nil && Date().timeIntervalSince(lastActivity) > 600
+257 |         lock.unlock()
+
+Foundation.NSLock.lock:2:11: note: 'lock()' declared here
+1 | class NSLock {
+2 | open func lock()}
+  |           `- note: 'lock()' declared here
+3 | 
+
+<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:257:14: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+255 |         lock.lock()
+256 |         let stale = client != nil && Date().timeIntervalSince(lastActivity) > 600
+257 |         lock.unlock()
+    |              `- warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+258 |         if stale {
+259 |             await client?.close()
+
+Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
+1 | class NSLock {
+2 | open func unlock()}
+  |           `- note: 'unlock()' declared here
+3 | 
+
+<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:260:18: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+258 |         if stale {
+259 |             await client?.close()
+260 |             lock.lock(); client = nil; sessionID = nil; lock.unlock()
+    |                  `- warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+261 |         }
+262 |         guard client == nil else { return }
+
+Foundation.NSLock.lock:2:11: note: 'lock()' declared here
+1 | class NSLock {
+2 | open func lock()}
+  |           `- note: 'lock()' declared here
+3 | 
+
+<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:260:62: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+258 |         if stale {
+259 |             await client?.close()
+260 |             lock.lock(); client = nil; sessionID = nil; lock.unlock()
+    |                                                              `- warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+261 |         }
+262 |         guard client == nil else { return }
+
+Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
+1 | class NSLock {
+2 | open func unlock()}
+  |           `- note: 'unlock()' declared here
+3 | 
+
+<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:424:18: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+422 |         if !acknowledged {
+423 |             await client.close()
+424 |             lock.lock()
+    |                  `- warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+425 |             self.client = nil
+426 |             self.sessionID = nil
+
+Foundation.NSLock.lock:2:11: note: 'lock()' declared here
+1 | class NSLock {
+2 | open func lock()}
+  |           `- note: 'lock()' declared here
+3 | 
+
+<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:427:18: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+425 |             self.client = nil
+426 |             self.sessionID = nil
+427 |             lock.unlock()
+    |                  `- warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+428 |         }
+429 |         return acknowledged
+
+Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
+1 | class NSLock {
+2 | open func unlock()}
+  |           `- note: 'unlock()' declared here
+3 | 
+[7/15] Emitting module AdapterContractTests
+[8/15] Compiling AdapterContractTests AdapterContractTests.swift
+<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:82:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+ 80 | 
+ 81 |     func testCallCorrelatesByID() async throws {
+ 82 |         let transport = FakeACPTransport(responder: happyResponder())
+    |                                                     `- warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+ 83 |         let client = ACPClient(transport: transport)
+ 84 |         let result = try await client.call("initialize")
+
+<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:90:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+ 88 | 
+ 89 |     func testStreamMappingToAdapterEvents() async throws {
+ 90 |         let transport = FakeACPTransport(responder: happyResponder())
+    |                                                     `- warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+ 91 |         let adapter = ACPHarnessAdapter(
+ 92 |             spec: spec(), transportFactory: { _, _ in transport })
+
+<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:117:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+115 | 
+116 |     func testMalformedLinesAreSkipped() async throws {
+117 |         let transport = FakeACPTransport(responder: happyResponder())
+    |                                                     `- warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+118 |         let client = ACPClient(transport: transport)
+119 |         transport.inject("not json at all")
+
+<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:127:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+125 | 
+126 |     func testPermissionAllowOnceForWorkshopTool() async throws {
+127 |         let transport = FakeACPTransport(responder: happyResponder())
+    |                                                     `- warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+128 |         let client = ACPClient(transport: transport)
+129 |         transport.inject(#"{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"t1","title":"Calling workshop_ping from workshop","rawInput":{},"_meta":{"cognition.ai/toolName":"mcp__workshop__workshop_ping"}},"options":[{"optionId":"o1","name":"Approve once","kind":"allow_once"},{"optionId":"o2","name":"Reject","kind":"reject_once"}]}}"#)
+
+<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:141:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+139 | 
+140 |     func testPermissionRejectedForShellTool() async throws {
+141 |         let transport = FakeACPTransport(responder: happyResponder())
+    |                                                     `- warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+142 |         let client = ACPClient(transport: transport)
+143 |         transport.inject(#"{"jsonrpc":"2.0","id":98,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"t2","title":"Bash rm -rf /","rawInput":{},"_meta":{"cognition.ai/toolName":"shell"}},"options":[{"optionId":"a1","name":"Allow","kind":"allow_once"},{"optionId":"r1","name":"Reject","kind":"reject_once"}]}}"#)
+
+<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:156:14: warning: concurrently-executed local function 'encode' must be marked as '@Sendable'; this is an error in the Swift 6 language mode
+154 | 
+155 |     func testSessionLoadFailureFallsBackToNew() async throws {
+156 |         func encode(_ v: JSONValue) -> String {
+    |              `- warning: concurrently-executed local function 'encode' must be marked as '@Sendable'; this is an error in the Swift 6 language mode
+157 |             String(decoding: try! JSONEncoder().encode(v), as: UTF8.self)
+158 |         }
+
+<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:199:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+197 | 
+198 |     func testKimiSessionNewCarriesMCPServers() async throws {
+199 |         let transport = FakeACPTransport(responder: happyResponder())
+    |                                                     `- warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+200 |         let adapter = ACPHarnessAdapter(
+201 |             spec: spec(injection: .acpSessionParam, engineer: .kimi),
+
+<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:212:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+210 | 
+211 |     func testDevinWritesProjectMCPConfig() async throws {
+212 |         let transport = FakeACPTransport(responder: happyResponder())
+    |                                                     `- warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+213 |         let adapter = ACPHarnessAdapter(
+214 |             spec: spec(injection: .devinProjectConfigFile, engineer: .devin),
+
+<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:239:46: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+237 |     func testProbeUntestedVersionReported() async throws {
+238 |         let adapter = ACPHarnessAdapter(spec: spec()) { _, _ in
+239 |             FakeACPTransport(responder: self.happyResponder())
+    |                                              `- warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+240 |         } versionProbe: { _ in "9.9.9" }
+241 |         let probe = await adapter.probe()
+[9/15] Compiling AdapterContractTests CleanProfileTests.swift
+[10/16] Compiling WorkshopDaemonKit DaemonRuntime.swift
+<isolated-checkout>/Sources/WorkshopDaemonKit/DaemonRuntime.swift:471:29: warning: 'LSCopyDefaultHandlerForURLScheme' was deprecated in macOS 10.15: Use -[NSWorkspace URLForApplicationToOpenURL:] instead. [#DeprecatedDeclaration]
+469 |     /// True when Launch Services resolves `workshop://` to this app's bundle id.
+470 |     static func deepLinkRegistered() -> Bool {
+471 |         guard let handler = LSCopyDefaultHandlerForURLScheme("workshop" as CFString)?
+    |                             `- warning: 'LSCopyDefaultHandlerForURLScheme' was deprecated in macOS 10.15: Use -[NSWorkspace URLForApplicationToOpenURL:] instead. [#DeprecatedDeclaration]
+472 |             .takeRetainedValue() as? String else { return false }
+473 |         return handler == "ai.maapu.workshop"
+
+[#DeprecatedDeclaration]: <https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration>
+[11/16] Emitting module WorkshopDaemonKit
+[11/16] Write Objects.LinkFileList
+[13/16] Linking workshop-daemon
+[14/16] Applying workshop-daemon
+[15/16] Linking WorkshopPackageTests
+Build complete! (2.23s)
+Test Suite 'All tests' started at 2026-09-15 19:29:24.029.
+Test Suite 'WorkshopPackageTests.xctest' started at 2026-09-15 19:29:24.030.
+Test Suite 'AdapterContractTests' started at 2026-09-15 19:29:24.030.
+Test Case '-[AdapterContractTests.AdapterContractTests testCallCorrelatesByID]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testCallCorrelatesByID]' passed (0.006 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testCredentialScannerReadsKey]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testCredentialScannerReadsKey]' passed (0.002 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testDeepSeekAuthError]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testDeepSeekAuthError]' passed (0.002 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testDeepSeekHistoryCompaction]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testDeepSeekHistoryCompaction]' passed (0.002 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testDeepSeekIterationCap]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testDeepSeekIterationCap]' passed (0.011 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testDeepSeekQuotaError]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testDeepSeekQuotaError]' passed (0.002 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testDeepSeekToolLoopAndUsageMapping]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testDeepSeekToolLoopAndUsageMapping]' passed (0.002 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testDevinWritesProjectMCPConfig]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testDevinWritesProjectMCPConfig]' passed (0.002 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testKimiSessionNewCarriesMCPServers]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testKimiSessionNewCarriesMCPServers]' passed (0.002 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testMalformedLinesAreSkipped]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testMalformedLinesAreSkipped]' passed (0.001 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testPermissionAllowOnceForWorkshopTool]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testPermissionAllowOnceForWorkshopTool]' passed (0.102 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testPermissionRejectedForShellTool]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testPermissionRejectedForShellTool]' passed (0.105 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testProbeUnavailableForMissingBinary]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testProbeUnavailableForMissingBinary]' passed (0.001 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testProbeUntestedVersionReported]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testProbeUntestedVersionReported]' passed (0.001 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testSandboxProfileContainsWorktreeAllow]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testSandboxProfileContainsWorktreeAllow]' passed (0.001 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testSessionLoadFailureFallsBackToNew]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testSessionLoadFailureFallsBackToNew]' passed (0.002 seconds).
+Test Case '-[AdapterContractTests.AdapterContractTests testStreamMappingToAdapterEvents]' started.
+Test Case '-[AdapterContractTests.AdapterContractTests testStreamMappingToAdapterEvents]' passed (0.003 seconds).
+Test Suite 'AdapterContractTests' passed at 2026-09-15 19:29:24.280.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.248 (0.250) seconds
+Test Suite 'CleanProfileTests' started at 2026-09-15 19:29:24.280.
+Test Case '-[AdapterContractTests.CleanProfileTests testDevinDisablesInstructionImportsPreservesModelAndNativeSidekick]' started.
+Test Case '-[AdapterContractTests.CleanProfileTests testDevinDisablesInstructionImportsPreservesModelAndNativeSidekick]' passed (0.001 seconds).
+Test Case '-[AdapterContractTests.CleanProfileTests testEnvironmentExcludesPersonalHooks]' started.
+Test Case '-[AdapterContractTests.CleanProfileTests testEnvironmentExcludesPersonalHooks]' passed (0.000 seconds).
+Test Case '-[AdapterContractTests.CleanProfileTests testKimiProfileDriftIsRejectedWithoutDeletion]' started.
+Test Case '-[AdapterContractTests.CleanProfileTests testKimiProfileDriftIsRejectedWithoutDeletion]' passed (0.002 seconds).
+Test Case '-[AdapterContractTests.CleanProfileTests testProfileSymlinkDriftDoesNotOverwriteTarget]' started.
+Test Case '-[AdapterContractTests.CleanProfileTests testProfileSymlinkDriftDoesNotOverwriteTarget]' passed (0.001 seconds).
+Test Case '-[AdapterContractTests.CleanProfileTests testSandboxBlocksInstructionCanariesButAllowsSourceAndNativeSkill]' started.
+Test Case '-[AdapterContractTests.CleanProfileTests testSandboxBlocksInstructionCanariesButAllowsSourceAndNativeSkill]' passed (0.407 seconds).
+Test Suite 'CleanProfileTests' passed at 2026-09-15 19:29:24.692.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.411 (0.412) seconds
+Test Suite 'CodexBridgeTests' started at 2026-09-15 19:29:24.692.
+Test Case '-[MCPTests.CodexBridgeTests testCodexForbiddenActions]' started.
+Test Case '-[MCPTests.CodexBridgeTests testCodexForbiddenActions]' passed (0.039 seconds).
+Test Case '-[MCPTests.CodexBridgeTests testCodexPostMessageVia]' started.
+Test Case '-[MCPTests.CodexBridgeTests testCodexPostMessageVia]' passed (0.022 seconds).
+Test Case '-[MCPTests.CodexBridgeTests testCodexTokenAuthenticates]' started.
+Test Case '-[MCPTests.CodexBridgeTests testCodexTokenAuthenticates]' passed (0.009 seconds).
+Test Case '-[MCPTests.CodexBridgeTests testCreateTaskDeepLinkWhenRegistered]' started.
+Test Case '-[MCPTests.CodexBridgeTests testCreateTaskDeepLinkWhenRegistered]' passed (0.016 seconds).
+Test Case '-[MCPTests.CodexBridgeTests testCreateTaskIdempotencyConflict]' started.
+Test Case '-[MCPTests.CodexBridgeTests testCreateTaskIdempotencyConflict]' passed (0.018 seconds).
+Test Case '-[MCPTests.CodexBridgeTests testCreateTaskIdempotentDuplicate]' started.
+Test Case '-[MCPTests.CodexBridgeTests testCreateTaskIdempotentDuplicate]' passed (0.020 seconds).
+Test Case '-[MCPTests.CodexBridgeTests testCreateTaskKeyNormalization]' started.
+Test Case '-[MCPTests.CodexBridgeTests testCreateTaskKeyNormalization]' passed (0.037 seconds).
+Test Case '-[MCPTests.CodexBridgeTests testOfflineBridgeStillServesTools]' started.
+Test Case '-[MCPTests.CodexBridgeTests testOfflineBridgeStillServesTools]' passed (0.009 seconds).
+Test Suite 'CodexBridgeTests' passed at 2026-09-15 19:29:24.862.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 0.169 (0.170) seconds
+Test Suite 'CoreTests' started at 2026-09-15 19:29:24.862.
+Test Case '-[CoreTests.CoreTests testCanonicalHashStableUnderKeyReordering]' started.
+Test Case '-[CoreTests.CoreTests testCanonicalHashStableUnderKeyReordering]' passed (0.000 seconds).
+Test Case '-[CoreTests.CoreTests testCreateTaskRequestSnakeCaseRoundTrip]' started.
+Test Case '-[CoreTests.CoreTests testCreateTaskRequestSnakeCaseRoundTrip]' passed (0.000 seconds).
+Test Case '-[CoreTests.CoreTests testTaskStateTransitions]' started.
+Test Case '-[CoreTests.CoreTests testTaskStateTransitions]' passed (0.000 seconds).
+Test Suite 'CoreTests' passed at 2026-09-15 19:29:24.863.
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds
+Test Suite 'IPCTests' started at 2026-09-15 19:29:24.863.
+Test Case '-[IPCTests.IPCTests testHealthRoundtrip]' started.
+Test Case '-[IPCTests.IPCTests testHealthRoundtrip]' passed (0.006 seconds).
+Test Case '-[IPCTests.IPCTests testInvalidJSONThenValidCall]' started.
+Test Case '-[IPCTests.IPCTests testInvalidJSONThenValidCall]' passed (0.006 seconds).
+Test Case '-[IPCTests.IPCTests testOverLimitLine]' started.
+Test Case '-[IPCTests.IPCTests testOverLimitLine]' passed (7.239 seconds).
+Test Case '-[IPCTests.IPCTests testSubscribeReceivesEventAfterCreateTask]' started.
+Test Case '-[IPCTests.IPCTests testSubscribeReceivesEventAfterCreateTask]' passed (0.011 seconds).
+Test Case '-[IPCTests.IPCTests testUnknownMethod]' started.
+Test Case '-[IPCTests.IPCTests testUnknownMethod]' passed (0.007 seconds).
+Test Suite 'IPCTests' passed at 2026-09-15 19:29:32.133.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 7.269 (7.270) seconds
+Test Suite 'LatencyBench' started at 2026-09-15 19:29:32.133.
+Test Case '-[ServiceTests.LatencyBench testLatencyBench]' started.
+2026-09-15 19:29:40.146 xctest[89821:30817701] LatencyBench committed_event_visible p50=0.72ms p95=2.07ms
+2026-09-15 19:29:40.146 xctest[89821:30817701] LatencyBench create_task_receipt p50=7.82ms p95=13.43ms
+2026-09-15 19:29:40.146 xctest[89821:30817701] LatencyBench open_task_5000msg_newest_page p50=28.96ms p95=32.13ms
+2026-09-15 19:29:40.146 xctest[89821:30817701] LatencyBench wakeup_queued p50=0.15ms p95=0.85ms
+Test Case '-[ServiceTests.LatencyBench testLatencyBench]' passed (8.014 seconds).
+Test Suite 'LatencyBench' passed at 2026-09-15 19:29:40.147.
+	 Executed 1 test, with 0 failures (0 unexpected) in 8.014 (8.014) seconds
+Test Suite 'LiveSmokeTests' started at 2026-09-15 19:29:40.148.
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL1Devin]' started.
+<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL1Devin] : Test skipped - WORKSHOP_LIVE not set
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL1Devin]' skipped (0.001 seconds).
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL2Kimi]' started.
+<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL2Kimi] : Test skipped - WORKSHOP_LIVE not set
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL2Kimi]' skipped (0.000 seconds).
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL3DeepSeek]' started.
+<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL3DeepSeek] : Test skipped - WORKSHOP_LIVE not set
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL3DeepSeek]' skipped (0.000 seconds).
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL4PeerRoundtrip]' started.
+<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL4PeerRoundtrip] : Test skipped - WORKSHOP_LIVE not set
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL4PeerRoundtrip]' skipped (0.000 seconds).
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL5RestartRecall]' started.
+<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL5RestartRecall] : Test skipped - WORKSHOP_LIVE not set
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL5RestartRecall]' skipped (0.000 seconds).
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL6ResearchApprovalAllocation]' started.
+<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL6ResearchApprovalAllocation] : Test skipped - WORKSHOP_LIVE not set
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL6ResearchApprovalAllocation]' skipped (0.000 seconds).
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL7DeepSeekBalance]' started.
+<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:452: -[LiveSmokeTests.LiveSmokeTests testL7DeepSeekBalance] : Test skipped - WORKSHOP_LIVE not set
+Test Case '-[LiveSmokeTests.LiveSmokeTests testL7DeepSeekBalance]' skipped (0.000 seconds).
+Test Suite 'LiveSmokeTests' passed at 2026-09-15 19:29:40.151.
+	 Executed 7 tests, with 7 tests skipped and 0 failures (0 unexpected) in 0.003 (0.003) seconds
+Test Suite 'MCPTests' started at 2026-09-15 19:29:40.151.
+Test Case '-[MCPTests.MCPTests testEngineerNotParticipantRejected]' started.
+Test Case '-[MCPTests.MCPTests testEngineerNotParticipantRejected]' passed (0.021 seconds).
+Test Case '-[MCPTests.MCPTests testInitializePinsProtocolVersion]' started.
+Test Case '-[MCPTests.MCPTests testInitializePinsProtocolVersion]' passed (0.007 seconds).
+Test Case '-[MCPTests.MCPTests testNotificationsIgnored]' started.
+Test Case '-[MCPTests.MCPTests testNotificationsIgnored]' passed (0.007 seconds).
+Test Case '-[MCPTests.MCPTests testToolsCallRoundtripThroughDaemon]' started.
+Test Case '-[MCPTests.MCPTests testToolsCallRoundtripThroughDaemon]' passed (0.017 seconds).
+Test Case '-[MCPTests.MCPTests testToolsListContainsWorkshopTools]' started.
+Test Case '-[MCPTests.MCPTests testToolsListContainsWorkshopTools]' passed (0.009 seconds).
+Test Case '-[MCPTests.MCPTests testUnknownMethod]' started.
+Test Case '-[MCPTests.MCPTests testUnknownMethod]' passed (0.005 seconds).
+Test Case '-[MCPTests.MCPTests testUnknownToolIsError]' started.
+Test Case '-[MCPTests.MCPTests testUnknownToolIsError]' passed (0.007 seconds).
+Test Suite 'MCPTests' passed at 2026-09-15 19:29:40.224.
+	 Executed 7 tests, with 0 failures (0 unexpected) in 0.073 (0.074) seconds
+Test Suite 'MigrationV2Tests' started at 2026-09-15 19:29:40.224.
+Test Case '-[StoreTests.MigrationV2Tests testV1ToV2PreservesData]' started.
+Test Case '-[StoreTests.MigrationV2Tests testV1ToV2PreservesData]' passed (0.008 seconds).
+Test Case '-[StoreTests.MigrationV2Tests testV3ToV4PreservesData]' started.
+Test Case '-[StoreTests.MigrationV2Tests testV3ToV4PreservesData]' passed (0.010 seconds).
+Test Suite 'MigrationV2Tests' passed at 2026-09-15 19:29:40.242.
+	 Executed 2 tests, with 0 failures (0 unexpected) in 0.018 (0.018) seconds
+Test Suite 'Phase2ServiceTests' started at 2026-09-15 19:29:40.242.
+Test Case '-[ServiceTests.Phase2ServiceTests testAuthenticateResolvesToken]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testAuthenticateResolvesToken]' passed (0.016 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testAuthorComesFromPrincipalNotParams]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testAuthorComesFromPrincipalNotParams]' passed (0.018 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testCapacityReportsUnknown]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testCapacityReportsUnknown]' passed (0.016 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testEngineerCannotPostToNonParticipantTask]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testEngineerCannotPostToNonParticipantTask]' passed (0.015 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testMentionWakesMentionedEngineer]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testMentionWakesMentionedEngineer]' passed (0.043 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testPhaseGatedToolsReturnMethodNotFound]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testPhaseGatedToolsReturnMethodNotFound]' passed (0.022 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testPublishArtifactRejectsTraversalAndSymlink]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testPublishArtifactRejectsTraversalAndSymlink]' passed (0.068 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testPublishArtifactSuccess]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testPublishArtifactSuccess]' passed (0.028 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testReportResultByNonOwnerRejected]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testReportResultByNonOwnerRejected]' passed (0.016 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testReportResultByOwnerMarksReview]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testReportResultByOwnerMarksReview]' passed (0.022 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testSaveCheckpoint]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testSaveCheckpoint]' passed (0.024 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testUnmentionedPeerNotWoken]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testUnmentionedPeerNotWoken]' passed (0.322 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testUserReplyWakesOwner]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testUserReplyWakesOwner]' passed (0.047 seconds).
+Test Case '-[ServiceTests.Phase2ServiceTests testWakeupLoopBoundSuppresses]' started.
+Test Case '-[ServiceTests.Phase2ServiceTests testWakeupLoopBoundSuppresses]' passed (0.016 seconds).
+Test Suite 'Phase2ServiceTests' passed at 2026-09-15 19:29:40.916.
+	 Executed 14 tests, with 0 failures (0 unexpected) in 0.672 (0.674) seconds
+Test Suite 'Phase3ServiceTests' started at 2026-09-15 19:29:40.916.
+Test Case '-[ServiceTests.Phase3ServiceTests testApproveCreatesSubtasksAndWakesDevin]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testApproveCreatesSubtasksAndWakesDevin]' passed (0.029 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testAssignDependencyGatingCASAndDispute]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testAssignDependencyGatingCASAndDispute]' passed (0.034 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testCancelWhileRunningRequestsThenCompletes]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testCancelWhileRunningRequestsThenCompletes]' passed (0.068 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testConsolidateWakesDevinOnly]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testConsolidateWakesDevinOnly]' passed (0.031 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testDevinUnavailableConsolidationWaits]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testDevinUnavailableConsolidationWaits]' passed (0.083 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testDraftProposalsInvisibleToPeers]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testDraftProposalsInvisibleToPeers]' passed (0.021 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testEscalateThenConvertToResearch]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testEscalateThenConvertToResearch]' passed (0.043 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testNeedsChangesReturnsToOwner]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testNeedsChangesReturnsToOwner]' passed (0.042 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testPauseCancelsRunningTurn]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testPauseCancelsRunningTurn]' passed (0.046 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testProportionalReviewVerifiesAndCompletes]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testProportionalReviewVerifiesAndCompletes]' passed (0.035 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testPublishTogetherRecordsMissing]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testPublishTogetherRecordsMissing]' passed (0.019 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testRecoveryMessageReflectsOutcome]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testRecoveryMessageReflectsOutcome]' passed (0.028 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testStaleRevisionAndEngineerApprovalRejected]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testStaleRevisionAndEngineerApprovalRejected]' passed (0.020 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testT07ImplementationToolsGatedBeforeApproval]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testT07ImplementationToolsGatedBeforeApproval]' passed (0.015 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testT08NewRevisionInvalidatesApproval]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testT08NewRevisionInvalidatesApproval]' passed (0.028 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testToolMessageOrdersBeforeStreamedReply]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testToolMessageOrdersBeforeStreamedReply]' passed (0.040 seconds).
+Test Case '-[ServiceTests.Phase3ServiceTests testToolOnlyTurnLeavesNoEmptyMessage]' started.
+Test Case '-[ServiceTests.Phase3ServiceTests testToolOnlyTurnLeavesNoEmptyMessage]' passed (0.039 seconds).
+Test Suite 'Phase3ServiceTests' passed at 2026-09-15 19:29:41.538.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.620 (0.622) seconds
+Test Suite 'Phase4ServiceTests' started at 2026-09-15 19:29:41.538.
+Test Case '-[ServiceTests.Phase4ServiceTests testCheckpointValidation]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testCheckpointValidation]' passed (0.038 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testCorruptCheckpointSkipped]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testCorruptCheckpointSkipped]' passed (0.020 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testDiagnosticsShape]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testDiagnosticsShape]' passed (0.012 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testInterruptedTurnWithoutCheckpointBlocks]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testInterruptedTurnWithoutCheckpointBlocks]' passed (0.015 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testLeaseSweeperBlocksExpiredWithoutRunningTurn]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testLeaseSweeperBlocksExpiredWithoutRunningTurn]' passed (0.014 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testNilCountersMakeRemainingUnknown]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testNilCountersMakeRemainingUnknown]' passed (0.014 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testOutboxDeliveryCursorAndDedup]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testOutboxDeliveryCursorAndDedup]' passed (0.015 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testSearchFindsMessages]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testSearchFindsMessages]' passed (0.014 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT05StaleGenerationFenced]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT05StaleGenerationFenced]' passed (0.024 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT06ArtifactIdempotentAndInterruptedResume]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT06ArtifactIdempotentAndInterruptedResume]' passed (0.037 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT13CriticalCapacityBlocksDispatch]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT13CriticalCapacityBlocksDispatch]' passed (0.016 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT14UnknownCapacityDistinct]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT14UnknownCapacityDistinct]' passed (0.011 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT15AllUnavailableKeepsTaskDurable]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT15AllUnavailableKeepsTaskDurable]' passed (0.026 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT23CancellationAcknowledgedAndUncertain]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT23CancellationAcknowledgedAndUncertain]' passed (0.234 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT24ResourceLeaseCAS]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT24ResourceLeaseCAS]' passed (0.009 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT29ReconcileOnStart]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT29ReconcileOnStart]' passed (0.016 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT30StorageGuard]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT30StorageGuard]' passed (0.024 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT31MessagePaging]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT31MessagePaging]' passed (0.179 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT32Redaction]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT32Redaction]' passed (0.020 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testT38BackupWhileWriting]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testT38BackupWhileWriting]' passed (0.036 seconds).
+Test Case '-[ServiceTests.Phase4ServiceTests testWakeReconcileDeadProcess]' started.
+Test Case '-[ServiceTests.Phase4ServiceTests testWakeReconcileDeadProcess]' passed (0.018 seconds).
+Test Suite 'Phase4ServiceTests' passed at 2026-09-15 19:29:42.331.
+	 Executed 21 tests, with 0 failures (0 unexpected) in 0.791 (0.793) seconds
+Test Suite 'ServiceTests' started at 2026-09-15 19:29:42.331.
+Test Case '-[ServiceTests.ServiceTests testExplicitCollaborationKeepsExistingPeersAndCleanInstructions]' started.
+Test Case '-[ServiceTests.ServiceTests testExplicitCollaborationKeepsExistingPeersAndCleanInstructions]' passed (0.530 seconds).
+Test Case '-[ServiceTests.ServiceTests testFailedTurnDoesNotReportComplete]' started.
+Test Case '-[ServiceTests.ServiceTests testFailedTurnDoesNotReportComplete]' passed (0.012 seconds).
+Test Case '-[ServiceTests.ServiceTests testInterruptedStreamMarkedUncertain]' started.
+Test Case '-[ServiceTests.ServiceTests testInterruptedStreamMarkedUncertain]' passed (0.008 seconds).
+Test Case '-[ServiceTests.ServiceTests testLegacySessionIsPreservedAndNeverDispatched]' started.
+Test Case '-[ServiceTests.ServiceTests testLegacySessionIsPreservedAndNeverDispatched]' passed (0.012 seconds).
+Test Case '-[ServiceTests.ServiceTests testNoEligibleEngineerBlocksWithoutRetry]' started.
+Test Case '-[ServiceTests.ServiceTests testNoEligibleEngineerBlocksWithoutRetry]' passed (0.011 seconds).
+Test Case '-[ServiceTests.ServiceTests testPoisonedDispatchRowFailsAndLoopContinues]' started.
+Test Case '-[ServiceTests.ServiceTests testPoisonedDispatchRowFailsAndLoopContinues]' passed (0.013 seconds).
+Test Case '-[ServiceTests.ServiceTests testResearchProposalEntersResearching]' started.
+Test Case '-[ServiceTests.ServiceTests testResearchProposalEntersResearching]' passed (0.532 seconds).
+Test Case '-[ServiceTests.ServiceTests testT01IdempotentCreate]' started.
+Test Case '-[ServiceTests.ServiceTests testT01IdempotentCreate]' passed (0.014 seconds).
+Test Case '-[ServiceTests.ServiceTests testT02IdempotencyConflict]' started.
+Test Case '-[ServiceTests.ServiceTests testT02IdempotencyConflict]' passed (0.011 seconds).
+Test Case '-[ServiceTests.ServiceTests testT03PreDispatchCrashRecovery]' started.
+Test Case '-[ServiceTests.ServiceTests testT03PreDispatchCrashRecovery]' passed (0.012 seconds).
+Test Case '-[ServiceTests.ServiceTests testT04AtomicClaimSingleWinner]' started.
+Test Case '-[ServiceTests.ServiceTests testT04AtomicClaimSingleWinner]' passed (0.006 seconds).
+Test Case '-[ServiceTests.ServiceTests testT09OneEngineerDoesWork]' started.
+Test Case '-[ServiceTests.ServiceTests testT09OneEngineerDoesWork]' passed (0.012 seconds).
+Test Case '-[ServiceTests.ServiceTests testT28ReopenPreservesState]' started.
+Test Case '-[ServiceTests.ServiceTests testT28ReopenPreservesState]' passed (0.012 seconds).
+Test Case '-[ServiceTests.ServiceTests testUsageSampleKeepsUnknownCache]' started.
+Test Case '-[ServiceTests.ServiceTests testUsageSampleKeepsUnknownCache]' passed (0.011 seconds).
+Test Suite 'ServiceTests' passed at 2026-09-15 19:29:43.529.
+	 Executed 14 tests, with 0 failures (0 unexpected) in 1.196 (1.198) seconds
+Test Suite 'StoreTests' started at 2026-09-15 19:29:43.529.
+Test Case '-[StoreTests.StoreTests testCASClaim]' started.
+Test Case '-[StoreTests.StoreTests testCASClaim]' passed (0.006 seconds).
+Test Case '-[StoreTests.StoreTests testForeignKeyViolationThrows]' started.
+Test Case '-[StoreTests.StoreTests testForeignKeyViolationThrows]' passed (0.006 seconds).
+Test Case '-[StoreTests.StoreTests testMigrationAppliesAndIsIdempotent]' started.
+Test Case '-[StoreTests.StoreTests testMigrationAppliesAndIsIdempotent]' passed (0.006 seconds).
+Test Case '-[StoreTests.StoreTests testPragmas]' started.
+Test Case '-[StoreTests.StoreTests testPragmas]' passed (0.001 seconds).
+Test Case '-[StoreTests.StoreTests testTransactionRollback]' started.
+Test Case '-[StoreTests.StoreTests testTransactionRollback]' passed (0.006 seconds).
+Test Suite 'StoreTests' passed at 2026-09-15 19:29:43.553.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.024 (0.024) seconds
+Test Suite 'WorkshopPackageTests.xctest' passed at 2026-09-15 19:29:43.553.
+	 Executed 126 tests, with 7 tests skipped and 0 failures (0 unexpected) in 19.511 (19.523) seconds
+Test Suite 'All tests' passed at 2026-09-15 19:29:43.553.
+	 Executed 126 tests, with 7 tests skipped and 0 failures (0 unexpected) in 19.511 (19.524) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.

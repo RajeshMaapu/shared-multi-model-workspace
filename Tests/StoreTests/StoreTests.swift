@@ -24,7 +24,8 @@ final class StoreTests: XCTestCase {
                 .compactMap { $0["name"]?.text }
             for expected in ["tasks", "participants", "messages", "subtasks",
                              "operations", "outbox", "session_bindings", "schema_migrations",
-                             "artifacts", "usage_samples", "wakeups", "checkpoints"] {
+                             "artifacts", "usage_samples", "wakeups", "checkpoints",
+                             "task_ingress"] {
                 XCTAssertTrue(tables.contains(expected), "missing table \(expected)")
             }
         }
@@ -34,7 +35,7 @@ final class StoreTests: XCTestCase {
             try Migrations.all.migrate(db)
             let count = try db.query("SELECT COUNT(*) AS c FROM schema_migrations")
                 .first?["c"]?.int
-            XCTAssertEqual(count, 4)
+            XCTAssertEqual(count, 7)
         }
     }
 

@@ -11,6 +11,7 @@ public actor WorkshopClient {
 
     private var fd: Int32 = -1
     private var nextID: Int64 = 1
+    private var authenticated = false
     private var pending: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
     private var notificationContinuations: [UUID: AsyncStream<JSONRPCNotification>.Continuation] = [:]
     private let socketPath: String
@@ -47,6 +48,7 @@ public actor WorkshopClient {
             Darwin.close(s)
             throw IPCError.notConnected
         }
+        authenticated = false
         fd = s
         let capturedFD = s
         Thread { [weak self] in self?.readLoop(fd: capturedFD) }.start()
@@ -75,6 +77,19 @@ public actor WorkshopClient {
 
     /// One JSON-RPC call.
     public func call(_ method: String, params: JSONValue? = nil) async throws -> JSONValue {
+        if method != WorkshopProtocol.authenticate, !authenticated {
+            let path = (socketPath as NSString).deletingLastPathComponent + "/user.token"
+            if let token = try? String(contentsOfFile: path).trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+                _ = try await rawCall(WorkshopProtocol.authenticate, params: .object(["token": .string(token)]))
+                authenticated = true
+            }
+        }
+        let result = try await rawCall(method, params: params)
+        if method == WorkshopProtocol.authenticate { authenticated = true }
+        return result
+    }
+
+    private func rawCall(_ method: String, params: JSONValue? = nil) async throws -> JSONValue {
         let id = nextID
         nextID += 1
         return try await withCheckedThrowingContinuation { continuation in

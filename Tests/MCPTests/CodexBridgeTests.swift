@@ -162,6 +162,29 @@ final class CodexBridgeTests: XCTestCase {
         }
     }
 
+    func testCodexRootMessageViaAndFollowUp() async throws {
+        let r = try await service.callTool(
+            "workshop_create_task", args: createArgs(key: "codex-root"),
+            principal: codex)
+        let taskID = TaskID(r["task_id"]!.stringValue!)
+        let messages = try await service.readMessages(taskID)
+        let root = try XCTUnwrap(messages.first { $0.seq == 1 })
+        XCTAssertEqual(root.author, .user)
+        let structured = root.structured
+            .flatMap { try? JSONDecoder().decode(JSONValue.self,
+                                                 from: Data($0.utf8)) }
+        XCTAssertEqual(structured?["via"]?.stringValue, "codex")
+        _ = try await service.callTool(
+            "workshop_post_message",
+            args: .object(["task_id": .string(taskID.rawValue),
+                           "body": .string("follow-up body")]),
+            principal: codex)
+        let tasks = try await service.listTasks()
+        XCTAssertEqual(tasks.count, 1)
+        let after = try await service.readMessages(taskID)
+        XCTAssertTrue(after.contains { $0.body == "follow-up body" })
+    }
+
     /// Codex-posted messages: author user, via=codex in structured, wakes owner.
     func testCodexPostMessageVia() async throws {
         let receipt = try await service.createTask(CreateTaskRequest(
