@@ -159,7 +159,7 @@ final class AdapterContractTests: XCTestCase {
     func testPermissionAllowOnceForWorkshopTool() async throws {
         let transport = FakeACPTransport(responder: happyResponder())
         let client = ACPClient(transport: transport)
-        transport.inject(#"{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"t1","title":"Calling workshop_ping from workshop","rawInput":{},"_meta":{"cognition.ai/toolName":"mcp__workshop__workshop_ping"}},"options":[{"optionId":"o1","name":"Approve once","kind":"allow_once"},{"optionId":"o2","name":"Reject","kind":"reject_once"}]}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"t1","title":"Calling workshop_post_message from workshop","rawInput":{},"_meta":{"cognition.ai/toolName":"mcp__workshop__workshop_post_message"}},"options":[{"optionId":"o1","name":"Approve once","kind":"allow_once"},{"optionId":"o2","name":"Reject","kind":"reject_once"}]}}"#)
         try await Task.sleep(for: .milliseconds(100))
         let reply = transport.sentLines.compactMap { l -> JSONValue? in
             let j = self.json(l)
@@ -181,6 +181,242 @@ final class AdapterContractTests: XCTestCase {
         }.last
         XCTAssertEqual(reply?["result"]?["outcome"]?["optionId"]?.stringValue, "r1")
         await client.close()
+    }
+
+    func testShellPermissionCannotBeGrantedByDisplayTitle() async throws {
+        for title in ["Read harmless-looking command", "Run tests for workshop"] {
+            let transport = FakeACPTransport(responder: happyResponder())
+            let client = ACPClient(transport: transport)
+            let request: JSONValue = .object([
+                "jsonrpc": .string("2.0"), "id": .number(97),
+                "method": .string("session/request_permission"),
+                "params": .object([
+                    "sessionId": .string("s"),
+                    "toolCall": .object(["toolCallId": .string("t"), "title": .string(title),
+                        "rawInput": .object(["command": .string("unapproved command")]),
+                        "_meta": .object(["cognition.ai/toolName": .string("exec")])]),
+                    "options": .array([
+                        .object(["optionId": .string("allow"), "kind": .string("allow_once"), "name": .string("Allow")]),
+                        .object(["optionId": .string("deny"), "kind": .string("reject_once"), "name": .string("Reject")])])])])
+            transport.inject(String(decoding: try JSONEncoder().encode(request), as: UTF8.self))
+            try await Task.sleep(for: .milliseconds(100))
+            let response = transport.sentLines.map(json).last { $0["id"]?.intValue == 97 }
+            XCTAssertEqual(response?["result"]?["outcome"]?["optionId"]?.stringValue, "deny")
+            await client.close()
+        }
+    }
+
+    func testPermissionWithoutRejectOptionNeverSelectsAllow() async throws {
+        let transport = FakeACPTransport(responder: happyResponder())
+        let client = ACPClient(transport: transport)
+        transport.inject(#"{"jsonrpc":"2.0","id":96,"method":"session/request_permission","params":{"toolCall":{"toolCallId":"t","title":"Unapproved execution","_meta":{"cognition.ai/toolName":"exec"}},"options":[{"optionId":"allow","kind":"allow_once","name":"Allow"}]}}"#)
+        try await Task.sleep(for: .milliseconds(100))
+        let response = transport.sentLines.map(json).last { $0["id"]?.intValue == 96 }
+        XCTAssertNotEqual(response?["result"]?["outcome"]?["optionId"]?.stringValue, "allow")
+        await client.close()
+    }
+
+    func testPermissionAllowAlwaysOnlyCancels() async throws {
+        let transport = FakeACPTransport(responder: happyResponder())
+        let client = ACPClient(transport: transport)
+        transport.inject(#"{"jsonrpc":"2.0","id":95,"method":"session/request_permission","params":{"toolCall":{"toolCallId":"t","_meta":{"cognition.ai/toolName":"mcp__workshop__workshop_post_message"}},"options":[{"optionId":"aa","kind":"allow_always","name":"Always allow"}]}}"#)
+        try await Task.sleep(for: .milliseconds(100))
+        let response = transport.sentLines.map(json).last { $0["id"]?.intValue == 95 }
+        XCTAssertEqual(response?["result"]?["outcome"]?["outcome"]?.stringValue, "cancelled")
+        await client.close()
+    }
+
+    func testPermissionWithoutAnyRejectCancels() async throws {
+        let transport = FakeACPTransport(responder: happyResponder())
+        let client = ACPClient(transport: transport)
+        transport.inject(#"{"jsonrpc":"2.0","id":94,"method":"session/request_permission","params":{"toolCall":{"toolCallId":"t","_meta":{"cognition.ai/toolName":"exec"}},"options":[{"optionId":"a","kind":"allow_once","name":"Allow"},{"optionId":"b","kind":"allow_always","name":"Always"}]}}"#)
+        try await Task.sleep(for: .milliseconds(100))
+        let response = transport.sentLines.map(json).last { $0["id"]?.intValue == 94 }
+        XCTAssertEqual(response?["result"]?["outcome"]?["outcome"]?.stringValue, "cancelled")
+        await client.close()
+    }
+
+    func testRememberedToolCallAuthorizesIDOnlyRequestPerSession() async throws {
+        let transport = FakeACPTransport(responder: happyResponder())
+        let client = ACPClient(transport: transport)
+        transport.inject(#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"shared","title":"raw","_meta":{"cognition.ai/toolName":"mcp__workshop__workshop_post_message"}}}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s2","update":{"sessionUpdate":"tool_call","toolCallId":"shared","title":"raw","_meta":{"cognition.ai/toolName":"exec"}}}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","id":93,"method":"session/request_permission","params":{"sessionId":"s1","toolCall":{"toolCallId":"shared"},"options":[{"optionId":"ok","kind":"allow_once","name":"Allow"},{"optionId":"no","kind":"reject_once","name":"Reject"}]}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","id":92,"method":"session/request_permission","params":{"sessionId":"s2","toolCall":{"toolCallId":"shared"},"options":[{"optionId":"ok2","kind":"allow_once","name":"Allow"},{"optionId":"no2","kind":"reject_once","name":"Reject"}]}}"#)
+        try await Task.sleep(for: .milliseconds(150))
+        let allowed = transport.sentLines.map(json).last { $0["id"]?.intValue == 93 }
+        let denied = transport.sentLines.map(json).last { $0["id"]?.intValue == 92 }
+        XCTAssertEqual(allowed?["result"]?["outcome"]?["optionId"]?.stringValue, "ok")
+        XCTAssertEqual(denied?["result"]?["outcome"]?["optionId"]?.stringValue, "no2")
+        await client.close()
+    }
+
+    func testConflictingToolIdentityRejects() async throws {
+        let transport = FakeACPTransport(responder: happyResponder())
+        let client = ACPClient(transport: transport)
+        transport.inject(#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"x","_meta":{"cognition.ai/toolName":"mcp__workshop__workshop_post_message"}}}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","id":91,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"x","_meta":{"cognition.ai/toolName":"exec"}},"options":[{"optionId":"ok","kind":"allow_once","name":"Allow"},{"optionId":"no","kind":"reject_once","name":"Reject"}]}}"#)
+        try await Task.sleep(for: .milliseconds(150))
+        let response = transport.sentLines.map(json).last { $0["id"]?.intValue == 91 }
+        XCTAssertEqual(response?["result"]?["outcome"]?["optionId"]?.stringValue, "no")
+        await client.close()
+    }
+
+    func testRememberedRawInputUpdatedFullyForApprovalBoundary() async throws {
+        let workspace = dir!
+        let transport = FakeACPTransport(responder: happyResponder())
+        let policy = ACPPermissionPolicy(workspace: workspace, approvedCommands: [
+            ACPCommandApproval(command: "/usr/bin/true", cwd: workspace)])
+        let client = ACPClient(transport: transport, permissionPolicy: policy)
+        transport.inject(#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"e","kind":"execute","_meta":{"cognition.ai/toolName":"exec"},"rawInput":{"command":"/usr/bin/true"}}}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","id":90,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"e"},"options":[{"optionId":"ok","kind":"allow_once","name":"Allow"},{"optionId":"no","kind":"reject_once","name":"Reject"}]}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"e","rawInput":{"command":"/usr/bin/true; touch /private/tmp/pwned-fixture"}}}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","id":89,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"e"},"options":[{"optionId":"ok9","kind":"allow_once","name":"Allow"},{"optionId":"no9","kind":"reject_once","name":"Reject"}]}}"#)
+        try await Task.sleep(for: .milliseconds(200))
+        let approved = transport.sentLines.map(json).last { $0["id"]?.intValue == 90 }
+        let mutated = transport.sentLines.map(json).last { $0["id"]?.intValue == 89 }
+        XCTAssertEqual(approved?["result"]?["outcome"]?["optionId"]?.stringValue, "ok")
+        XCTAssertEqual(mutated?["result"]?["outcome"]?["optionId"]?.stringValue, "no9")
+        await client.close()
+    }
+
+    func testNativeIdentityMetadataSurvivesPermissionMetadata() async throws {
+        let transport = FakeACPTransport(responder: happyResponder())
+        let policy = ACPPermissionPolicy(workspace: dir!, approvedCommands: [
+            ACPCommandApproval(command: "/usr/bin/true", cwd: dir!)])
+        let client = ACPClient(transport: transport, permissionPolicy: policy)
+        transport.inject(#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"native","kind":"execute","_meta":{"cognition.ai/inferenceToolName":"exec"},"rawInput":{"command":"/usr/bin/true"}}}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","id":81,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"native","_meta":{"cognition.ai/editableCommand":"/usr/bin/true"}},"options":[{"optionId":"ok","kind":"allow_once"},{"optionId":"no","kind":"reject_once"}]}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","id":82,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"native","rawInput":{"command":"unapproved"},"_meta":{"cognition.ai/editableCommand":"unapproved"}},"options":[{"optionId":"ok2","kind":"allow_once"},{"optionId":"no2","kind":"reject_once"}]}}"#)
+        _ = try await client.call("initialize")
+        let allowed = transport.sentLines.map(json).last { $0["id"]?.intValue == 81 }
+        let denied = transport.sentLines.map(json).last { $0["id"]?.intValue == 82 }
+        XCTAssertEqual(allowed?["result"]?["outcome"]?["optionId"]?.stringValue, "ok")
+        XCTAssertEqual(denied?["result"]?["outcome"]?["optionId"]?.stringValue, "no2")
+        await client.close()
+    }
+
+    func testPermissionDecisionEventIsNormalized() async throws {
+        let transport = FakeACPTransport(responder: happyResponder())
+        let client = ACPClient(transport: transport)
+        final class Box: @unchecked Sendable {
+            var events: [ACPClient.ServerEvent] = []
+            let lock = NSLock()
+        }
+        let box = Box()
+        await client.setEventSink { event in
+            box.lock.lock(); box.events.append(event); box.lock.unlock()
+        }
+        transport.inject(#"{"jsonrpc":"2.0","id":88,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"raw-call-id","title":"PRIVATE RAW TITLE","rawInput":{"command":"secret-fixture-command"},"_meta":{"cognition.ai/toolName":"exec"}},"options":[{"optionId":"ok","kind":"allow_once","name":"Allow workspace"},{"optionId":"no","kind":"reject_once","name":"Reject"}]}}"#)
+        try await Task.sleep(for: .milliseconds(150))
+        box.lock.lock()
+        let events = box.events
+        box.lock.unlock()
+        guard let decision = events.compactMap({ event -> ACPPermissionDecision? in
+            if case .permissionDecision(let d) = event { return d }
+            return nil
+        }).last else { return XCTFail("no permissionDecision event") }
+        XCTAssertEqual(decision.tool, "exec")
+        XCTAssertEqual(decision.operation, "execute")
+        XCTAssertFalse(decision.allowed)
+        XCTAssertEqual(decision.callID?.count, 64)
+        XCTAssertNotEqual(decision.callID, "raw-call-id")
+        for event in events {
+            let rendered = String(describing: event)
+            XCTAssertFalse(rendered.contains("PRIVATE RAW TITLE"))
+            XCTAssertFalse(rendered.contains("secret-fixture-command"))
+            XCTAssertFalse(rendered.contains("Allow workspace"))
+        }
+        await client.close()
+    }
+
+    func testConflictingSessionUpdateDeniedForIDOnlyRequest() async throws {
+        let transport = FakeACPTransport(responder: happyResponder())
+        let client = ACPClient(transport: transport)
+        transport.inject(#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"c","_meta":{"cognition.ai/toolName":"mcp__workshop__workshop_post_message"}}}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"c","_meta":{"cognition.ai/toolName":"exec"}}}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","id":87,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"c"},"options":[{"optionId":"ok","kind":"allow_once","name":"Allow"},{"optionId":"no","kind":"reject_once","name":"Reject"}]}}"#)
+        try await Task.sleep(for: .milliseconds(150))
+        let response = transport.sentLines.map(json).last { $0["id"]?.intValue == 87 }
+        XCTAssertEqual(response?["result"]?["outcome"]?["optionId"]?.stringValue, "no")
+        await client.close()
+    }
+
+    func testNULInIdentityNeverResolvesFromCache() async throws {
+        let transport = FakeACPTransport(responder: happyResponder())
+        let client = ACPClient(transport: transport)
+        transport.inject(#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"good","_meta":{"cognition.ai/toolName":"mcp__workshop__workshop_post_message"}}}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"bad\u0000evil","_meta":{"cognition.ai/toolName":"mcp__workshop__workshop_post_message"}}}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","id":86,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"good"},"options":[{"optionId":"ok","kind":"allow_once","name":"Allow"},{"optionId":"no","kind":"reject_once","name":"Reject"}]}}"#)
+        transport.inject(#"{"jsonrpc":"2.0","id":83,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"bad\u0000evil"},"options":[{"optionId":"ok3","kind":"allow_once","name":"Allow"},{"optionId":"no3","kind":"reject_once","name":"Reject"}]}}"#)
+        try await Task.sleep(for: .milliseconds(150))
+        let rejected = transport.sentLines.map(json).last { $0["id"]?.intValue == 83 }
+        let allowed = transport.sentLines.map(json).last { $0["id"]?.intValue == 86 }
+        XCTAssertEqual(allowed?["result"]?["outcome"]?["optionId"]?.stringValue, "ok")
+        XCTAssertEqual(rejected?["result"]?["outcome"]?["optionId"]?.stringValue, "no3")
+        await client.close()
+    }
+
+    func testOversizedRawInputMarksConflictAndIsNotCached() async throws {
+        let transport = FakeACPTransport(responder: happyResponder())
+        let client = ACPClient(transport: transport)
+        let big = String(repeating: "x", count: 70 * 1024)
+        transport.inject(#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"big","_meta":{"cognition.ai/toolName":"mcp__workshop__workshop_post_message"},"rawInput":{"command":"BASE"}}}}"#)
+        let encoded = "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"s\",\"update\":{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"big\",\"rawInput\":{\"command\":\"/usr/bin/true\",\"padding\":\"" + big + "\"}}}}"
+        transport.inject(encoded)
+        transport.inject(#"{"jsonrpc":"2.0","id":85,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"big"},"options":[{"optionId":"ok","kind":"allow_once","name":"Allow"},{"optionId":"no","kind":"reject_once","name":"Reject"}]}}"#)
+        try await Task.sleep(for: .milliseconds(150))
+        let response = transport.sentLines.map(json).last { $0["id"]?.intValue == 85 }
+        XCTAssertEqual(response?["result"]?["outcome"]?["optionId"]?.stringValue, "no")
+        await client.close()
+    }
+
+    func testBoundedRawInputWithinLimitIsCached() async throws {
+        let workspace = dir!
+        let transport = FakeACPTransport(responder: happyResponder())
+        let policy = ACPPermissionPolicy(workspace: workspace, approvedCommands: [
+            ACPCommandApproval(command: "/usr/bin/true", cwd: workspace)])
+        let client = ACPClient(transport: transport, permissionPolicy: policy)
+        let pad = String(repeating: "y", count: 32 * 1024)
+        transport.inject("{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"s\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"ok-call\",\"kind\":\"execute\",\"_meta\":{\"cognition.ai/toolName\":\"exec\"},\"rawInput\":{\"command\":\"/usr/bin/true\",\"timeout\":\"" + pad + "\"}}}}")
+        transport.inject(#"{"jsonrpc":"2.0","id":84,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"ok-call"},"options":[{"optionId":"ok","kind":"allow_once","name":"Allow"},{"optionId":"no","kind":"reject_once","name":"Reject"}]}}"#)
+        try await Task.sleep(for: .milliseconds(150))
+        let response = transport.sentLines.map(json).last { $0["id"]?.intValue == 84 }
+        XCTAssertEqual(response?["result"]?["outcome"]?["optionId"]?.stringValue, "ok")
+        await client.close()
+    }
+
+    func testNoRawDiagnosticFilesOrThoughtLeakage() async throws {
+        let diag = dir! + "/diag"
+        try FileManager.default.createDirectory(atPath: diag, withIntermediateDirectories: true)
+        let oldDiag = getenv("WORKSHOP_DIAG_DIR").map { String(cString: $0) }
+        setenv("WORKSHOP_DIAG_DIR", diag, 1)
+        defer {
+            if let oldDiag { setenv("WORKSHOP_DIAG_DIR", oldDiag, 1) }
+            else { unsetenv("WORKSHOP_DIAG_DIR") }
+        }
+        let transport = FakeACPTransport(responder: happyResponder())
+        let adapter = ACPHarnessAdapter(
+            spec: spec(), transportFactory: { _, _ in transport })
+        let ref = try await adapter.openTaskSession(binding: binding())
+        let task = WorkshopTask(id: TaskID("task_x"), channel: "main", title: "T",
+                                brief: "b", phase: .execution, state: .working,
+                                budgetPolicyRef: nil, createdAt: Date(), updatedAt: Date())
+        let context = TurnContext(task: task, subtask: nil, recentMessages: [])
+        transport.inject(#"{"jsonrpc":"2.0","id":77,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"d","title":"PRIVATE CANARY","_meta":{"cognition.ai/toolName":"exec"}},"options":[{"optionId":"no","kind":"reject_once","name":"Reject"}]}}"#)
+        var events: [AdapterEvent] = []
+        for try await e in adapter.sendTurn(ref: ref, turnID: "t1", context: context,
+                                            deadline: Date().addingTimeInterval(5)) {
+            events.append(e)
+        }
+        let files = try FileManager.default.contentsOfDirectory(atPath: diag)
+        for name in ["permission-requests.log", "acp-updates-kimi.log",
+                     "acp-prompt-result-kimi.log"] {
+            XCTAssertFalse(files.contains(name), name)
+        }
+        XCTAssertFalse(events.contains(.messageDelta("HIDDEN_TEST_THOUGHT")))
+        let response = transport.sentLines.map(json).last { $0["id"]?.intValue == 77 }
+        XCTAssertEqual(response?["result"]?["outcome"]?["optionId"]?.stringValue, "no")
     }
 
     // MARK: - ACPHarnessAdapter

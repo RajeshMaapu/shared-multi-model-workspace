@@ -65,6 +65,7 @@ function updateActivityHistory() {
     element.innerHTML = markup;
     if (element.querySelector('ol')) element.querySelector('ol').scrollTop = top;
     element.querySelector('details')?.addEventListener('toggle', event => {
+      if (!event.target.isConnected) return;
       if (event.target.open) state.activityOpen.add(task.id); else state.activityOpen.delete(task.id);
     });
   }
@@ -226,7 +227,7 @@ function render() {
   for (const [className, top] of scroll) { const element = document.querySelector(`.${className}`); if (element) element.scrollTop = top; }
   const replacement = focusID ? document.getElementById(focusID) : null;
   if (replacement) { replacement.focus({ preventScroll: true }); if (selection && replacement.setSelectionRange) replacement.setSelectionRange(...selection); }
-  document.getElementById('task-options')?.addEventListener('toggle', event => { state.optionsOpen = event.target.open; });
+  document.getElementById('task-options')?.addEventListener('toggle', event => { if (event.target.isConnected) state.optionsOpen = event.target.open; });
   document.getElementById('icon-dialog')?.addEventListener('close', () => { render(); document.querySelector(dialogOpener)?.focus(); });
 }
 
@@ -372,7 +373,7 @@ root.addEventListener('input', event => {
 root.addEventListener('change', event => {
   const element = event.target;
   if (element.id === 'phase') state.phase = element.value;
-  if (element.id === 'mode') { state.mode = element.value; render(); }
+  if (element.id === 'mode') { state.mode = element.value; state.optionsOpen = document.getElementById('task-options')?.open === true; render(); }
   if (element.dataset.peer) state.peers = element.checked ? [...new Set([...state.peers, element.dataset.peer])] : state.peers.filter(id => id !== element.dataset.peer);
 });
 root.addEventListener('submit', event => {

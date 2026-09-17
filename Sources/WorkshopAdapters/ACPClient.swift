@@ -118,9 +118,11 @@ public actor ACPClient {
         case sessionUpdate(JSONValue)
         case permissionRequested(title: String, chosen: String)
         case permissionDenied(String)
+        case permissionDecision(ACPPermissionDecision)
     }
 
     private let transport: ACPTransport
+    private let permissionPolicy: ACPPermissionPolicy
     private var nextID: Int64 = 1
     private var pending: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
     private var eventContinuations: [UUID: AsyncStream<ServerEvent>.Continuation] = [:]
@@ -128,10 +130,14 @@ public actor ACPClient {
     /// `call` is in flight are guaranteed delivered before that call resumes.
     private var eventSink: (@Sendable (ServerEvent) -> Void)?
     private var readerTask: Task<Void, Never>?
+    private var toolCalls: [String: JSONValue] = [:]
+    private var toolCallOrder: [String] = []
     private let log = Logger(subsystem: "ai.maapu.workshop", category: "acp")
 
-    public init(transport: ACPTransport) {
+    public init(transport: ACPTransport,
+                permissionPolicy: ACPPermissionPolicy = ACPPermissionPolicy()) {
         self.transport = transport
+        self.permissionPolicy = permissionPolicy
         let t = transport
         readerTask = Task { await self.readLoop(t.lines) }
     }
@@ -231,62 +237,111 @@ public actor ACPClient {
         // Notification.
         if msg["method"]?.stringValue == "session/update",
            let update = msg["params"]?["update"] {
+            if update["sessionUpdate"]?.stringValue == "tool_call"
+                || update["sessionUpdate"]?.stringValue == "tool_call_update" {
+                rememberToolCall(sessionID: msg["params"]?["sessionId"]?.stringValue,
+                                 update: update)
+            }
             emit(.sessionUpdate(update))
         }
     }
 
-    /// Permission policy: allow_once for workshop tools and read-only titles;
-    /// reject everything else and surface a permissionDenied event.
+    // Some ACP servers (Devin) send only toolCallId in `toolCall`; the
+    // permission request may carry no typed fields at all.
+    // Structured identity must come from the matching session/update.
+    private func rememberToolCall(sessionID: String?, update: JSONValue) {
+        guard let sessionID, let callID = update["toolCallId"]?.stringValue,
+              !sessionID.isEmpty, !callID.isEmpty,
+              sessionID.count <= 256, callID.count <= 256,
+              !sessionID.contains("\0"), !callID.contains("\0") else { return }
+        let key = sessionID + "\0" + callID
+        var stored = toolCalls[key]?.objectValue ?? [:]
+        let identity = ACPPermissionPolicy.identity(update)
+        if identity.conflict { stored["_workshopIdentityConflict"] = .bool(true) }
+        if !identity.name.isEmpty {
+            if let old = stored["_meta"]?["cognition.ai/toolName"]?.stringValue, old != identity.name {
+                stored["_workshopIdentityConflict"] = .bool(true)
+            }
+            stored["_meta"] = .object(["cognition.ai/toolName": .string(identity.name)])
+        }
+        if let kind = update["kind"]?.stringValue {
+            if let old = stored["kind"]?.stringValue, old != kind {
+                stored["_workshopIdentityConflict"] = .bool(true)
+            }
+            stored["kind"] = .string(kind)
+        }
+        if let raw = update["rawInput"] {
+            if let data = try? JSONEncoder().encode(raw), data.count <= 64 * 1024 {
+                stored["rawInput"] = raw
+            } else {
+                stored["_workshopIdentityConflict"] = .bool(true)
+                stored.removeValue(forKey: "rawInput")
+            }
+        }
+        stored["toolCallId"] = .string(callID)
+        if toolCalls[key] == nil {
+            toolCallOrder.append(key)
+            while toolCallOrder.count > 256 {
+                let oldest = toolCallOrder.removeFirst()
+                toolCalls.removeValue(forKey: oldest)
+            }
+        }
+        toolCalls[key] = .object(stored)
+    }
+
+    private func resolvedToolCall(_ params: JSONValue?) -> (JSONValue, Bool) {
+        let request = params?["toolCall"] ?? .object([:])
+        var requestFields = request.objectValue ?? [:]
+        let identity = ACPPermissionPolicy.identity(request)
+        if identity.name.isEmpty { requestFields.removeValue(forKey: "_meta") }
+        else { requestFields["_meta"] = .object(["cognition.ai/toolName": .string(identity.name)]) }
+        guard let sessionID = params?["sessionId"]?.stringValue,
+              let callID = requestFields["toolCallId"]?.stringValue,
+              !sessionID.isEmpty, !callID.isEmpty,
+              sessionID.count <= 256, callID.count <= 256,
+              !sessionID.contains("\0"), !callID.contains("\0"),
+              var remembered = toolCalls[sessionID + "\0" + callID]?.objectValue else {
+            return (request, false)
+        }
+        var conflicting = identity.conflict || remembered["_workshopIdentityConflict"] != nil
+        remembered.removeValue(forKey: "_workshopIdentityConflict")
+        for field in ["_meta", "kind"] {
+            guard let old = remembered[field], let new = requestFields[field] else { continue }
+            if field == "_meta" {
+                let oldName = old["cognition.ai/toolName"]?.stringValue
+                let newName = new["cognition.ai/toolName"]?.stringValue
+                if let oldName, let newName, oldName != newName { conflicting = true }
+            } else if let oldKind = old.stringValue, let newKind = new.stringValue,
+                      oldKind != newKind {
+                conflicting = true
+            }
+        }
+        var merged = remembered
+        for field in ["_meta", "kind", "rawInput", "toolCallId"] where requestFields[field] != nil {
+            merged[field] = requestFields[field]
+        }
+        return (.object(merged), conflicting)
+    }
+
+    /// Permission policy: allow_once for typed tools and explicit scoped
+    /// commands; everything else selects a reject option or cancels.
     private func respondToPermission(id: JSONValue, params: JSONValue?) {
-        // Diagnostic: append the raw request to <WORKSHOP_DIAG_DIR>/
-        // permission-requests.log when the env var is set (never secrets —
-        // tool titles and option kinds only).
-        if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
-           let data = try? JSONEncoder().encode(params ?? .null) {
-            let path = dir + "/permission-requests.log"
-            let line = String(decoding: data, as: UTF8.self) + "\n"
-            if let fh = FileHandle(forWritingAtPath: path) {
-                fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
-            } else {
-                FileManager.default.createFile(atPath: path,
-                                               contents: Data(line.utf8))
-            }
-        }
+        let (toolCall, conflicting) = resolvedToolCall(params)
+        var decision = permissionPolicy.decide(toolCall: toolCall)
+        if conflicting { decision.allowed = false; decision.reason = "conflicting_tool_update" }
         let options = params?["options"]?.arrayValue ?? []
-        let title = params?["toolCall"]?["title"]?.stringValue ?? ""
-        let rawName = params?["toolCall"]?["_meta"]?["cognition.ai/toolName"]?.stringValue ?? ""
-        // Some ACP servers (Devin) send only toolCallId in `toolCall`; the
-        // tool name then appears only inside option labels such as
-        // "allow calling workshop_post_message on the workshop MCP server".
-        let optionText = options.compactMap { $0["name"]?.stringValue }.joined(separator: " ")
-        let isWorkshop = rawName.hasPrefix("mcp__workshop__")
-            || title.contains("workshop")
-            || optionText.contains("workshop")
-        let isReadOnly = ["Read", "Grep", "List", "Glob"].contains { title.hasPrefix($0) }
-        func option(matching prefix: String) -> JSONValue? {
-            options.first { $0["kind"]?.stringValue?.hasPrefix(prefix) == true }
-        }
-        if isWorkshop || isReadOnly, let allow = option(matching: "allow") {
-            sendRaw(["jsonrpc": .string("2.0"), "id": id,
-                     "result": .object(["outcome": .object([
-                        "outcome": .string("selected"),
-                        "optionId": allow["optionId"] ?? .null])])])
-            emit(.permissionRequested(title: title,
-                                      chosen: allow["name"]?.stringValue ?? "allow"))
-        } else {
-            let reject = option(matching: "reject") ?? options.first
-            if let reject {
-                sendRaw(["jsonrpc": .string("2.0"), "id": id,
-                         "result": .object(["outcome": .object([
-                            "outcome": .string("selected"),
-                            "optionId": reject["optionId"] ?? .null])])])
-            } else {
-                sendRaw(["jsonrpc": .string("2.0"), "id": id,
-                         "error": .object(["code": .number(-32601),
-                                           "message": .string("no option")])])
-            }
-            emit(.permissionDenied(title.isEmpty ? rawName : title))
-        }
+        let valid = options.filter { !($0["optionId"]?.stringValue ?? "").isEmpty }
+        let allow = valid.first { $0["kind"]?.stringValue == "allow_once" }
+        if decision.allowed && allow == nil { decision.allowed = false; decision.reason = "allow_once_unavailable" }
+        let chosen = decision.allowed ? allow : valid.first { $0["kind"]?.stringValue == "reject_once" }
+            ?? valid.first { $0["kind"]?.stringValue == "reject_always" }
+        let outcome: JSONValue = chosen.map {
+            .object(["outcome": .string("selected"), "optionId": $0["optionId"]!])
+        } ?? .object(["outcome": .string("cancelled")])
+        sendRaw(["jsonrpc": .string("2.0"), "id": id, "result": .object(["outcome": outcome])])
+        emit(.permissionDecision(decision))
+        if decision.allowed { emit(.permissionRequested(title: decision.title, chosen: "allow_once")) }
+        else { emit(.permissionDenied(decision.title)) }
     }
 
     private func sendRaw(_ object: [String: JSONValue]) {

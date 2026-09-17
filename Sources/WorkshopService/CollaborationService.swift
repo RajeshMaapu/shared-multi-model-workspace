@@ -2011,6 +2011,12 @@ public actor CollaborationService {
                 case .permissionDenied:
                     recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
                                    kind: "permission", title: "Tool permission denied", status: "denied")
+                case .permissionDecision(let tool, let operation, let allowed, let reason, let callID):
+                    recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
+                                   kind: "permission",
+                                   title: "Permission " + (allowed ? "allowed" : "denied")
+                                       + " · " + operation + " · " + reason + " · " + tool,
+                                   status: allowed ? "completed" : "denied", callID: callID)
                 case .authRequired:
                     recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
                                    kind: "status", title: "Authentication required", status: "failed")

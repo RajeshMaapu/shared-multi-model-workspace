@@ -161,6 +161,7 @@ public enum ProfileBuilder {
         (allow file-write* (subpath "\(run)") (subpath "\(profile)/cache") (subpath "\(profile)/state") (subpath "\(profile)/data/devin/cli") (subpath "\(profile)/config/devin/cli") (subpath "\(userHome)/.local/share/devin/cli") (literal "/dev/null") (literal "\(userHome)/.local/share/fusion-codex-relay/.launch.lock"))
         (deny file-read* (subpath "\(root)"))
         (allow file-read* (subpath "\(run)") (subpath "\(profile)") (literal "\(token)"))
+        (allow file-read-metadata (literal "\(root)") (literal "\(root)/profiles") (literal "\(root)/profiles/clean-v2"))
         """
         try text.write(toFile: destination, atomically: true, encoding: .utf8)
     }

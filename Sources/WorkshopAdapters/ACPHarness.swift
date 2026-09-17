@@ -30,6 +30,7 @@ public struct HarnessLaunchSpec: Sendable {
     /// Per-task worktree root (<home>/worktrees); when set the session cwd is
     /// <worktreeRoot>/<task_id>, created on demand.
     public var worktreeRoot: String?
+    public var approvedCommands: [ACPCommandApproval] = []
 
     /// argv for spawning: [executable] + args.
     public var argv: [String] { [executable] + args }
@@ -293,7 +294,9 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
             }
         }
         let transport = try transportFactory(launch, cwd)
-        let c = ACPClient(transport: transport)
+        let c = ACPClient(transport: transport,
+                          permissionPolicy: ACPPermissionPolicy(
+                            workspace: cwd, approvedCommands: spec.approvedCommands))
         client = c
         _ = try await c.call("initialize", params: .object([
             "protocolVersion": .number(1),
@@ -328,16 +331,6 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                 // prompt result resumes this task (ordering, not racing).
                 await client.setEventSink { event in
                     if case .sessionUpdate(let u) = event {
-                        if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
-                           let data = try? JSONEncoder().encode(u) {
-                            let p = dir + "/acp-updates-\(self.engineer.rawValue).log"
-                            let line = String(decoding: data, as: UTF8.self) + "\n"
-                            if let fh = FileHandle(forWritingAtPath: p) {
-                                fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
-                            } else {
-                                FileManager.default.createFile(atPath: p, contents: Data(line.utf8))
-                            }
-                        }
                         switch u["sessionUpdate"]?.stringValue {
                         case "agent_message_chunk":
                             if let t = u["content"]?["text"]?.stringValue {
@@ -353,8 +346,11 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                                 status: u["status"]?.stringValue ?? "updated", callID: u["toolCallId"]?.stringValue))
                         default: break
                         }
-                    } else if case .permissionDenied(let title) = event {
-                        continuation.yield(.permissionDenied(title))
+                    } else if case .permissionDecision(let decision) = event {
+                        continuation.yield(.permissionDecision(
+                            tool: decision.tool, operation: decision.operation,
+                            allowed: decision.allowed, reason: decision.reason,
+                            callID: decision.callID))
                     }
                 }
                 defer {
@@ -366,16 +362,6 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                         "prompt": .array([.object([
                             "type": .string("text"), "text": .string(packet)])]),
                     ]))
-                    if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
-                       let data = try? JSONEncoder().encode(result) {
-                        let p = dir + "/acp-prompt-result-\(self.engineer.rawValue).log"
-                        let line = String(decoding: data, as: UTF8.self) + "\n"
-                        if let fh = FileHandle(forWritingAtPath: p) {
-                            fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
-                        } else {
-                            FileManager.default.createFile(atPath: p, contents: Data(line.utf8))
-                        }
-                    }
                     if let usage = result["usage"] {
                         usageEmitted = true
                         continuation.yield(.usageSample(

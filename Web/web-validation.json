@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "result": "pending",
-  "scope": "Web renderer visual and interaction validation against an isolated Swift daemon with fake engineer adapters; not live engineer, Astra bridge, accessibility certification, or Electron qualification.",
-  "reviewed_at": null,
+  "result": "passed",
+  "scope": "Web renderer visual and interaction validation against an isolated Swift daemon with fake engineer adapters using Google Chrome. Not live engineer, Astra bridge, accessibility certification, or installed Electron qualification.",
+  "reviewed_at": "2026-09-17T14:52:57Z",
   "reference": "docs/review/workshop-approved-reference.png",
   "evidence": ".build/web-qa/evidence.json",
   "screenshots": [
@@ -18,11 +18,12 @@
     "index.html": "ee48dd96a0e37e68e50665a85597526bd47285afd342746f38fe8f0a10bb5a02",
     "state.js": "6e0b47dc200361c3f3ff885e5953912325f84e89946dd5841acfae873859ea7e",
     "style.css": "45c376fb6866bb702ac28040e3d160e78e3b243e286abf6529f76f268cd4bb8b",
-    "app.js": "a58b332173dd9be8f1154df35020f785e03d44e59c03915f1e2292a74b4f522b"
+    "app.js": "0fa448123880bc548e1fcdb77cdd230a4f414a485661c6af7108c3baaafa16e9"
   },
   "review_notes": [
-    "Fresh browser validation of the activity renderer is pending; listed prior evidence paths are not current proof."
-  ],
-  "pending_reason": "Activity renderer changed; fresh supported browser validation required before packaging.",
-  "previous_reviewed_at": "2026-09-16T06:18:00Z"
+    "Fresh Google Chrome 152 validation through pinned Playwright Core 1.62.1 with an isolated browser context and browser sandbox enabled.",
+    "Measured exact inner/client/scroll dimensions and visually reviewed both screenshots; structural reference alignment, not pixel parity.",
+    "Peer selection, task-options reset, legacy system-message display, expanded activity history, terminal/no-read animation stopping and normal-network console checks passed.",
+    "Viewport reset after validation. Evidence and screenshots remain ignored local artifacts."
+  ]
 }

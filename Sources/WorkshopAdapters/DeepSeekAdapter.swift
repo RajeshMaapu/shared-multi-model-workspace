@@ -227,18 +227,6 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
                        "messages": .array(messages),
                        "tools": .array(Self.toolSchemas()),
                        "max_tokens": .number(Double(maxTokens))])
-            if status != 200, let dir =
-                ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"] {
-                let p = dir + "/deepseek-errors.log"
-                let line = "HTTP \(status): "
-                    + String(decoding: (try? JSONEncoder().encode(body)) ?? Data(),
-                             as: UTF8.self).prefix(500) + "\n"
-                if let fh = FileHandle(forWritingAtPath: p) {
-                    fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
-                } else {
-                    FileManager.default.createFile(atPath: p, contents: Data(line.utf8))
-                }
-            }
             switch status {
             case 401: throw Failure.auth
             case 402, 429: throw Failure.quota

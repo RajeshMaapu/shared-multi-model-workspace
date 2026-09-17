@@ -45,6 +45,36 @@ final class WorkActivityTests: XCTestCase {
         await reopened.shutdown()
     }
 
+    func testPermissionDecisionRecordedWithoutRawFields() async throws {
+        let dir = NSTemporaryDirectory() + "workshop-activity-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let fake = FakeAdapter(engineer: .devin, delayPerDelta: .zero)
+        fake.script = { _ in [
+            .event(.permissionDecision(tool: "exec", operation: "execute", allowed: false,
+                                       reason: "command_not_explicitly_approved", callID: "raw-id-one")),
+            .event(.permissionDecision(tool: "mcp__workshop__workshop_post_message", operation: "workshop",
+                                       allowed: true, reason: "known_workshop_tool", callID: "raw-id-two")),
+            .text("done")
+        ] }
+        let svc = try CollaborationService(databasePath: dir + "/db.sqlite", adapters: [fake])
+        let receipt = try await svc.createTask(CreateTaskRequest(schemaVersion: 2, idempotencyKey: "perm-one", title: "P", objective: "Fixture", phase: .execution, participants: [], collaborationMode: .ownerOnly))
+        await svc.start(); await svc.awaitIdle()
+        let all = try await svc.readActivity(receipt.taskID)
+        let perms = all.filter { $0.kind == "permission" }
+        XCTAssertEqual(perms.count, 2)
+        XCTAssertEqual(Set(perms.map(\.status)), ["denied", "completed"])
+        XCTAssertTrue(perms.contains { $0.title.contains("command_not_explicitly_approved") && $0.title.contains("exec") })
+        XCTAssertTrue(perms.contains { $0.title.contains("known_workshop_tool") && $0.title.contains("mcp__workshop__workshop_post_message") })
+        XCTAssertFalse(all.contains { $0.title.contains("raw-id") })
+        for item in perms {
+            XCTAssertNotNil(item.callID)
+            XCTAssertNotEqual(item.callID, "raw-id-one")
+            XCTAssertNotEqual(item.callID, "raw-id-two")
+        }
+        await svc.shutdown()
+    }
+
     func testBoundedAllowlistedActivity() {
         let item = WorkActivity(taskID: TaskID("task_test"), turnID: "turn", engineer: .devin,
             kind: "agent_thought", title: String(repeating: "x", count: 500) + "\n", status: "arbitrary raw payload", createdAt: Date())

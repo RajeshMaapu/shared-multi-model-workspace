@@ -22,9 +22,9 @@ Always supply both `WORKSHOP_HOME` and `WORKSHOP_RUNTIME_DIR` when launching a d
 
 New v2 tasks deliberately block native adapter turns until `supportsIsolatedWorkspaceTurns` is qualified. Do not set this capability merely to make a test or demonstration pass. Shared workspace identity is implemented; native single-writer process isolation and safe transfer are not.
 
-Do not change `Web/renderer` without new computer-use validation. `Web/web-validation.json` binds the approved renderer file hashes; packaging checks that manifest against `.build/web-qa/evidence.json`. Existing evidence used Aside on an isolated fake-adapter daemon, not Astra or live engineers. Launch `/Applications/Aside.app` before `aside repl` if the CLI returns `fetch failed` because the app is not running.
+Do not change `Web/renderer` without new computer-use validation. `Web/web-validation.json` binds the approved renderer file hashes; packaging checks that manifest against `.build/web-qa/evidence.json`. The user-selected browser is Google Chrome, not Aside. Current evidence uses Playwright Core 1.62.1 with `channel: 'chrome'`, `headless: true`, `chromiumSandbox: true`, and a fresh context against an isolated fake-adapter daemon. Local tooling is installed under ignored `.build/chrome-tools`; do not reuse a personal Chrome profile or disable browser protections.
 
-This Mac has a 30-day npm release-age guard and `ignore-scripts=true`. Keep those safeguards. Electron 42.9.1 and packager 20.3.0 are pinned. The user approved a one-time execution of the inspected Electron installer for this checkout; that does not authorize enabling scripts globally. The dev-only XML parser advisory remains recorded in the status report.
+This Mac has a 30-day npm release-age guard and `ignore-scripts=true`. Keep those safeguards. Electron 42.9.1 and packager 20.3.0 are pinned. The user approved a one-time execution of the inspected Electron installer for this checkout; that does not authorize enabling scripts globally. The dev-only XML parser advisory was fixed by the user's exact-version exception and lockfile pin for `@xmldom/xmldom@0.9.12`; no general release-age exemption is authorized. Preserve that reviewed lockfile and consult the status report before dependency re-resolution.
 
 ## Codex skill
 
