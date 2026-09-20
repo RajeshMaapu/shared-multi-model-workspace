@@ -53,10 +53,38 @@ public struct HarnessLaunchSpec: Sendable {
     }
 }
 
+/// A harness handshake/session operation failed. Carries the remote ACP error
+/// (or launch failure) plus the child's own stderr tail so native causes —
+/// e.g. a team-settings fetch timing out — survive to the system event.
+public struct HarnessSessionError: Error, LocalizedError, Equatable {
+    public let engineer: EngineerID
+    public let operation: String
+    public let underlying: String
+    public let stderrTail: String
+
+    public init(engineer: EngineerID, operation: String, underlying: String,
+                stderrTail: String) {
+        self.engineer = engineer
+        self.operation = operation
+        self.underlying = underlying
+        self.stderrTail = stderrTail
+    }
+
+    public var errorDescription: String? {
+        var text = "\(engineer.rawValue) \(operation) failed: \(underlying)"
+        if !stderrTail.isEmpty {
+            text += " — harness stderr tail: " + stderrTail
+        }
+        return text
+    }
+}
+
 /// Shared ACP harness adapter for Devin and Kimi. Keeps the process warm between
 /// turns for the same session; bounded idle timeout.
 public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     public let engineer: EngineerID
+    /// Configured model selector, propagated to session bindings and usage rows.
+    public var modelSelection: String? { spec.modelSelection }
     /// Qualified path: generation sandbox + relay-backed native Fusion. Other
     /// models/harnesses remain gated until their live writer probes pass.
     public var supportsIsolatedWorkspaceTurns: Bool {
@@ -171,11 +199,12 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                     "mcpServers": .array(mcpServersParam())]))
                 sessionID = native
             } catch {
+                let why = workshopErrorDescription(error)
                 sessionID = try await newSession(client: client, cwd: cwd)
                 lock.lock()
                 pendingNotes.append(
-                    "Native session for \(engineer.rawValue) could not be loaded; "
-                    + "started a new session (no checkpoint available yet)")
+                    "Native session for \(engineer.rawValue) could not be loaded "
+                    + "(\(why)); started a new session (no checkpoint available yet)")
                 lock.unlock()
             }
         } else if sessionID == nil {
@@ -184,11 +213,34 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         return SessionRef(engineer: engineer, nativeSessionID: sessionID ?? "")
     }
 
+    /// Last non-empty stderr lines from the child — where the harness reports
+    /// its own connection failures (team settings, auth, upstream timeouts).
+    private func stderrExcerpt(_ client: ACPClient) -> String {
+        let tail = client.transportStderrText
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .suffix(4)
+            .joined(separator: " | ")
+        return String(tail.suffix(600))
+    }
+
     private func newSession(client: ACPClient, cwd: String) async throws -> String {
-        let result = try await client.call("session/new", params: .object([
-            "cwd": .string(cwd), "mcpServers": .array(mcpServersParam())]))
+        let result: JSONValue
+        do {
+            result = try await client.call("session/new", params: .object([
+                "cwd": .string(cwd), "mcpServers": .array(mcpServersParam())]))
+        } catch {
+            throw HarnessSessionError(
+                engineer: engineer, operation: "session/new",
+                underlying: workshopErrorDescription(error),
+                stderrTail: stderrExcerpt(client))
+        }
         guard let id = result["sessionId"]?.stringValue else {
-            throw WorkshopError.adapterUnavailable(engineer)
+            throw HarnessSessionError(
+                engineer: engineer, operation: "session/new",
+                underlying: "response contained no sessionId",
+                stderrTail: stderrExcerpt(client))
         }
         return id
     }
@@ -283,7 +335,7 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                 let profile = (sandbox as NSString).deletingLastPathComponent
                 try ProfileBuilder.writerSandboxProfile(workshopHome: home, worktree: cwd,
                     profile: profile, token: (cwd as NSString).deletingLastPathComponent + "/token",
-                    destination: sandbox)
+                    destination: sandbox, engineer: spec.engineer)
                 let tmp = (cwd as NSString).deletingLastPathComponent + "/tmp"
                 try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
                 launch.env["TMPDIR"] = tmp
@@ -297,12 +349,22 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         let c = ACPClient(transport: transport,
                           permissionPolicy: ACPPermissionPolicy(
                             workspace: cwd, approvedCommands: spec.approvedCommands))
+        do {
+            _ = try await c.call("initialize", params: .object([
+                "protocolVersion": .number(1),
+                "clientCapabilities": .object([:]),
+                "clientInfo": .object(["name": .string("workshop"), "version": .string("0")]),
+            ]))
+        } catch {
+            // A failed handshake leaves no usable client; drop it so the next
+            // turn respawns instead of reusing a half-initialized transport.
+            let tail = stderrExcerpt(c)
+            await c.close()
+            throw HarnessSessionError(
+                engineer: engineer, operation: "initialize",
+                underlying: workshopErrorDescription(error), stderrTail: tail)
+        }
         client = c
-        _ = try await c.call("initialize", params: .object([
-            "protocolVersion": .number(1),
-            "clientCapabilities": .object([:]),
-            "clientInfo": .object(["name": .string("workshop"), "version": .string("0")]),
-        ]))
     }
 
     public func sendTurn(ref: SessionRef, turnID: String, context: TurnContext,

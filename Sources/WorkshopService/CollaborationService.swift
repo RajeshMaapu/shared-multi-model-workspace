@@ -1758,7 +1758,18 @@ public actor CollaborationService {
             blockInvalidIngress(task.id)
             return
         }
-        if ingress?.request.schemaVersion == 2, !adapter.supportsIsolatedWorkspaceTurns {
+        let schemaV2 = ingress?.request.schemaVersion == 2
+        // Execution turns (owner dispatch: nil/assigned/resumed/changes_requested)
+        // get an authoritative writer generation whose sealed snapshot can be
+        // promoted — they require qualified write isolation. Discussion wakeups
+        // (mentions, research, reviews, reports) run on an explicitly read-only
+        // footing: a fenced non-authoritative generation that seals to
+        // review_only and can never be promoted.
+        let executionReason = wakeReason == nil || wakeReason == "assigned"
+            || wakeReason == "resumed" || wakeReason == "changes_requested"
+        let authoritative = (executionReason && subtask?.ownerID == engineer)
+            || (engineer == .devin && subtask == nil && wakeReason == nil)
+        if schemaV2, authoritative, !adapter.supportsIsolatedWorkspaceTurns {
             let timestamp = now()
             _ = attempt("unqualifiedWriterBlocked") {
                 try repo.db.transaction {
@@ -1766,7 +1777,7 @@ public actor CollaborationService {
                     try repo.insertMessage(Message(
                         id: MessageID(newID("msg")), taskID: task.id,
                         seq: try repo.nextMessageSeq(task.id), author: .system, kind: .systemEvent,
-                        body: "Native workspace writer isolation is not qualified for this adapter; no turn was started",
+                        body: "Native workspace writer isolation is not qualified for this adapter; execution turn was not started. Discussion turns remain available.",
                         createdAt: timestamp, updatedAt: timestamp))
                     try repo.insertOutbox(taskID: task.id, eventType: "task.state_changed",
                                           payload: "{}", deliveryState: "pending", at: timestamp)
@@ -1779,12 +1790,22 @@ public actor CollaborationService {
         var writerLease: WriterGenerations.Lease?
         do {
             workspace = try ensureTaskWorkspace(taskID: task.id, ingress: ingress)
-            if ingress?.request.schemaVersion == 2, let homeDir, let base = workspace {
-                let lease = try WriterGenerations(db: repo.db, home: homeDir).begin(task: base, engineer: engineer,
-                    authoritative: subtask?.ownerID == engineer || (engineer == .devin && subtask == nil && wakeReason == nil))
-                writerLease = lease
-                workspace = TaskWorkspace(taskID: task.id, repositoryPath: base.repositoryPath,
-                    path: lease.path, baseRevision: base.baseRevision, state: "writer")
+            if schemaV2, let homeDir, let base = workspace {
+                if adapter.usesWorkspaceFilesystem {
+                    let lease = try WriterGenerations(db: repo.db, home: homeDir).begin(
+                        task: base, engineer: engineer, authoritative: authoritative)
+                    writerLease = lease
+                    workspace = TaskWorkspace(taskID: task.id, repositoryPath: base.repositoryPath,
+                        path: lease.path, baseRevision: base.baseRevision,
+                        state: authoritative ? "writer" : "discussion")
+                } else if !authoritative {
+                    // Read-only discussion footing for adapters with no
+                    // workspace filesystem: the shared path is context only;
+                    // nothing they emit can be promoted.
+                    workspace = TaskWorkspace(taskID: task.id, repositoryPath: base.repositoryPath,
+                        path: base.path, baseRevision: base.baseRevision,
+                        state: "discussion")
+                }
             }
         } catch {
             let timestamp = now()
@@ -1828,6 +1849,7 @@ public actor CollaborationService {
                                      workerID: "main", workspace: workspace)
         // Reuse a persisted native session binding when present (§6.2).
         var bound = binding
+        var storedModelSelection: String?
         if let stored: WorkshopRepository.SessionBindingRecord =
             attempt("sessionBinding", {
                 try repo.sessionBinding(taskID: task.id, engineerID: engineer,
@@ -1851,11 +1873,16 @@ public actor CollaborationService {
             bound.nativeSessionID = stored.nativeSessionID
             bound.modelSelection = stored.modelSelection
             bound.recoveryState = stored.recoveryState
+            storedModelSelection = stored.modelSelection
         }
         let ref: SessionRef
         do {
             ref = try await adapter.openTaskSession(binding: bound)
-            if ref.nativeSessionID != bound.nativeSessionID {
+            if bound.modelSelection == nil {
+                bound.modelSelection = adapter.modelSelection
+            }
+            if ref.nativeSessionID != bound.nativeSessionID
+                || bound.modelSelection != storedModelSelection {
                 bound.nativeSessionID = ref.nativeSessionID
                 bound.recoveryState = "bound"
                 _ = attempt("saveSessionBinding") {
@@ -1869,14 +1896,14 @@ public actor CollaborationService {
                 }
             }
         } catch {
-            log.error("openTaskSession failed for \(engineer.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            log.error("openTaskSession failed for \(engineer.rawValue, privacy: .public): \(workshopErrorDescription(error), privacy: .public)")
             _ = attempt("openFailedEvent") {
                 try repo.insertMessage(Message(
                     id: MessageID(newID("msg")), taskID: task.id,
                     seq: try repo.nextMessageSeq(task.id), author: .system,
                     kind: .systemEvent,
                     body: "Turn could not start for \(engineer.displayName): "
-                        + error.localizedDescription,
+                        + workshopErrorDescription(error),
                     deliveryState: .committed, createdAt: timestamp,
                     updatedAt: timestamp))
             }
@@ -1897,8 +1924,7 @@ public actor CollaborationService {
         }
 
         // Execution-style turns mark the task working so the UI reflects it.
-        if wakeReason == nil || wakeReason == "assigned" || wakeReason == "resumed"
-            || wakeReason == "changes_requested" {
+        if executionReason {
             _ = attempt("markWorking") {
                 try repo.db.transaction {
                     if let subtask, subtask.state == .claimed {
@@ -2064,7 +2090,7 @@ public actor CollaborationService {
                 }
             }
         } catch {
-            failedReason = error.localizedDescription
+            failedReason = workshopErrorDescription(error)
             body += "\n\n[turn failed: \(failedReason!); marked uncertain]"
         }
 
@@ -2074,7 +2100,7 @@ public actor CollaborationService {
                 body += "\n\nWriter proposal sealed for independent verification. No changes promoted. Snapshot: "
                     + candidate.path + "\nSHA-256: " + candidate.digest
             } catch {
-                failedReason = "Writer snapshot failed: " + error.localizedDescription
+                failedReason = "Writer snapshot failed: " + workshopErrorDescription(error)
             }
         }
 

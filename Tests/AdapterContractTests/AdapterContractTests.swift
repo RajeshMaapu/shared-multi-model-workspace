@@ -460,7 +460,8 @@ final class AdapterContractTests: XCTestCase {
             deadline: Date().addingTimeInterval(5))
         for try await e in stream { events.append(e) }
         XCTAssertTrue(events.contains(.uncertain(
-            "Native session for kimi could not be loaded; "
+            "Native session for kimi could not be loaded "
+            + "(ACP remote error -32000: no session); "
             + "started a new session (no checkpoint available yet)")))
     }
 
@@ -701,5 +702,219 @@ final class AdapterContractTests: XCTestCase {
             Array(history.prefix(10)), taskID: TaskID("task_x"))
         XCTAssertFalse(didCompact2)
         XCTAssertEqual(untouched.count, 10)
+    }
+
+    // MARK: - Native error preservation
+
+    /// session/new remote errors must surface their message (e.g. a native
+    /// team-settings timeout), not collapse into a generic adapter failure.
+    func testSessionNewFailurePreservesNativeMessage() async throws {
+        func encode(_ v: JSONValue) -> String {
+            String(decoding: try! JSONEncoder().encode(v), as: UTF8.self)
+        }
+        let transport = FakeACPTransport { line in
+            let msg = self.json(line)
+            let id = msg["id"] ?? .null
+            switch msg["method"]?.stringValue {
+            case "initialize":
+                return [#"{"jsonrpc":"2.0","id":"# + encode(id)
+                    + #","result":{"protocolVersion":1}}"#]
+            case "session/new":
+                return [#"{"jsonrpc":"2.0","id":"# + encode(id)
+                    + #","error":{"code":-32603,"message":"session/new failed: fetching team settings timed out after 10 seconds"}}"#]
+            default:
+                return []
+            }
+        }
+        let adapter = ACPHarnessAdapter(spec: spec(), transportFactory: { _, _ in transport })
+        do {
+            _ = try await adapter.openTaskSession(binding: binding())
+            XCTFail("session/new failure must throw")
+        } catch {
+            let detail = error.localizedDescription
+            XCTAssertTrue(detail.contains("session/new"), detail)
+            XCTAssertTrue(detail.contains("team settings timed out after 10 seconds"), detail)
+        }
+    }
+
+    /// A session/new response without a sessionId reports the real defect, not
+    /// a bare "adapter unavailable".
+    func testSessionNewMissingIDIsDescriptive() async throws {
+        func encode(_ v: JSONValue) -> String {
+            String(decoding: try! JSONEncoder().encode(v), as: UTF8.self)
+        }
+        let transport = FakeACPTransport { line in
+            let msg = self.json(line)
+            let id = msg["id"] ?? .null
+            switch msg["method"]?.stringValue {
+            case "initialize":
+                return [#"{"jsonrpc":"2.0","id":"# + encode(id)
+                    + #","result":{"protocolVersion":1}}"#]
+            case "session/new":
+                return [#"{"jsonrpc":"2.0","id":"# + encode(id)
+                    + #","result":{}}"#]
+            default:
+                return []
+            }
+        }
+        let adapter = ACPHarnessAdapter(spec: spec(), transportFactory: { _, _ in transport })
+        do {
+            _ = try await adapter.openTaskSession(binding: binding())
+            XCTFail("missing sessionId must throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("no sessionId"),
+                          error.localizedDescription)
+        }
+    }
+
+    /// A failed initialize (e.g. the sandboxed launcher died) leaves no
+    /// half-initialized client behind: the next open respawns the transport.
+    func testInitializeFailureRespawnsTransport() async throws {
+        func encode(_ v: JSONValue) -> String {
+            String(decoding: try! JSONEncoder().encode(v), as: UTF8.self)
+        }
+        var spawned = 0
+        var allowInitialize = false
+        let adapter = ACPHarnessAdapter(spec: spec()) { _, _ in
+            spawned += 1
+            return FakeACPTransport { line in
+                let msg = self.json(line)
+                let id = msg["id"] ?? .null
+                switch msg["method"]?.stringValue {
+                case "initialize":
+                    if allowInitialize {
+                        return [#"{"jsonrpc":"2.0","id":"# + encode(id)
+                            + #","result":{"protocolVersion":1}}"#]
+                    }
+                    return [#"{"jsonrpc":"2.0","id":"# + encode(id)
+                        + #","error":{"code":-32603,"message":"spawn rejected by sandbox"}}"#]
+                case "session/new":
+                    return [#"{"jsonrpc":"2.0","id":"# + encode(id)
+                        + #","result":{"sessionId":"fresh-9"}}"#]
+                default:
+                    return []
+                }
+            }
+        }
+        do {
+            _ = try await adapter.openTaskSession(binding: binding())
+            XCTFail("initialize failure must throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("initialize"),
+                          error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains("spawn rejected by sandbox"),
+                          error.localizedDescription)
+        }
+        allowInitialize = true
+        let ref = try await adapter.openTaskSession(binding: binding())
+        XCTAssertEqual(ref.nativeSessionID, "fresh-9")
+        XCTAssertEqual(spawned, 2)
+    }
+
+    // MARK: - DeepSeek model selection
+
+    /// A stub verification response whose `model` field is the provider echo.
+    private func verifyEcho(_ model: String) -> JSONValue {
+        .object([
+            "model": .string(model),
+            "choices": .array([.object(["message": .object([
+                "content": .string(""), "tool_calls": .null])])]),
+            "usage": .object(["prompt_tokens": .number(1),
+                              "completion_tokens": .number(1)]),
+        ])
+    }
+
+    /// The configured model is sent on the wire and verified at session open;
+    /// the provider echo becomes the effective model.
+    func testDeepSeekConfiguredModelVerifiedAtSessionOpen() async throws {
+        let recorded = Recorder()
+        let adapter = DeepSeekAdapter(
+            transport: StubHTTP(responses: [(200, verifyEcho("deepseek-v4-pro")),
+                                            (200, finalResponse())],
+                                recorded: recorded),
+            sessionsDir: dir + "/sessions",
+            endpoint: URL(string: "https://example.invalid/api")!,
+            model: "deepseek-v4-pro",
+            keyReader: { "sk-test" },
+            toolExecutor: { _, _ in "{}" })
+        // Before verification, the configured selection is reported.
+        let probe = await adapter.probe()
+        XCTAssertEqual(probe.effectiveModel, "deepseek-v4-pro")
+        let ref = try await adapter.openTaskSession(binding: SessionBinding(
+            taskID: TaskID("task_x"), engineerID: .deepseek, role: "owner",
+            workerID: "main"))
+        XCTAssertEqual(ref.nativeSessionID, "deepseek:task_x:main")
+        // First request is the bounded verification ping carrying the model.
+        XCTAssertEqual(recorded.bodies[0]["model"]?.stringValue, "deepseek-v4-pro")
+        XCTAssertEqual(recorded.bodies[0]["max_tokens"]?.intValue, 1)
+        // The real turn request carries the same configured model.
+        _ = try await collect(adapter)
+        XCTAssertEqual(recorded.bodies[1]["model"]?.stringValue, "deepseek-v4-pro")
+        // modelSelection feeds session bindings / usage rows.
+        XCTAssertEqual(adapter.modelSelection, "deepseek-v4-pro")
+    }
+
+    /// Default selection is the verified V4.1-Flash identifier.
+    func testDeepSeekDefaultModelIsV41FlashAlias() async throws {
+        let recorded = Recorder()
+        let adapter = deepseek(responses: [(200, finalResponse())], recorded: recorded)
+        _ = try await collect(adapter)
+        XCTAssertEqual(recorded.bodies[0]["model"]?.stringValue, "deepseek-flash")
+        XCTAssertEqual(adapter.modelSelection, "deepseek-flash")
+    }
+
+    /// An identifier the provider does not serve fails the session open with
+    /// the provider's own message — before any real turn request runs.
+    func testDeepSeekUnavailableModelRejectedBeforeTurn() async throws {
+        let recorded = Recorder()
+        let adapter = DeepSeekAdapter(
+            transport: StubHTTP(responses: [(400, .object([
+                "error": .object([
+                    "message": .string("The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-v4.1.")])]))],
+                                recorded: recorded),
+            sessionsDir: dir + "/sessions",
+            endpoint: URL(string: "https://example.invalid/api")!,
+            model: "deepseek-v4.1",
+            keyReader: { "sk-test" },
+            toolExecutor: { _, _ in "{}" })
+        do {
+            _ = try await adapter.openTaskSession(binding: SessionBinding(
+                taskID: TaskID("task_x"), engineerID: .deepseek, role: "owner",
+                workerID: "main"))
+            XCTFail("unavailable model must fail session open")
+        } catch {
+            let detail = error.localizedDescription
+            XCTAssertTrue(detail.contains("deepseek-v4.1"), detail)
+            XCTAssertTrue(detail.contains("supported API model names"), detail)
+        }
+        XCTAssertEqual(recorded.bodies.count, 1) // only the verification ping
+    }
+
+    /// A provider-side alias (configured name ≠ served name) is reported
+    /// through the uncertain channel rather than silently accepted.
+    func testDeepSeekAliasEchoReported() async throws {
+        let recorded = Recorder()
+        var alias = toolCallResponse()
+        if case .object(var o) = alias {
+            o["model"] = .string("deepseek-flash")
+            alias = .object(o)
+        }
+        var final = finalResponse()
+        if case .object(var o) = final {
+            o["model"] = .string("deepseek-flash")
+            final = .object(o)
+        }
+        let adapter = DeepSeekAdapter(
+            transport: StubHTTP(responses: [(200, alias), (200, final)],
+                                recorded: recorded),
+            sessionsDir: dir + "/sessions",
+            endpoint: URL(string: "https://example.invalid/api")!,
+            model: "deepseek-chat",
+            keyReader: { "sk-test" },
+            toolExecutor: { _, _ in #"{"ok":true}"# })
+        let events = try await collect(adapter)
+        XCTAssertTrue(events.contains(.uncertain(
+            "DeepSeek served model \"deepseek-flash\" for configured \"deepseek-chat\"")))
+        XCTAssertEqual(adapter.modelSelection, "deepseek-flash")
     }
 }

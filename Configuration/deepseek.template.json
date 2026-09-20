@@ -8,5 +8,5 @@
     "path": "~/.kimi-code/config.toml",
     "toml_path": "providers.deepseek.api_key"
   },
-  "notes": "Alias observed in API responses, not immutable weights. Requalify when provider mapping changes. Credential value never copied into this file."
+  "notes": "GET /models serves deepseek-flash (the V4.1-Flash alias) and deepseek-v4-pro only; literal deepseek-v4.1 is rejected. Aliases observed in API responses, not immutable weights — the adapter verifies the configured model and records the echoed runtime model at session open. Requalify when provider mapping changes. Credential value never copied into this file."
 }

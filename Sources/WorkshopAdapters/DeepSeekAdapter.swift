@@ -36,30 +36,57 @@ public struct URLSessionHTTPTransport: HTTPTransport {
 /// never persisted). The API key is read at request time from a credential
 /// reference, never persisted or logged.
 public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
+    /// The provider alias for the DeepSeek V4.1 Flash line; verified against
+    /// the endpoint's advertised model list at session open.
+    public static let defaultModel = "deepseek-flash"
+
     public let engineer: EngineerID = .deepseek
     private let transport: HTTPTransport
     private let keyReader: @Sendable () throws -> String
     private let toolExecutor: @Sendable (String, JSONValue) async throws -> String
     private let sessionsDir: String
     private let endpoint: URL
+    /// Configured model identifier sent in the chat-completions request.
+    private let configuredModel: String
     private let maxIterations = 8
     private let maxTokens = 4000
+    private let verifyLock = NSLock()
+    /// Configured model → provider-echoed model, populated by the bounded
+    /// verification request at session open (once per configured model).
+    private var verifiedModels: [String: String] = [:]
     /// Checkpoint-derived summary provider for managed-history compaction
     /// (§6.3); wired by the daemon, nil in bare adapter tests.
     public var checkpointSummary: (@Sendable (TaskID) async -> String?)?
 
     /// `keyReader` returns the API key at request time (credential reference);
     /// `toolExecutor` runs a workshop tool and returns result JSON text.
+    /// `model` is the explicit chat-completions model identifier; it is
+    /// verified against the provider (and its echoed runtime name captured)
+    /// before the first real turn request.
     public init(transport: HTTPTransport = URLSessionHTTPTransport(),
                 sessionsDir: String,
                 endpoint: URL = URL(string: "https://api.deepseek.com/v1/chat/completions")!,
+                model: String = DeepSeekAdapter.defaultModel,
                 keyReader: @escaping @Sendable () throws -> String,
                 toolExecutor: @escaping @Sendable (String, JSONValue) async throws -> String) {
         self.transport = transport
         self.sessionsDir = sessionsDir
         self.endpoint = endpoint
+        self.configuredModel = model
         self.keyReader = keyReader
         self.toolExecutor = toolExecutor
+    }
+
+    /// No child process and no filesystem access — turns reach Workshop only
+    /// through capability-checked bridge tools, so no workspace copy is needed.
+    public let usesWorkspaceFilesystem = false
+
+    /// The model the provider actually serves for our selection — the echoed
+    /// `model` field once verified, else the configured identifier.
+    public var modelSelection: String? {
+        verifyLock.lock()
+        defer { verifyLock.unlock() }
+        return verifiedModels[configuredModel] ?? configuredModel
     }
 
     /// Targeted TOML section/key scanner for credential references — NOT a
@@ -96,7 +123,7 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
             return AdapterProbe(engineer: .deepseek,
                                 health: .available(
                                     "credential reference present; auth unverified until first turn"),
-                                effectiveModel: "deepseek-flash",
+                                effectiveModel: modelSelection,
                                 capabilities: ["tool_loop"], tested: false)
         } catch {
             return AdapterProbe(engineer: .deepseek,
@@ -112,8 +139,44 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
         // DeepSeek sessions are file-backed histories; nothing to open remotely.
         try FileManager.default.createDirectory(
             atPath: sessionsDir + "/" + binding.taskID.rawValue, withIntermediateDirectories: true)
+        try await verifyModel()
         return SessionRef(engineer: .deepseek,
                           nativeSessionID: "deepseek:\(binding.taskID):\(binding.workerID)")
+    }
+
+    /// Confirm the configured model is accepted before a real turn runs, and
+    /// record the provider-echoed runtime model. One bounded request per
+    /// configured model per adapter lifetime — an unavailable identifier fails
+    /// the turn here with the provider's message instead of mid-prompt.
+    private func verifyModel() async throws {
+        verifyLock.lock()
+        let cached = verifiedModels[configuredModel]
+        verifyLock.unlock()
+        if cached != nil { return }
+        let key = try keyReader()
+        let (status, body) = try await transport.postJSON(
+            url: endpoint,
+            headers: ["Authorization": "Bearer \(key)",
+                      "Content-Type": "application/json"],
+            body: ["model": .string(configuredModel),
+                   "messages": .array([.object([
+                       "role": .string("user"), "content": .string("ping")])]),
+                   "max_tokens": .number(1)])
+        switch status {
+        case 200:
+            let echoed = body["model"]?.stringValue ?? configuredModel
+            verifyLock.lock()
+            verifiedModels[configuredModel] = echoed
+            verifyLock.unlock()
+        case 401: throw Failure.auth
+        case 402, 429: throw Failure.quota
+        default:
+            throw Failure.transport(
+                "model \"\(configuredModel)\" rejected (HTTP \(status)): "
+                    + (body["error"]?["message"]?.stringValue
+                       ?? String(decoding: (try? JSONEncoder().encode(body)) ?? Data(),
+                                 as: UTF8.self).prefix(300).description))
+        }
     }
 
     /// Tool schemas sent to DeepSeek mirror the workshop bridge tools.
@@ -181,7 +244,7 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
                     case .auth: continuation.yield(.authRequired)
                     case .quota: continuation.yield(.quotaLimited)
                     default:
-                        continuation.yield(.uncertain(error.localizedDescription))
+                        continuation.yield(.uncertain(workshopErrorDescription(error)))
                     }
                     continuation.finish(throwing: error)
                 }
@@ -189,7 +252,17 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
         }
     }
 
-    enum Failure: Error { case auth, quota, transport(String) }
+    enum Failure: Error, LocalizedError {
+        case auth, quota, transport(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .auth: return "DeepSeek authentication failed (HTTP 401)"
+            case .quota: return "DeepSeek quota or billing exhausted (HTTP 402/429)"
+            case .transport(let detail): return "DeepSeek transport: \(detail)"
+            }
+        }
+    }
 
     private func runTurn(ref: SessionRef, context: TurnContext,
                          continuation: AsyncThrowingStream<AdapterEvent, Error>.Continuation)
@@ -215,13 +288,14 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
                 "content": .string(context.packetText(for: .deepseek))]))
         continuation.yield(.turnStarted)
         var iterations = 0
+        var aliasNoted = false
         while iterations < maxIterations {
             iterations += 1
             let (status, body) = try await transport.postJSON(
                 url: endpoint,
                 headers: ["Authorization": "Bearer \(key)",
                           "Content-Type": "application/json"],
-                body: ["model": .string("deepseek-flash"),
+                body: ["model": .string(configuredModel),
                        "thinking": .object(["type": .string("enabled")]),
                        "reasoning_effort": .string("max"),
                        "messages": .array(messages),
@@ -234,6 +308,16 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
             default:
                 if status >= 500 { continuation.yield(.uncertain("HTTP \(status)")) }
                 throw Failure.transport("HTTP \(status)")
+            }
+            if let echoed = body["model"]?.stringValue,
+               echoed != configuredModel, !aliasNoted {
+                aliasNoted = true
+                verifyLock.lock()
+                verifiedModels[configuredModel] = echoed
+                verifyLock.unlock()
+                continuation.yield(.uncertain(
+                    "DeepSeek served model \"\(echoed)\" for configured "
+                    + "\"\(configuredModel)\""))
             }
             guard let message = body["choices"]?.arrayValue?.first?["message"] else {
                 throw Failure.transport("malformed response")

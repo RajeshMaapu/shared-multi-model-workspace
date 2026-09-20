@@ -101,3 +101,19 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
         }
     }
 }
+
+extension WorkshopError: LocalizedError {
+    public var errorDescription: String? { message }
+}
+
+/// Render an error for user-facing surfaces (system events, logs) without
+/// losing the underlying cause. `localizedDescription` alone collapses typed
+/// errors to "The operation couldn't be completed"; this keeps provider and
+/// harness detail (e.g. a team-settings timeout) visible.
+public func workshopErrorDescription(_ error: Error) -> String {
+    if let rpc = error as? WorkshopRPCError { return rpc.message }
+    if let localized = error as? LocalizedError,
+       let detail = localized.errorDescription { return detail }
+    if error is CancellationError { return "cancelled" }
+    return String(describing: error)
+}

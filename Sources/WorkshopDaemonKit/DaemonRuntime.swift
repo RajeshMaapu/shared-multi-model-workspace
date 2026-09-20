@@ -186,6 +186,8 @@ public final class DaemonRuntime: @unchecked Sendable {
                 case .deepseek:
                     return DeepSeekAdapter(
                         sessionsDir: home + "/sessions/deepseek",
+                        model: engineersConfig.engineer(.deepseek)?.model_selection
+                            ?? DeepSeekAdapter.defaultModel,
                         keyReader: { try DeepSeekAdapter.readCredential() },
                         toolExecutor: { _, _ in "{}" }) // rebound after service init
                 }
@@ -234,6 +236,8 @@ public final class DaemonRuntime: @unchecked Sendable {
         if !isFake(.deepseek) {
             let bound = DeepSeekAdapter(
                 sessionsDir: home + "/sessions/deepseek",
+                model: engineersConfig.engineer(.deepseek)?.model_selection
+                    ?? DeepSeekAdapter.defaultModel,
                 keyReader: { try DeepSeekAdapter.readCredential() },
                 toolExecutor: { name, args in
                     guard WorkshopToolCatalog.method(for: name) != nil else {

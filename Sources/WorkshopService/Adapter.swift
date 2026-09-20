@@ -107,6 +107,11 @@ public struct TurnContext: Sendable {
         if let workspace {
             lines.append("Shared task workspace: " + workspace.path)
             lines.append("Workspace identity is shared by task participants. A shared path is not proof of an active writer lease; do not assume permission to mutate from this path alone.")
+            if workspace.state == "discussion" {
+                lines.append("Read-only discussion turn: this is a fenced scratch copy. "
+                    + "Changes here are sealed for review only and are never promoted "
+                    + "to the task workspace; reply with discussion, not edits.")
+            }
         }
         if let subtask, !subtask.acceptance.isEmpty {
             lines.append("Acceptance: " + subtask.acceptance.joined(separator: "; "))
@@ -223,6 +228,12 @@ public enum AdapterEvent: Sendable, Equatable {
 public protocol EngineerAdapter: Sendable {
     var engineer: EngineerID { get }
     var supportsIsolatedWorkspaceTurns: Bool { get }
+    /// Configured (or provider-verified) model identifier; persisted on the
+    /// session binding and recorded on usage rows. nil when unknown.
+    var modelSelection: String? { get }
+    /// Whether the adapter launches a process that reads/writes the workspace
+    /// (and so needs a fenced per-turn copy). Pure API adapters answer false.
+    var usesWorkspaceFilesystem: Bool { get }
     func probe() async -> AdapterProbe
     func openTaskSession(binding: SessionBinding) async throws -> SessionRef
     func sendTurn(ref: SessionRef, turnID: String, context: TurnContext,
@@ -237,4 +248,6 @@ public protocol EngineerAdapter: Sendable {
 
 public extension EngineerAdapter {
     var supportsIsolatedWorkspaceTurns: Bool { false }
+    var modelSelection: String? { nil }
+    var usesWorkspaceFilesystem: Bool { true }
 }

@@ -10,6 +10,13 @@ public protocol ACPTransport: Sendable {
     var lines: AsyncStream<String> { get }
     /// Terminate the underlying process (and its group) if running.
     func terminate()
+    /// Captured child stderr (bounded, redacted) for diagnostics; empty for
+    /// transports that are not child processes.
+    var stderrText: String { get }
+}
+
+public extension ACPTransport {
+    var stderrText: String { "" }
 }
 
 /// ACP transport over a spawned process's stdin/stdout. The child runs in its
@@ -356,5 +363,18 @@ public actor ACPClient {
 
     public enum ACPError: Error, Equatable {
         case remote(Int, String)
+    }
+
+    /// Redacted tail of the child's stderr, when the transport captures it —
+    /// the harness's own diagnostics (e.g. a team-settings timeout) live here.
+    public nonisolated var transportStderrText: String { transport.stderrText }
+}
+
+extension ACPClient.ACPError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .remote(let code, let message):
+            return "ACP remote error \(code): \(message)"
+        }
     }
 }

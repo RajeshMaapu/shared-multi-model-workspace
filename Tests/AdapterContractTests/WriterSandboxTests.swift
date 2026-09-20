@@ -116,4 +116,46 @@ final class WriterSandboxTests: XCTestCase {
         XCTAssertEqual(result["sqlite_create_wal_reopen"], true)
         XCTAssertEqual(result["protected_writes_denied"], true)
     }
+
+    /// fs.watch()/vnode lookup stats every ancestor of the watched path, so the
+    /// profile must grant file-read-metadata on the ancestors of the allowed
+    /// subpaths — without exposing metadata for unrelated Workshop state.
+    func testAncestorMetadataGrantUnblocksWatchWithoutLeakingSiblings() throws {
+        let root = "/private/tmp/writer-sandbox-" + UUID().uuidString
+        let work = root + "/writer-runs/one/workspace"
+        let profile = root + "/profiles/clean-v2/kimi"
+        for path in [work, profile, root + "/db"] {
+            try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        }
+        let sb = root + "/policy.sb"
+        try ProfileBuilder.writerSandboxProfile(workshopHome: root, worktree: work,
+             profile: profile, token: root + "/profiles/kimi/token", destination: sb,
+             engineer: .kimi)
+        let text = try String(contentsOfFile: sb)
+        XCTAssertTrue(text.contains("(subpath \"\(profile)\")"))
+        for ancestor in [root, root + "/writer-runs", root + "/profiles", root + "/profiles/clean-v2"] {
+            XCTAssertTrue(text.contains("(literal \"\(ancestor)\")"), ancestor)
+        }
+        let script = """
+        import os,sys,json
+        result=[]
+        for path in json.loads(sys.argv[1]):
+            try: os.stat(path); result.append(True)
+            except OSError: result.append(False)
+        print(json.dumps(result))
+        """
+        let probes = [work, profile, root + "/writer-runs", root, root + "/db"]
+        let process = Process(); let out = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+        process.arguments = ["-f", sb, "/usr/bin/python3", "-c", script,
+                             String(decoding: try JSONEncoder().encode(probes), as: UTF8.self)]
+        process.environment = ["PATH":"/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE":"1"]
+        process.standardOutput = out; process.standardError = FileHandle.standardError
+        try process.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        // Allowed subpaths + ancestors stat cleanly; a sibling control dir stays hidden.
+        XCTAssertEqual(try JSONDecoder().decode([Bool].self, from: data),
+                       [true, true, true, true, false])
+    }
 }

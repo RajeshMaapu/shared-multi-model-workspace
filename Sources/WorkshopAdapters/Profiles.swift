@@ -134,9 +134,15 @@ public enum ProfileBuilder {
 
     /// Per-generation write confinement. No grant covers Workshop control state,
     /// accepted snapshots, other writers or the registered source repository.
+    /// The profile-scoped write grants differ per harness: Devin's session store
+    /// is hardcoded under ~/.local/share/devin/cli plus a few config dirs, while
+    /// Kimi writes session storage across its whole KIMI_CODE_HOME profile and
+    /// fs.watch()es that directory — a Devin-shaped allowlist makes Kimi's
+    /// session/new fail with "storage write failed: permission denied".
     public static func writerSandboxProfile(workshopHome: String, worktree: String,
                                              profile: String, token: String,
-                                             destination: String) throws {
+                                             destination: String,
+                                             engineer: EngineerID = .devin) throws {
         let root = canonicalPath(workshopHome)
         let workspace = canonicalPath(worktree)
         guard workspace.hasPrefix(root + "/writer-runs/"), workspace.hasSuffix("/workspace") else {
@@ -154,15 +160,42 @@ public enum ProfileBuilder {
         }.joined(separator: "\n")
         let userHome = canonicalPath(NSHomeDirectory())
         let run = (workspace as NSString).deletingLastPathComponent
+        let profileWrites: String
+        switch engineer {
+        case .kimi:
+            // Kimi's KIMI_CODE_HOME is a Workshop-owned disposable profile:
+            // session storage, device state and its fs.watch live under it.
+            profileWrites = "(subpath \"\(profile)\")"
+        default:
+            profileWrites = "(subpath \"\(profile)/cache\") (subpath \"\(profile)/state\") (subpath \"\(profile)/data/devin/cli\") (subpath \"\(profile)/config/devin/cli\") (subpath \"\(userHome)/.local/share/devin/cli\") (literal \"\(userHome)/.local/share/fusion-codex-relay/.launch.lock\")"
+        }
+        // fs.watch()/vnode lookup stats every ancestor directory of the
+        // watched path; the blanket root deny breaks watch on otherwise
+        // allowed subpaths. Grant stat()-only access to the ancestors of the
+        // writable subpaths — directory contents remain denied.
+        var ancestors = Set<String>()
+        for path in [run, profile] {
+            var dir = (path as NSString).deletingLastPathComponent
+            while dir.hasPrefix(root) {
+                ancestors.insert(dir)
+                guard dir != root else { break }
+                dir = (dir as NSString).deletingLastPathComponent
+            }
+        }
+        let ancestorMetadata = ancestors.sorted()
+            .map { "(literal \"\($0)\")" }.joined(separator: " ")
         text += """
 
         (deny file-read* (regex #"/user[.]token$"))
         (deny file-write*)
-        (allow file-write* (subpath "\(run)") (subpath "\(profile)/cache") (subpath "\(profile)/state") (subpath "\(profile)/data/devin/cli") (subpath "\(profile)/config/devin/cli") (subpath "\(userHome)/.local/share/devin/cli") (literal "/dev/null") (literal "\(userHome)/.local/share/fusion-codex-relay/.launch.lock"))
+        (allow file-write* (subpath "\(run)") \(profileWrites) (literal "/dev/null"))
         (deny file-read* (subpath "\(root)"))
         (allow file-read* (subpath "\(run)") (subpath "\(profile)") (literal "\(token)"))
         (allow file-read-metadata (literal "\(root)") (literal "\(root)/profiles") (literal "\(root)/profiles/clean-v2"))
         """
+        if !ancestorMetadata.isEmpty {
+            text += "\n(allow file-read-metadata \(ancestorMetadata))"
+        }
         try text.write(toFile: destination, atomically: true, encoding: .utf8)
     }
 

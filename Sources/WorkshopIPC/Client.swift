@@ -161,3 +161,7 @@ public actor WorkshopClient {
         disconnect()
     }
 }
+
+extension WorkshopClient.RemoteError: LocalizedError {
+    public var errorDescription: String? { message }
+}
