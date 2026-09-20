@@ -133,6 +133,9 @@ final class WriterSandboxTests: XCTestCase {
              engineer: .kimi)
         let text = try String(contentsOfFile: sb)
         XCTAssertTrue(text.contains("(subpath \"\(profile)\")"))
+        // The user's real credential store must never be writable from a
+        // sandboxed turn — a failed refresh would wipe shared credentials.
+        XCTAssertFalse(text.contains(".kimi-code/credentials"))
         for ancestor in [root, root + "/writer-runs", root + "/profiles", root + "/profiles/clean-v2"] {
             XCTAssertTrue(text.contains("(literal \"\(ancestor)\")"), ancestor)
         }

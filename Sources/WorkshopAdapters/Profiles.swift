@@ -5,7 +5,7 @@ import WorkshopService
 
 /// Builds isolated per-engineer profiles and HarnessLaunchSpecs from settled
 /// live-probe facts. No credentials are copied except the documented
-/// reference patterns (Devin static-key file symlink, Kimi credential-dir link).
+/// reference patterns (Devin static-key file symlink, Kimi OAuth copy).
 public enum ProfileBuilder {
     public static func canonicalPath(_ path: String) -> String {
         if let resolved = realpath(path, nil) {
@@ -165,6 +165,9 @@ public enum ProfileBuilder {
         case .kimi:
             // Kimi's KIMI_CODE_HOME is a Workshop-owned disposable profile:
             // session storage, device state and its fs.watch live under it.
+            // Its OAuth file is a real directory with a seeded copy (see
+            // kimiProfile) — no grant into the user's real ~/.kimi-code store:
+            // a sandboxed turn must never write the shared credentials.
             profileWrites = "(subpath \"\(profile)\")"
         default:
             profileWrites = "(subpath \"\(profile)/cache\") (subpath \"\(profile)/state\") (subpath \"\(profile)/data/devin/cli\") (subpath \"\(profile)/config/devin/cli\") (subpath \"\(userHome)/.local/share/devin/cli\") (literal \"\(userHome)/.local/share/fusion-codex-relay/.launch.lock\")"
@@ -213,29 +216,80 @@ public enum ProfileBuilder {
         guard try FileManager.default.contentsOfDirectory(atPath: profile + "/skills").isEmpty else {
             throw WorkshopError.invalidRequest("Workshop Kimi skill profile has drifted; review required")
         }
-        let link = profile + "/credentials"
-        let target = NSHomeDirectory() + "/.kimi-code/credentials"
-        if !FileManager.default.fileExists(atPath: link),
-           FileManager.default.fileExists(atPath: target) {
-            try? FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: target)
+        // Credentials: a REAL directory holding a copy of the OAuth file —
+        // never a symlink into the user's store. The old symlink let a
+        // sandboxed turn's token refresh write through to the real
+        // kimi-code.json; a rejected refresh persisted an empty grant and
+        // wiped it. Refresh now stays inside this disposable profile.
+        let credDir = profile + "/credentials"
+        let sourceDir = NSHomeDirectory() + "/.kimi-code/credentials"
+        if (try? FileManager.default.destinationOfSymbolicLink(atPath: credDir)) != nil {
+            try? FileManager.default.removeItem(atPath: credDir)
+        }
+        try FileManager.default.createDirectory(atPath: credDir, withIntermediateDirectories: true)
+        func credentialIsValid(_ path: String) -> Bool {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let token = json["access_token"] as? String else { return false }
+            return !token.isEmpty
+        }
+        // Seed every valid credential file — kimi stores region-scoped
+        // tokens as kimi-code-env-*.json alongside the default file.
+        // Re-seed when the real file is valid and the profile copy is
+        // missing, invalid, or older — e.g. after re-authentication.
+        for file in (try? FileManager.default.contentsOfDirectory(atPath: sourceDir)) ?? []
+        where file.hasPrefix("kimi-code") && file.hasSuffix(".json") {
+            let source = sourceDir + "/" + file
+            let dest = credDir + "/" + file
+            guard credentialIsValid(source) else { continue }
+            let sourceTime = (try? FileManager.default
+                .attributesOfItem(atPath: source))?[.modificationDate] as? Date
+            let destTime = (try? FileManager.default
+                .attributesOfItem(atPath: dest))?[.modificationDate] as? Date
+            if !credentialIsValid(dest) || (sourceTime != nil && (destTime == nil || sourceTime! > destTime!)) {
+                try? FileManager.default.removeItem(atPath: dest)
+                try? FileManager.default.copyItem(atPath: source, toPath: dest)
+            }
         }
         // config.toml: minimal managed-kimi-code profile. The api_key field is
         // an empty placeholder in the canonical config (verified: both files
-        // carry `""`); real auth is OAuth via the linked credentials dir.
+        // carry `""`); real auth is OAuth via the copied credentials dir.
         // Never copy the user's full config — it holds unrelated provider keys.
+        // The managed provider + oauth tables ARE copied: the oauth key embeds
+        // the region env (kimi-code-env-*) chosen at `kimi login`, and the
+        // region's base_url/oauth_host must match or no credential resolves.
+        var managedBlock = """
+        [providers."managed:kimi-code"]
+        type = "kimi"
+        api_key = ""
+        base_url = "https://api.kimi.com/coding/v1"
+
+        [providers."managed:kimi-code".oauth]
+        storage = "file"
+        key = "oauth/kimi-code"
+        """
+        if let userConfig = try? String(
+            contentsOfFile: NSHomeDirectory() + "/.kimi-code/config.toml", encoding: .utf8) {
+            var extracted = ""
+            var capture = false
+            for raw in userConfig.components(separatedBy: "\n") {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("[") {
+                    capture = line == "[providers.\"managed:kimi-code\"]"
+                        || line == "[providers.\"managed:kimi-code\".oauth]"
+                }
+                if capture { extracted += raw + "\n" }
+            }
+            if extracted.contains("oauth") {
+                managedBlock = extracted.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
         let dest = profile + "/config.toml"
         do {
             let config = """
             default_model = "kimi-code/k3"
 
-            [providers."managed:kimi-code"]
-            type = "kimi"
-            api_key = ""
-            base_url = "https://api.kimi.com/coding/v1"
-
-            [providers."managed:kimi-code".oauth]
-            storage = "file"
-            key = "oauth/kimi-code"
+            \(managedBlock)
 
             [models."kimi-code/k3"]
             provider = "managed:kimi-code"

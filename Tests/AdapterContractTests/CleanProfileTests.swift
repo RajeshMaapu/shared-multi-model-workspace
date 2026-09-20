@@ -40,6 +40,22 @@ final class CleanProfileTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker))
     }
 
+    /// The pre-repair profile symlinked credentials into the user's real
+    /// ~/.kimi-code store, letting a sandboxed refresh wipe it. The profile
+    /// must hold a real directory instead — the symlink is migrated away.
+    func testKimiCredentialsSymlinkMigratesToOwnedDirectory() throws {
+        let home = NSTemporaryDirectory() + "clean-creds-" + UUID().uuidString
+        let profile = try ProfileBuilder.kimiProfile(home: home)
+        let credDir = profile + "/credentials"
+        try FileManager.default.removeItem(atPath: credDir)
+        try FileManager.default.createSymbolicLink(atPath: credDir, withDestinationPath: "/tmp")
+        _ = try ProfileBuilder.kimiProfile(home: home)
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: credDir))
+        var isDir: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: credDir, isDirectory: &isDir))
+        XCTAssertTrue(isDir.boolValue)
+    }
+
     func testSandboxBlocksInstructionCanariesButAllowsSourceAndNativeSkill() throws {
         let home = NSTemporaryDirectory() + "clean-sandbox-" + UUID().uuidString
         let workspace = home + "/worktrees/task"

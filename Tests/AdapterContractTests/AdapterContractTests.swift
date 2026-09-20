@@ -465,6 +465,58 @@ final class AdapterContractTests: XCTestCase {
             + "started a new session (no checkpoint available yet)")))
     }
 
+    /// A session/load that never answers (sandboxed harness wedged mid-resume)
+    /// must time out, close the stalled transport, and fall back to
+    /// session/new on a respawned client.
+    func testSessionLoadTimeoutFallsBackToNewOnFreshTransport() async throws {
+        func encode(_ v: JSONValue) -> String {
+            String(decoding: try! JSONEncoder().encode(v), as: UTF8.self)
+        }
+        let spawns = LockedCounter()
+        let responder: @Sendable (String) -> [String] = { line in
+            let msg = try! JSONDecoder().decode(JSONValue.self, from: Data(line.utf8))
+            let id = msg["id"] ?? .null
+            switch msg["method"]?.stringValue {
+            case "initialize":
+                return [#"{"jsonrpc":"2.0","id":"# + encode(id)
+                    + #","result":{"protocolVersion":1}}"#]
+            case "session/load":
+                return []  // never answered — the wedged resume
+            case "session/new":
+                return [#"{"jsonrpc":"2.0","id":"# + encode(id)
+                    + #","result":{"sessionId":"fresh-after-timeout"}}"#]
+            case "session/prompt":
+                return [#"{"jsonrpc":"2.0","id":"# + encode(id)
+                    + #","result":{"stopReason":"end_turn"}}"#]
+            default:
+                return []
+            }
+        }
+        let adapter = ACPHarnessAdapter(
+            spec: spec(), transportFactory: { _, _ in
+                spawns.bump()
+                return FakeACPTransport(responder: responder)
+            }, sessionLoadTimeout: .milliseconds(150))
+        let ref = try await adapter.openTaskSession(binding: binding(native: "wedged-1"))
+        XCTAssertEqual(ref.nativeSessionID, "fresh-after-timeout")
+        XCTAssertEqual(spawns.value, 2)  // stalled transport was closed + respawned
+        let task = WorkshopTask(id: TaskID("task_x"), channel: "main", title: "T",
+                                brief: "b", phase: .execution, state: .working,
+                                budgetPolicyRef: nil, createdAt: Date(), updatedAt: Date())
+        var events: [AdapterEvent] = []
+        let stream = adapter.sendTurn(
+            ref: ref, turnID: "t1",
+            context: TurnContext(task: task, subtask: nil, recentMessages: []),
+            deadline: Date().addingTimeInterval(5))
+        for try await e in stream { events.append(e) }
+        XCTAssertTrue(events.contains { e in
+            if case .uncertain(let note) = e {
+                return note.contains("could not be loaded")
+            }
+            return false
+        })
+    }
+
     func testKimiSessionNewCarriesMCPServers() async throws {
         let transport = FakeACPTransport(responder: happyResponder())
         let adapter = ACPHarnessAdapter(
@@ -533,6 +585,12 @@ final class AdapterContractTests: XCTestCase {
         var bodies: [[String: JSONValue]] = []
         let lock = NSLock()
         func append(_ b: [String: JSONValue]) { lock.lock(); bodies.append(b); lock.unlock() }
+    }
+
+    private final class LockedCounter: @unchecked Sendable {
+        private(set) var value = 0
+        private let lock = NSLock()
+        func bump() { lock.lock(); value += 1; lock.unlock() }
     }
 
     private struct StubHTTP: HTTPTransport {

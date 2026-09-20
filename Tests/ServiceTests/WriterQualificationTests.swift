@@ -191,4 +191,49 @@ final class WriterQualificationTests: XCTestCase {
         XCTAssertTrue(states.allSatisfy { $0["state"]?.text == "review_only" })
         await service.shutdown()
     }
+
+    /// A user @mention wakes the named peer even when no subtask is owned —
+    /// the compose UI advertises "@mention an engineer"; previously a user
+    /// mention was silently ignored because only engineer authors were scanned.
+    func testV2UserMentionWakesPeerWithoutOwnedSubtask() async throws {
+        let root = makeHome()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let kimi = FakeAdapter(engineer: .kimi, delayPerDelta: .zero)
+        let devin = FakeAdapter(engineer: .devin, delayPerDelta: .zero)
+        let service = try CollaborationService(
+            databasePath: root + "/db.sqlite",
+            adapters: [Unqualified(fake: kimi), Unqualified(fake: devin)],
+            dispatcherEnabled: false, homeDir: root, wakeupCoalescence: .zero)
+        let receipt = try await service.createTask(CreateTaskRequest(
+            schemaVersion: 2, idempotencyKey: "user-mention", title: "T", objective: "obj",
+            phase: .execution, participants: [.kimi, .devin],
+            collaborationMode: .requestedPeers))
+        await service.start()
+        // Build engineer-triggered mention history at/past the loop bound, as a
+        // real discussion would; each engineer @kimi produces one wakeup.
+        for i in 0..<7 {
+            _ = try await service.postMessage(taskID: receipt.taskID,
+                                              body: "@kimi ping \(i)",
+                                              principal: .engineer(.devin))
+            _ = await waitForTurns(kimi, i + 1)
+        }
+        let preUser = await waitForWakeReason(kimi, "mention")
+        XCTAssertNotNil(preUser)
+        let userMessage = try await service.postMessage(taskID: receipt.taskID,
+                                          body: "@kimi please review the proposal")
+        // The fresh user message resets the loop bound: the mention must not
+        // be suppressed even though engineer wakeups alone already hit it.
+        let db = try Database(path: root + "/db.sqlite")
+        let pending = try db.query("""
+            SELECT state FROM wakeups
+            WHERE engineer_id='kimi' AND reason='mention' AND trigger_seq=?
+            """, [.integer(Int64(userMessage.seq))])
+        XCTAssertNotEqual(pending.first?["state"]?.text, "suppressed")
+        XCTAssertNotNil(pending.first)
+        let kimiBefore = kimi.turnCount
+        _ = await waitForTurns(kimi, kimiBefore + 1)
+        await service.awaitIdle()
+        XCTAssertTrue(kimi.receivedContexts.contains { $0.wakeReason == "mention" })
+        await service.shutdown()
+    }
 }

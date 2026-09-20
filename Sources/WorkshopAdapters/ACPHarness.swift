@@ -105,6 +105,12 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     /// turnID → waiter resumed when the in-flight session/prompt call returns
     /// (T23 cancel acknowledgement) and turns whose prompt already finished.
     private let cancellationTimeout: Duration
+    /// Bound on session/load: a sandboxed harness can stall without erroring
+    /// (kimi retries fs.watch on the session's previously-recorded workspace,
+    /// which the new generation's profile denies) — then no response ever
+    /// arrives and the caller wedges. On timeout the client is closed and the
+    /// caller falls back to session/new.
+    private let sessionLoadTimeout: Duration
     private var promptFinished: Set<String> = []
     /// Notes produced outside a turn stream (e.g. session/load fallback);
     /// emitted as `.uncertain` at the start of the next sendTurn.
@@ -116,8 +122,10 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                     = { try ProcessACPTransport(argv: $0.argv, env: $0.env, cwd: $1) },
                 versionProbe: @escaping @Sendable (String) -> String?
                     = ACPHarnessAdapter.defaultVersionProbe,
-                cancellationTimeout: Duration = .seconds(10)) {
+                cancellationTimeout: Duration = .seconds(10),
+                sessionLoadTimeout: Duration = .seconds(30)) {
         self.cancellationTimeout = cancellationTimeout
+        self.sessionLoadTimeout = sessionLoadTimeout
         self.engineer = spec.engineer
         self.spec = spec
         self.transportFactory = transportFactory
@@ -193,14 +201,52 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         if let native = binding.nativeSessionID, sessionID == nil {  // lock-held read
 
             // Try to load the persisted native session; fall back to new.
+            // The call is bounded: a harness that stalls mid-resume (e.g. the
+            // sandbox denies the session's previously-recorded workspace) never
+            // answers — timeout closes the client, which releases the wedged
+            // pending call, and a fresh transport runs session/new instead.
+            let mcp = mcpServersParam()
             do {
-                _ = try await client.call("session/load", params: .object([
-                    "sessionId": .string(native), "cwd": .string(cwd),
-                    "mcpServers": .array(mcpServersParam())]))
+                _ = try await withThrowingTaskGroup(of: JSONValue.self) { group in
+                    group.addTask {
+                        try await client.call("session/load", params: .object([
+                            "sessionId": .string(native), "cwd": .string(cwd),
+                            "mcpServers": .array(mcp)]))
+                    }
+                    group.addTask {
+                        try await Task.sleep(for: self.sessionLoadTimeout)
+                        let tail = self.stderrExcerpt(client)
+                        await client.close()
+                        throw HarnessSessionError(
+                            engineer: self.engineer, operation: "session/load(timeout)",
+                            underlying: "no response after \(self.sessionLoadTimeout)",
+                            stderrTail: tail)
+                    }
+                    let value = try await group.next()
+                    group.cancelAll()
+                    return value ?? .null
+                }
                 sessionID = native
             } catch {
                 let why = workshopErrorDescription(error)
-                sessionID = try await newSession(client: client, cwd: cwd)
+                var fresh = client
+                // A stalled resume leaves the process mid-load; give
+                // session/new a clean transport rather than reusing it. The
+                // timeout task closes the client, which releases the wedged
+                // call as CancellationError — that error can win group.next()
+                // before the timeout itself throws, so treat it the same.
+                let wedged = error is CancellationError
+                    || (error as? HarnessSessionError)?.operation == "session/load(timeout)"
+                if wedged {
+                    await client.close()
+                    self.client = nil
+                    try await ensureClient(cwd: cwd)
+                    guard let respawned = self.client else {
+                        throw WorkshopError.adapterUnavailable(engineer)
+                    }
+                    fresh = respawned
+                }
+                sessionID = try await newSession(client: fresh, cwd: cwd)
                 lock.lock()
                 pendingNotes.append(
                     "Native session for \(engineer.rawValue) could not be loaded "

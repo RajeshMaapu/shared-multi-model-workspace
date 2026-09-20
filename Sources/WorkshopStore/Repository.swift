@@ -725,13 +725,18 @@ public final class WorkshopRepository {
     }
 
     /// Consecutive engineer-triggered wakeups in a task with no intervening user
-    /// message (loop bound, T11).
+    /// message (loop bound, T11). The watermark is the last user-authored
+    /// MESSAGE, not the last wakeup row: a user message that wakes nobody must
+    /// still reset the count, otherwise historical engineer wakeups suppress a
+    /// fresh user @mention forever.
     public func engineerWakeupsSinceLastUserMessage(_ taskID: TaskID) throws -> Int {
         let r = try db.query("""
-            SELECT COUNT(*) AS n FROM wakeups
-            WHERE task_id=? AND state != 'suppressed'
-              AND id > COALESCE((SELECT MAX(id) FROM wakeups w2
-                                 WHERE w2.task_id=? AND w2.reason='user_message'), 0)
+            SELECT COUNT(*) AS n FROM wakeups w
+            JOIN messages m ON m.task_id = w.task_id AND m.seq = w.trigger_seq
+            WHERE w.task_id=? AND w.state != 'suppressed'
+              AND m.author_kind='engineer'
+              AND w.trigger_seq > COALESCE((SELECT MAX(seq) FROM messages u
+                     WHERE u.task_id=? AND u.author_kind='user'), 0)
             """, [.text(taskID.rawValue), .text(taskID.rawValue)]).first
         return Int(r?["n"]?.int ?? 0)
     }

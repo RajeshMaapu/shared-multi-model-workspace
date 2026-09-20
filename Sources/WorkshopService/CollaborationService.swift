@@ -1151,6 +1151,15 @@ public actor CollaborationService {
                 .compactMap(\.ownerID).first, participantIDs.contains(owner) {
                 targets.append((owner, "user_message"))
             }
+            // Explicit @mentions of participants wake them too — the compose UI
+            // advertises "@mention an engineer" and the mentioned turn runs as
+            // read-only discussion, so this cannot grant write reach.
+            for engineer in EngineerID.allCases
+            where message.body.contains("@\(engineer.rawValue)")
+                && participantIDs.contains(engineer)
+                && !targets.contains(where: { $0.0 == engineer }) {
+                targets.append((engineer, "mention"))
+            }
         case .engineer(let author):
             // Explicit @mentions of other participants.
             for engineer in EngineerID.allCases where engineer != author {
