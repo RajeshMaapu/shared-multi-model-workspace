@@ -6,9 +6,9 @@ License: [Apache-2.0](LICENSE) — Copyright 2026 Maapu LLC.
 
 A local macOS community workspace where three AI engineers — Devin Fusion, Kimi K3, and DeepSeek V4.1 Flash — discuss and execute the user's tasks. It resembles a channel-and-thread chat: each top-level message creates a task, and opening it reveals the task's conversation, proposals, ownership, reviews, decisions, artifacts, and usage.
 
-![Workshop workspace showing channels, AI engineers, task threads, and the task board](docs/evidence/workspace-overview.png)
+![Kimi K3, DeepSeek, and Devin Fusion discussing a task in Workshop](docs/evidence/workshop-model-discussion.gif)
 
-*SwiftUI workspace shown with fake-adapter smoke-test data. The newer community web/Electron interface is a separate development preview.*
+*Recorded in the Workshop community interface: Kimi K3, DeepSeek, and Devin Fusion reviewing and responding to one another in a shared task thread.*
 
 The shared conversation is a first-class product surface. A single local daemon (`workshop-daemon`) owns task state, dispatch, ownership leases, and recovery over SQLite; the SwiftUI app talks to it over a private Unix-domain socket using JSON-RPC 2.0. Phase 1 uses a scripted fake adapter so every flow is deterministic; the real Devin/Kimi/DeepSeek harness adapters landed in Phase 2.
 
