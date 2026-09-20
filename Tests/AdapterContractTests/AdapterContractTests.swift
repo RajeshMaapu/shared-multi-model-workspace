@@ -762,6 +762,48 @@ final class AdapterContractTests: XCTestCase {
         XCTAssertEqual(untouched.count, 10)
     }
 
+    /// The suffix cut must not leave a leading `tool` result whose assistant
+    /// call was dropped — that makes the provider reject the next request.
+    func testDeepSeekCompactionSkipsOrphanedToolSequence() async throws {
+        let adapter = deepseek(responses: [], recorded: Recorder())
+        adapter.checkpointSummary = nil
+        func msg(_ role: String, _ extra: [String: JSONValue] = [:]) -> JSONValue {
+            var o: [String: JSONValue] = ["role": .string(role),
+                                        "content": .string("x")]
+            for (k, v) in extra { o[k] = v }
+            return .object(o)
+        }
+        // suffix(20) lands between the assistant call and its results:
+        // kept starts on the orphaned tool result.
+        var history = (0..<44).map { _ in msg("user") }
+        history.append(msg("assistant", ["tool_calls": .array([
+            .object(["id": .string("call_1")]),
+            .object(["id": .string("call_2")])]), "content": .null]))
+        history.append(msg("tool", ["tool_call_id": .string("call_1")]))
+        history.append(msg("tool", ["tool_call_id": .string("call_2")]))
+        history += (0..<18).map { _ in msg("user") }
+        let (kept, didCompact) = await adapter.compactedHistory(
+            history, taskID: TaskID("task_x"))
+        XCTAssertTrue(didCompact)
+        XCTAssertEqual(kept.first?["role"]?.stringValue, "system")
+        XCTAssertEqual(kept.count, 19)
+        XCTAssertEqual(kept[1]["role"]?.stringValue, "user",
+                       "orphan tool results must be dropped")
+        for m in kept { XCTAssertNotEqual(m["role"]?.stringValue, "tool") }
+
+        // Boundary landing ON the assistant keeps it only when all its
+        // results follow.
+        var answered = (0..<45).map { _ in msg("user") }
+        answered.append(msg("assistant", ["tool_calls": .array([
+            .object(["id": .string("call_9")])]), "content": .null]))
+        answered.append(msg("tool", ["tool_call_id": .string("call_9")]))
+        answered += (0..<18).map { _ in msg("user") }
+        let (kept2, _) = await adapter.compactedHistory(
+            answered, taskID: TaskID("task_x"))
+        XCTAssertEqual(kept2[1]["role"]?.stringValue, "assistant")
+        XCTAssertEqual(kept2[2]["tool_call_id"]?.stringValue, "call_9")
+    }
+
     // MARK: - Native error preservation
 
     /// session/new remote errors must surface their message (e.g. a native

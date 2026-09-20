@@ -215,6 +215,26 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
         }
         guard history.count > 60 || chars > 200_000 else { return (history, false) }
         var kept = Array(history.suffix(20))
+        // The suffix can land inside a tool-call sequence: a leading `tool`
+        // result whose assistant call was dropped (or a leading assistant
+        // whose results were dropped) makes the next request HTTP 400.
+        // Advance the start to a clean boundary.
+        while let first = kept.first {
+            let role = first["role"]?.stringValue
+            if role == "tool" { kept.removeFirst(); continue }
+            if role == "assistant",
+               let calls = first["tool_calls"]?.arrayValue, !calls.isEmpty {
+                var missing = calls.compactMap { $0["id"]?.stringValue }
+                var j = 1
+                while j < kept.count, kept[j]["role"]?.stringValue == "tool" {
+                    if let id = kept[j]["tool_call_id"]?.stringValue,
+                       let k = missing.firstIndex(of: id) { missing.remove(at: k) }
+                    j += 1
+                }
+                if !missing.isEmpty { kept.removeFirst(); continue }
+            }
+            break
+        }
         let summary = (await checkpointSummary?(taskID))
             ?? "Earlier turns compacted; re-read the task state via workshop_get_task."
         kept.insert(.object([
