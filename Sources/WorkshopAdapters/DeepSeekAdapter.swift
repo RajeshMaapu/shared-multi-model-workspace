@@ -49,7 +49,9 @@ public final class DeepSeekAdapter: EngineerAdapter, @unchecked Sendable {
     /// Configured model identifier sent in the chat-completions request.
     private let configuredModel: String
     private let maxIterations = 8
-    private let maxTokens = 4000
+    // reasoning_effort=max can spend most of the budget inside
+    // reasoning_content; 4000 truncated every turn with empty content.
+    private let maxTokens = 65536
     private let verifyLock = NSLock()
     /// Configured model → provider-echoed model, populated by the bounded
     /// verification request at session open (once per configured model).
