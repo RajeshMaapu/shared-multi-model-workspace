@@ -236,4 +236,31 @@ final class WriterQualificationTests: XCTestCase {
         XCTAssertTrue(kimi.receivedContexts.contains { $0.wakeReason == "mention" })
         await service.shutdown()
     }
+
+    /// A FakeAdapter turn must never commit a journal message that reads as a
+    /// real engineer response — the default reply carries an explicit marker.
+    func testFakeAdapterReplyIsMarkedInJournal() async throws {
+        let root = makeHome()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let kimi = FakeAdapter(engineer: .kimi, delayPerDelta: .zero)
+        let service = try CollaborationService(
+            databasePath: root + "/db.sqlite", adapters: [kimi],
+            dispatcherEnabled: false, homeDir: root, wakeupCoalescence: .zero)
+        let receipt = try await service.createTask(CreateTaskRequest(
+            schemaVersion: 2, idempotencyKey: "fake-marker", title: "T",
+            objective: "obj", phase: .execution, participants: [.kimi],
+            collaborationMode: .requestedPeers))
+        await service.start()
+        _ = try await service.postMessage(taskID: receipt.taskID,
+                                          body: "@kimi ping")
+        _ = await waitForTurns(kimi, 1)
+        await service.awaitIdle()
+        let messages = try await service.readMessages(receipt.taskID)
+        let fakeReply = messages.first {
+            $0.author == .engineer(.kimi) && $0.deliveryState == .committed }
+        XCTAssertNotNil(fakeReply)
+        XCTAssertTrue(fakeReply?.body.hasPrefix("[FAKE ADAPTER") == true,
+                      "fake output must be marked, got: \(fakeReply?.body ?? "nil")")
+        await service.shutdown()
+    }
 }

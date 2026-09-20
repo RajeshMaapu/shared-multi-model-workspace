@@ -204,6 +204,11 @@ public final class DaemonRuntime: @unchecked Sendable {
                     ?? UnconfiguredAdapter(engineer: $0))
         }
         self.adapters = built
+        let fakeNames = EngineerID.allCases.filter { isFake($0) }.map(\.rawValue)
+        if !fakeNames.isEmpty {
+            Self.log("WARNING: fake adapters active for [\(fakeNames.joined(separator: ", "))] "
+                + "(WORKSHOP_ADAPTERS=\(adaptersMode)); their turns are marked '[FAKE ADAPTER]' in the journal")
+        }
         self.adaptersModeLive = Set(EngineerID.allCases.filter { !isFake($0) })
 
         let dbPath = home + "/db/workshop.sqlite"

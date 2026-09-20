@@ -118,7 +118,10 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
                         }
                     }
                 } else {
-                    let reply = "Acknowledged \"\(title)\". \(engineerName) has claimed this subtask, " +
+                    // Unmistakable marker: a fake turn must never read as a
+                    // real engineer response in the task journal.
+                    let reply = "[FAKE ADAPTER — not a real engineer response] " +
+                        "Acknowledged \"\(title)\". \(engineerName) has claimed this subtask, " +
                         "reviewed the brief, and will report back with results."
                     // ~6 deltas forming the reply
                     let words = reply.split(separator: " ").map(String.init)
