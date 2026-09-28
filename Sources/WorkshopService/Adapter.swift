@@ -26,12 +26,17 @@ public struct SessionBinding: Codable, Equatable, Sendable {
     /// Service-verified writer paths for this task and engineer. Used only to
     /// authorize read-only native session reload from a prior generation.
     public var allowedSessionWorkspaces: [String]
+    /// The task's current fenced review seed snapshot — granted read-only to
+    /// harnesses that keep a warm native session (Kimi) so reviews always
+    /// read the same seed begin() selected.
+    public var reviewSeedPath: String?
 
     public init(taskID: TaskID, engineerID: EngineerID, role: String, workerID: String,
                 nativeSessionID: String? = nil, profileRevision: Int = 2,
                 modelSelection: String? = nil, recoveryState: String = "new",
                 workspace: TaskWorkspace? = nil,
-                allowedSessionWorkspaces: [String] = []) {
+                allowedSessionWorkspaces: [String] = [],
+                reviewSeedPath: String? = nil) {
         self.taskID = taskID
         self.engineerID = engineerID
         self.role = role
@@ -42,6 +47,7 @@ public struct SessionBinding: Codable, Equatable, Sendable {
         self.recoveryState = recoveryState
         self.workspace = workspace
         self.allowedSessionWorkspaces = allowedSessionWorkspaces
+        self.reviewSeedPath = reviewSeedPath
     }
 }
 
@@ -306,7 +312,8 @@ public struct TurnContext: Sendable {
             lines.append("## Conversation")
             for m in recentMessages
             where m.deliveryState == .committed && m.kind != .turnSummary {
-                lines.append("[\(m.seq)] \(m.author.displayName): \(m.body.strippedInlineImages)")
+                lines.append("[\(m.seq)] \(m.author.displayName)"
+                    + Self.laneTag(m) + ": \(m.body.strippedInlineImages)")
             }
         }
         if let wakeReason {
@@ -399,6 +406,16 @@ public struct TurnContext: Sendable {
         }
         return lines.joined(separator: "\n")
     }
+
+    /// " (managed lane)" provenance tag for messages whose structured card
+    /// records lane=managed (D-b); empty otherwise.
+    private static func laneTag(_ m: Message) -> String {
+        guard let s = m.structured,
+              let v = try? JSONDecoder().decode(JSONValue.self,
+                                                from: Data(s.utf8)),
+              v["lane"]?.stringValue == "managed" else { return "" }
+        return " (managed lane)"
+    }
 }
 
 /// Normalized adapter stream events (spec §7.1).
@@ -429,6 +446,12 @@ public protocol EngineerAdapter: Sendable {
     /// Whether the adapter launches a process that reads/writes the workspace
     /// (and so needs a fenced per-turn copy). Pure API adapters answer false.
     var usesWorkspaceFilesystem: Bool { get }
+    /// Identity used to look up capability records (Phase 3c); nil for
+    /// adapters that never gate on qualification.
+    var qualificationIdentity: QualificationIdentity? { get }
+    /// Binary whose SHA-256 was recorded at qualification (nil → no drift
+    /// advisory possible).
+    var qualificationBinaryPath: String? { get }
     func probe() async -> AdapterProbe
     func openTaskSession(binding: SessionBinding) async throws -> SessionRef
     func sendTurn(ref: SessionRef, turnID: String, context: TurnContext,
@@ -445,6 +468,24 @@ public extension EngineerAdapter {
     var supportsIsolatedWorkspaceTurns: Bool { false }
     var modelSelection: String? { nil }
     var usesWorkspaceFilesystem: Bool { true }
+    var qualificationIdentity: QualificationIdentity? { nil }
+    var qualificationBinaryPath: String? { nil }
+}
+
+/// Adapters whose writer qualification lives in config/capabilities.json
+/// (G-E5). DaemonRuntime injects `capabilityLookup` and `binaryDriftNotice`.
+public protocol CapabilityAwareAdapter: EngineerAdapter, AnyObject {
+    /// Record lookup for the adapter's qualification identity.
+    var capabilityLookup: (@Sendable (QualificationIdentity) -> CapabilityRecord?)? { get set }
+    /// Appended to probe detail when the recorded binary hash differs.
+    var binaryDriftNotice: String? { get set }
+    /// The concrete capability-checked adapters — lane selectors forward to
+    /// their wrapped lanes so drift/lookup land on the right identity.
+    var capabilitySubjects: [any CapabilityAwareAdapter] { get }
+}
+
+public extension CapabilityAwareAdapter {
+    var capabilitySubjects: [any CapabilityAwareAdapter] { [self] }
 }
 
 extension String {

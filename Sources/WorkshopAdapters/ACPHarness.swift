@@ -84,17 +84,29 @@ public struct HarnessSessionError: Error, LocalizedError, Equatable {
 
 /// Shared ACP harness adapter for Devin and Kimi. Keeps the process warm between
 /// turns for the same session; bounded idle timeout.
-public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
+public final class ACPHarnessAdapter: CapabilityAwareAdapter, @unchecked Sendable {
     public let engineer: EngineerID
     /// Configured model selector, propagated to session bindings and usage rows.
     public var modelSelection: String? { spec.modelSelection }
-    /// Qualified path: generation sandbox + relay-backed native Fusion. Other
-    /// models/harnesses remain gated until their live writer probes pass.
+    /// Qualified only when config/capabilities.json records a passed
+    /// isolated-writer recipe for this (engineer, native, model) identity
+    /// (G-E5) — the launch still requires the fenced-generation plumbing.
     public var supportsIsolatedWorkspaceTurns: Bool {
-        engineer == .devin && spec.executable == "/usr/bin/sandbox-exec"
-            && spec.sandboxProfilePath != nil && spec.worktreeRoot != nil
-            && spec.args.contains(NSHomeDirectory() + "/projects/fusion-codex-relay/bin/devin-fusion")
-            && spec.modelSelection == "fusion-gpt-6-astra-high-sidekick-swe-2-medium"
+        spec.sandboxProfilePath != nil && spec.worktreeRoot != nil
+            && qualificationIdentity.flatMap {
+                capabilityLookup?($0)?.qualified
+            } ?? false
+    }
+    /// Phase 3c: capability records are data, injected by DaemonRuntime.
+    public var capabilityLookup: (@Sendable (QualificationIdentity) -> CapabilityRecord?)?
+    /// Appended to probe detail when the recorded binary hash drifted.
+    public var binaryDriftNotice: String?
+    public var qualificationIdentity: QualificationIdentity? {
+        QualificationIdentity(engineer: engineer, lane: "native",
+                              model: spec.modelSelection)
+    }
+    public var qualificationBinaryPath: String? {
+        spec.versionProbePath ?? spec.executable
     }
     private let spec: HarnessLaunchSpec
     private let transportFactory: @Sendable (HarnessLaunchSpec, String) throws -> ACPTransport
@@ -143,16 +155,17 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         // path retries launches instead of dropping work (G-D5).
         guard let version = versionProbe(probePath) else {
             return AdapterProbe(engineer: engineer,
-                                health: .available("version unknown (probe failed); auth unverified until first turn"),
+                                health: .available("version unknown (probe failed); auth unverified until first turn" + (binaryDriftNotice.map { " — " + $0 } ?? "")),
                                 versions: [:],
                                 effectiveModel: spec.modelSelection,
                                 capabilities: ["acp", "session_load"],
                                 tested: false)
         }
         let qualified = version == spec.qualifiedVersion
-        let detail = qualified
+        var detail = qualified
             ? "v\(version) qualified; auth unverified until first turn"
             : "v\(version) UNTESTED (qualified \(spec.qualifiedVersion)); auth unverified until first turn"
+        if let notice = binaryDriftNotice { detail += " — \(notice)" }
         return AdapterProbe(engineer: engineer,
                             health: .available(detail),
                             versions: ["binary": version],
@@ -382,33 +395,36 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         let configPath = dir + "/mcp_config.local.json"
         try data.write(to: URL(fileURLWithPath: configPath))
         chmod(configPath, 0o600)
-        // Keep the file out of git status when the worktree is a repo.
-        let exclude = cwd + "/.git/info/exclude"
-        if FileManager.default.fileExists(atPath: exclude),
-           let existing = try? String(contentsOfFile: exclude),
-           !existing.contains(".devin/") {
-            try? (existing + "\n.devin/\n").write(toFile: exclude, atomically: true,
-                                                 encoding: .utf8)
+        // Keep the file out of git status when the worktree is a repo:
+        // create .git/info/exclude when missing (fresh generations have a
+        // .git dir but no exclude file yet).
+        let fm = FileManager.default
+        var isDir = ObjCBool(false)
+        if fm.fileExists(atPath: cwd + "/.git", isDirectory: &isDir), isDir.boolValue {
+            let infoDir = cwd + "/.git/info"
+            try? fm.createDirectory(atPath: infoDir, withIntermediateDirectories: true)
+            let exclude = infoDir + "/exclude"
+            if !fm.fileExists(atPath: exclude) {
+                try? "".write(toFile: exclude, atomically: true, encoding: .utf8)
+            }
+            if let existing = try? String(contentsOfFile: exclude),
+               !existing.contains(".devin/") {
+                try? (existing + "\n.devin/\n").write(toFile: exclude, atomically: true,
+                                                     encoding: .utf8)
+            }
         }
     }
 
+    /// Read-only prior-workspace grant for a warm Kimi session. The granted
+    /// path is the task's current fenced review seed — the same snapshot
+    /// begin() seeded this turn from — never a stale session-index path.
     private func priorKimiWorkspace(for binding: SessionBinding,
                                     currentCwd: String) -> String? {
-        guard engineer == .kimi, let native = binding.nativeSessionID,
-              !binding.allowedSessionWorkspaces.isEmpty,
-              let sandbox = spec.sandboxProfilePath else { return nil }
-        let profile = (sandbox as NSString).deletingLastPathComponent
-        let index = profile + "/session_index.jsonl"
-        guard let contents = try? String(contentsOfFile: index, encoding: .utf8) else { return nil }
-        for line in contents.split(separator: "\n").reversed() {
-            guard let data = line.data(using: .utf8),
-                  let entry = try? JSONDecoder().decode(JSONValue.self, from: data),
-                  entry["sessionId"]?.stringValue == native,
-                  let path = entry["workDir"]?.stringValue else { continue }
-            return path != currentCwd && binding.allowedSessionWorkspaces.contains(path)
-                ? path : nil
-        }
-        return nil
+        guard engineer == .kimi, binding.nativeSessionID != nil,
+              spec.sandboxProfilePath != nil,
+              let seed = binding.reviewSeedPath,
+              seed != currentCwd else { return nil }
+        return seed
     }
 
     private func ensureClient(cwd: String, taskID: String,

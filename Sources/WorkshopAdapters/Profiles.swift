@@ -165,6 +165,7 @@ public enum ProfileBuilder {
                                              readOnlyPriorWorkspace: String? = nil) throws {
         let root = canonicalPath(workshopHome)
         let workspace = canonicalPath(worktree)
+        let profile = canonicalPath(profile)
         guard workspace.hasPrefix(root + "/writer-runs/"), workspace.hasSuffix("/workspace") else {
             throw WorkshopError.invalidRequest("Writer workspace is outside the generation root")
         }
@@ -172,9 +173,13 @@ public enum ProfileBuilder {
             ?? NSHomeDirectory() + "/.kimi-code/credentials")
         let prior = readOnlyPriorWorkspace.map(canonicalPath)
         if let prior {
+            let underRuns = prior.hasPrefix(root + "/writer-runs/")
+                && prior.hasSuffix("/workspace")
+            // Review-seed snapshots live under writer-snapshots/ and are
+            // immutable; either shape is a valid read-only grant.
+            let underSnapshots = prior.hasPrefix(root + "/writer-snapshots/")
             guard engineer == .kimi, prior != workspace,
-                  prior.hasPrefix(root + "/writer-runs/"),
-                  prior.hasSuffix("/workspace") else {
+                  underRuns || underSnapshots else {
                 throw WorkshopError.invalidRequest("Prior session workspace is outside the generation root")
             }
         }
@@ -198,7 +203,7 @@ public enum ProfileBuilder {
             // OAuth refresh replaces files inside the linked canonical dir.
             profileWrites = "(subpath \"\(profile)\") (subpath \"\(credentialPath)\")"
         default:
-            profileWrites = "(subpath \"\(profile)/cache\") (subpath \"\(profile)/state\") (subpath \"\(profile)/data/devin/cli\") (subpath \"\(profile)/config/devin/cli\") (subpath \"\(userHome)/.local/share/devin/cli\") (literal \"\(userHome)/.local/share/fusion-codex-relay/.launch.lock\")"
+            profileWrites = "(subpath \"\(profile)/cache\") (subpath \"\(profile)/state\") (subpath \"\(profile)/data/devin/cli\") (subpath \"\(profile)/config/devin/cli\") (subpath \"\(userHome)/.local/share/devin/cli\") (subpath \"\(userHome)/.local/share/fusion-codex-relay\")"
         }
         // fs.watch()/vnode lookup stats every ancestor directory of the
         // watched path; the blanket root deny breaks watch on otherwise
@@ -231,6 +236,56 @@ public enum ProfileBuilder {
             text += "\n(allow file-read* (subpath \"\(prior)\"))"
             text += "\n(deny file-read* (regex #\"/user[.]token$\"))"
         }
+        if !ancestorMetadata.isEmpty {
+            text += "\n(allow file-read-metadata \(ancestorMetadata))"
+        }
+        try text.write(toFile: destination, atomically: true, encoding: .utf8)
+    }
+
+    /// Managed-lane exec sandbox (Phase 3, D-b): the lane's local tools are
+    /// Workshop-owned and in-process; only `exec` runs a child, confined to
+    /// the fenced generation dir (worktree's parent). Keeps the personal
+    /// instruction denies from devinSandboxProfile; writes are allowed only
+    /// under the generation dir and /dev/null; reads of the rest of the
+    /// Workshop home are denied.
+    public static func managedSandboxProfile(workshopHome: String, worktree: String,
+                                             destination: String) throws {
+        let root = canonicalPath(workshopHome)
+        let workspace = canonicalPath(worktree)
+        guard workspace.hasPrefix(root + "/writer-runs/"),
+              workspace.hasSuffix("/workspace") else {
+            throw WorkshopError.invalidRequest(
+                "Managed workspace is outside the generation root")
+        }
+        for path in [root, workspace, destination] {
+            guard !path.contains("\""), !path.contains("\\"), !path.contains("\n") else {
+                throw WorkshopError.invalidRequest("Unsupported sandbox path")
+            }
+        }
+        try devinSandboxProfile(workshopHome: root, worktree: workspace,
+                                destination: destination)
+        var text = try String(contentsOfFile: destination)
+        text = text.components(separatedBy: "\n").filter {
+            !$0.hasPrefix("(deny file-write*") && !$0.hasPrefix("(allow file-write*")
+        }.joined(separator: "\n")
+        let run = (workspace as NSString).deletingLastPathComponent
+        var ancestors = Set<String>()
+        var dir = (run as NSString).deletingLastPathComponent
+        while dir.hasPrefix(root) {
+            ancestors.insert(dir)
+            guard dir != root else { break }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        let ancestorMetadata = ancestors.sorted()
+            .map { "(literal \"\($0)\")" }.joined(separator: " ")
+        text += """
+
+        (deny file-read* (regex #"/user[.]token$"))
+        (deny file-write*)
+        (allow file-write* (subpath "\(run)") (literal "/dev/null"))
+        (deny file-read* (subpath "\(root)"))
+        (allow file-read* (subpath "\(run)"))
+        """
         if !ancestorMetadata.isEmpty {
             text += "\n(allow file-read-metadata \(ancestorMetadata))"
         }

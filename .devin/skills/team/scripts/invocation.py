@@ -99,6 +99,36 @@ def validate_receipt(receipt):
             raise ValueError('Invalid receipt ' + field)
 
 
+def load_text(path):
+    path = safe_path(path)
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'r', encoding='utf-8') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError('Expected a regular file')
+        text = handle.read(32769)
+    if not isinstance(text, str) or not text.strip() or len(text) > 32768:
+        raise ValueError('Invalid follow-up body')
+    return text
+
+
+def validate_append(entry):
+    if not isinstance(entry, dict) or set(entry) != {'idempotency_key', 'request'}:
+        raise ValueError('Invalid append entry')
+    key = entry['idempotency_key']
+    prefix = 'codex-append-'
+    if not isinstance(key, str) or not key.startswith(prefix) or str(uuid.UUID(key[len(prefix):])) != key[len(prefix):]:
+        raise ValueError('Invalid append key')
+    request = entry['request']
+    if not isinstance(request, dict) or set(request) != {'task_id', 'body', 'idempotency_key'}:
+        raise ValueError('Invalid append request')
+    if request['idempotency_key'] != key:
+        raise ValueError('Append request key mismatch')
+    if not isinstance(request['body'], str) or not request['body'].strip() or len(request['body']) > 32768:
+        raise ValueError('Invalid append body')
+    if not isinstance(request['task_id'], str) or not re.fullmatch(r'task_[A-Za-z0-9_-]{1,120}', request['task_id']):
+        raise ValueError('Invalid append task ID')
+
+
 def load_journal(path):
     value, raw = load_json(path)
     if not isinstance(value, dict) or value.get('version') != 1:
@@ -106,6 +136,11 @@ def load_journal(path):
     validate_request(value.get('request'))
     if value.get('receipt') is not None:
         validate_receipt(value['receipt'])
+    appends = value.get('appends', [])
+    if not isinstance(appends, list):
+        raise ValueError('Invalid appends')
+    for entry in appends:
+        validate_append(entry)
     return value, raw
 
 
@@ -144,20 +179,17 @@ def new_invocation(args):
     return {'journal': str(path), 'request': request}
 
 
-def save_receipt(args):
-    path = safe_path(args.journal)
+def rewrite_journal(journal_path, update):
+    """Locked, hash-checked atomic journal rewrite. update(journal) returns
+    the payload this command reports."""
+    path = safe_path(journal_path)
     lock_path = path.with_name(path.name + '.lock')
     lock_fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     temp = None
     try:
         journal, original = load_journal(path)
-        receipt, _ = load_json(args.receipt)
-        validate_receipt(receipt)
-        previous = journal.get('receipt')
-        if previous and previous['task_id'] != receipt['task_id']:
-            raise ValueError('Receipt conflicts with the recorded task')
-        journal['receipt'] = receipt
-        fd, temp = tempfile.mkstemp(prefix='.receipt-', dir=str(path.parent))
+        result = update(journal)
+        fd, temp = tempfile.mkstemp(prefix='.journal-', dir=str(path.parent))
         with os.fdopen(fd, 'wb') as handle:
             handle.write(encoded(journal))
             handle.flush()
@@ -168,12 +200,45 @@ def save_receipt(args):
         os.replace(temp, path)
         temp = None
         sync_directory(path.parent)
-        return {'journal': str(path), 'task_id': receipt['task_id'], 'saved': True}
+        return result
     finally:
         os.close(lock_fd)
         lock_path.unlink()
         if temp is not None:
             Path(temp).unlink()
+
+
+def save_receipt(args):
+    receipt, _ = load_json(args.receipt)
+    validate_receipt(receipt)
+
+    def update(journal):
+        previous = journal.get('receipt')
+        if previous and previous['task_id'] != receipt['task_id']:
+            raise ValueError('Receipt conflicts with the recorded task')
+        journal['receipt'] = receipt
+        return {'journal': args.journal, 'task_id': receipt['task_id'], 'saved': True}
+
+    return rewrite_journal(args.journal, update)
+
+
+def append_followup(args):
+    """Persist a follow-up request with a fresh codex-append-<uuid> key so an
+    uncertain workshop_post_message can be retried verbatim."""
+    body = load_text(args.body)
+
+    def update(journal):
+        receipt = journal.get('receipt')
+        if not receipt:
+            raise ValueError('Journal has no receipt; resolve the task first')
+        key = 'codex-append-' + str(uuid.uuid4())
+        request = {'task_id': receipt['task_id'], 'body': body,
+                   'idempotency_key': key}
+        journal.setdefault('appends', [])
+        journal['appends'].append({'idempotency_key': key, 'request': request})
+        return {'journal': args.journal, 'request': request}
+
+    return rewrite_journal(args.journal, update)
 
 
 def main():
@@ -188,12 +253,17 @@ def main():
     receipt = commands.add_parser('receipt')
     receipt.add_argument('--journal', required=True)
     receipt.add_argument('--receipt', required=True)
+    append = commands.add_parser('append')
+    append.add_argument('--journal', required=True)
+    append.add_argument('--body', required=True)
     args = parser.parse_args()
     try:
         if args.command == 'new':
             result = new_invocation(args)
         elif args.command == 'show':
             result, _ = load_journal(args.journal)
+        elif args.command == 'append':
+            result = append_followup(args)
         else:
             result = save_receipt(args)
         print(json.dumps(result, sort_keys=True))

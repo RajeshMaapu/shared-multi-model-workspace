@@ -31,6 +31,8 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
     case staleGeneration(engineer: EngineerID, supplied: Int, current: Int)
     /// Free disk below the storage-guard threshold (-32010, T30).
     case storageLow(freeBytes: Int64)
+    /// Too many concurrent wait_for_events waiters for this principal kind.
+    case tooManyWaiters
 
     /// JSON-RPC error code for this failure.
     public var rpcCode: Int {
@@ -49,6 +51,8 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
             return WorkshopProtocol.ErrorCode.notOwner
         case .storageLow:
             return WorkshopProtocol.ErrorCode.storageLow
+        case .tooManyWaiters:
+            return WorkshopProtocol.ErrorCode.tooManyWaiters
         case .workspaceEscape:
             return WorkshopProtocol.ErrorCode.invalidParams
         case .phaseNotImplemented:
@@ -102,6 +106,8 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
             return "Stale ownership generation \(supplied) from \(engineer.rawValue); current is \(current)"
         case .storageLow(let freeBytes):
             return "Storage critically low (\(freeBytes / 1_048_576) MiB free); write refused"
+        case .tooManyWaiters:
+            return "Too many concurrent wait_for_events waiters"
         }
     }
 }

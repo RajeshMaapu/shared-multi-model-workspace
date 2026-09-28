@@ -633,7 +633,7 @@ final class Phase4ServiceTests: XCTestCase {
         let version = try backupDB.query(
             "SELECT MAX(version) AS v FROM schema_migrations")
             .first?["v"]?.int
-        XCTAssertEqual(version, 10)
+        XCTAssertEqual(version, 11)
         let count = try backupDB.query("SELECT COUNT(*) AS c FROM tasks")
             .first?["c"]?.int ?? 0
         XCTAssertGreaterThanOrEqual(count, 1)

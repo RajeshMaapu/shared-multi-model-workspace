@@ -481,6 +481,26 @@ final class LiveSmokeTests: XCTestCase {
         XCTAssertNotNil(snapshot, "balance probe returned nothing")
     }
 
+    /// G-D1 live canary: the Kimi coding OAuth grant still authenticates a
+    /// zero-cost GET /models. Skipped unless WORKSHOP_LIVE=1; the token
+    /// value is never logged or recorded.
+    func testKimiCredentialCanary() async throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["WORKSHOP_LIVE"] == "1",
+            "WORKSHOP_LIVE not set")
+        let token = try await KimiOAuthCredential.readAccessToken()
+        var request = URLRequest(
+            url: URL(string: "https://api.kimi.ai/coding/v1/models")!)
+        request.setValue("Bearer \(token)",
+                         forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 15
+        let (_, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode
+        record("kimi-canary", ["status": .string("\(status ?? -1)")],
+               phase: "phase3c")
+        XCTAssertEqual(status, 200)
+    }
+
     override class func tearDown() {
         // Nothing to kill by hand: adapter processes are children of the test
         // process group and exit with it; the runtime shuts down in-test.

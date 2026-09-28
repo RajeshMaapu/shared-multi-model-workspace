@@ -160,6 +160,63 @@ final class WriterQualificationTests: XCTestCase {
         await service.shutdown()
     }
 
+    /// A task blocked by the writer-qualification gate resumes once the
+    /// owner qualifies: the subtask goes back to claimed and the retried
+    /// turn can reach verifying.
+    func testResumeUnblocksGateBlockedTask() async throws {
+        let root = makeHome()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let kimi = FakeAdapter(engineer: .kimi, delayPerDelta: .zero)
+        kimi.supportsIsolatedWorkspaceTurns = false
+        let service = try CollaborationService(
+            databasePath: root + "/db.sqlite",
+            adapters: [kimi],
+            dispatcherEnabled: false, homeDir: root, wakeupCoalescence: .zero)
+        kimi.toolRunner = { name, args, principal in
+            try await service.callTool(name, args: args, principal: principal)
+        }
+        kimi.script = { context in
+            guard let sub = context.subtask else { return [.text("done")] }
+            // Every owner turn must post a NEW revision — a byte-identical
+            // report dedupes and the turn counts as "ended without a report".
+            return [
+                .toolCall("workshop_report_result", .object([
+                    "task_id": .string(context.task.id.rawValue),
+                    "subtask_id": .string(sub.id.rawValue),
+                    "summary": .string("resumed smoke ok \(kimi.turnCount)"),
+                    "generation": .number(Double(sub.generation))])),
+                .text("done")]
+        }
+        let receipt = try await service.createTask(CreateTaskRequest(
+            schemaVersion: 2, idempotencyKey: "gate-resume", title: "T",
+            objective: "obj", phase: .execution, participants: [.kimi],
+            collaborationMode: .requestedPeers))
+        await service.start()
+        let detail = try await service.getTask(receipt.taskID)
+        let sub = try XCTUnwrap(detail.subtasks.first)
+        let claimed = try await service.claimForTest(
+            subtaskID: sub.id, owner: .kimi, expectedGeneration: 0)
+        XCTAssertTrue(claimed)
+        await service.runTurnForTest(engineer: .kimi, taskID: receipt.taskID)
+        await service.awaitIdle()
+        var after = try await service.getTask(receipt.taskID)
+        XCTAssertEqual(after.task.state, .blocked)
+
+        kimi.supportsIsolatedWorkspaceTurns = true
+        try await service.resumeTask(taskID: receipt.taskID, principal: .user)
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            after = try await service.getTask(receipt.taskID)
+            if after.task.state == .verifying { break }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(after.task.state, .verifying)
+        XCTAssertEqual(after.subtasks.first?.generation, 1)
+        XCTAssertTrue(kimi.receivedContexts.contains {
+            $0.wakeReason == "resumed" && $0.workspace?.state == "writer" })
+        await service.shutdown()
+    }
+
     /// An owner replying to a user message is still a discussion turn: the
     /// workspace stays read-only even though the peer owns a subtask.
     func testV2UserReplyToOwnerRunsAsDiscussion() async throws {
@@ -189,6 +246,74 @@ final class WriterQualificationTests: XCTestCase {
         let db = try Database(path: root + "/db.sqlite")
         let states = try db.query("SELECT DISTINCT state FROM writer_generations")
         XCTAssertTrue(states.allSatisfy { $0["state"]?.text == "review_only" })
+        await service.shutdown()
+    }
+}
+
+extension WriterQualificationTests {
+    /// A hard workspace failure posts the cause and no retry announcement:
+    /// the turn result is `.failed`, not `.failedToStart`.
+    func testWorkspaceFailureBlocksWithCauseAndNoRetry() async throws {
+        let root = makeHome()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let kimi = FakeAdapter(engineer: .kimi, delayPerDelta: .zero)
+        let service = try CollaborationService(
+            databasePath: root + "/db.sqlite", adapters: [kimi],
+            dispatcherEnabled: false, homeDir: root, wakeupCoalescence: .zero)
+        let receipt = try await service.createTask(CreateTaskRequest(
+            schemaVersion: 2, idempotencyKey: "ws-fail", title: "T",
+            objective: "obj", phase: .execution, participants: [.kimi],
+            workspaceRef: "/nonexistent-repo-\(UUID().uuidString)",
+            collaborationMode: .requestedPeers))
+        await service.start()
+        let detail = try await service.getTask(receipt.taskID)
+        let sub = try XCTUnwrap(detail.subtasks.first)
+        _ = try await service.claimForTest(
+            subtaskID: sub.id, owner: .kimi, expectedGeneration: 0)
+        await service.runTurnForTest(engineer: .kimi, taskID: receipt.taskID)
+        await service.awaitIdle()
+        let after = try await service.getTask(receipt.taskID)
+        XCTAssertEqual(after.task.state, .blocked)
+        let messages = try await service.readMessages(receipt.taskID)
+        XCTAssertTrue(messages.contains {
+            $0.body.hasPrefix("Task workspace unavailable:")
+                && $0.body.contains("registered repository")
+                && $0.body.contains("Resume the task after the cause is fixed") })
+        XCTAssertFalse(messages.contains { $0.body.contains("retry 1/3") })
+        await service.shutdown()
+    }
+
+    /// A workspace-unavailable block is resumable (files preserved), and the
+    /// reclaimed subtask gets a fresh lease so the sweeper does not fire.
+    func testResumeWorkspaceBlockedTaskRenewsLease() async throws {
+        let root = makeHome()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let kimi = FakeAdapter(engineer: .kimi, delayPerDelta: .zero)
+        let service = try CollaborationService(
+            databasePath: root + "/db.sqlite", adapters: [kimi],
+            dispatcherEnabled: false, homeDir: root, wakeupCoalescence: .zero)
+        let receipt = try await service.createTask(CreateTaskRequest(
+            schemaVersion: 2, idempotencyKey: "ws-resume", title: "T",
+            objective: "obj", phase: .execution, participants: [.kimi],
+            workspaceRef: "/nonexistent-repo-\(UUID().uuidString)",
+            collaborationMode: .requestedPeers))
+        await service.start()
+        let detail = try await service.getTask(receipt.taskID)
+        let sub = try XCTUnwrap(detail.subtasks.first)
+        _ = try await service.claimForTest(
+            subtaskID: sub.id, owner: .kimi, expectedGeneration: 0)
+        await service.runTurnForTest(engineer: .kimi, taskID: receipt.taskID)
+        await service.awaitIdle()
+        let blocked = try await service.getTask(receipt.taskID)
+        XCTAssertEqual(blocked.task.state, .blocked)
+        // Blocked by workspace failure → resume must not throw even though a
+        // task_workspaces row exists.
+        try await service.resumeTask(taskID: receipt.taskID, principal: .user)
+        let after = try await service.getTask(receipt.taskID)
+        let resumedSub = try XCTUnwrap(after.subtasks.first)
+        XCTAssertEqual(resumedSub.state, .claimed)
+        XCTAssertGreaterThan(resumedSub.leaseExpiresAt ?? .distantPast,
+                             Date().addingTimeInterval(60))
         await service.shutdown()
     }
 }

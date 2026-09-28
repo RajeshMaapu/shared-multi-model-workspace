@@ -1,7 +1,9 @@
 # ADR 0006: Devin MCP tools via project config file, not ACP injection
 
 ## Status
-Accepted (verified by live probes, 2026-09-13)
+Superseded by ADR 0017 (2026-09-28)
+
+(was: Accepted, verified by live probes, 2026-09-13)
 
 ## Context
 ACP `session/new` accepts an `mcpServers` param. Live probe D showed that for

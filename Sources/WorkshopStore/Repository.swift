@@ -317,6 +317,17 @@ public final class WorkshopRepository {
         ])
     }
 
+    /// Resume path: reclaim a blocked subtask with a fresh lease so the
+    /// sweeper does not immediately flag it expired.
+    public func reclaimBlockedSubtask(_ id: SubtaskID, leaseExpiresAt: Date,
+                                      at now: Date) throws {
+        try db.execute("""
+            UPDATE subtasks SET state='claimed', lease_expires_at=?, updated_at=?
+            WHERE id=? AND state='blocked'
+            """, [.text(WorkshopTime.string(leaseExpiresAt)),
+                  .text(WorkshopTime.string(now)), .text(id.rawValue)])
+    }
+
     public func updateSubtaskVerification(_ id: SubtaskID, _ verification: String,
                                           at now: Date) throws {
         try db.execute("UPDATE subtasks SET verification=?, updated_at=? WHERE id=?", [
@@ -516,6 +527,14 @@ public final class WorkshopRepository {
                                                from: Data(row["request_json"]!.text!.utf8))
         return TaskIngress(request: request, source: row["principal"]!.text!,
                            lastAcknowledgedSeq: row["last_acknowledged_seq"]!.int ?? 0)
+    }
+
+    /// Advance the caller-acknowledged cursor; never moves backwards.
+    public func acknowledgeIngressSeq(_ taskID: TaskID, seq: Int64) throws {
+        try db.execute("""
+            UPDATE task_ingress SET last_acknowledged_seq=MAX(last_acknowledged_seq, ?)
+            WHERE task_id=?
+            """, [.integer(seq), .text(taskID.rawValue)])
     }
 
     public func taskIDForOrigin(principal: String, sourceTaskID: String,

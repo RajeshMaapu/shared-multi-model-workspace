@@ -226,6 +226,56 @@ cursors, wakeups and default reads (`include_summaries` opts in).
 each turn and once at startup; `workshop.readActivity` serves that ring.
 Catalog 2 adds `include_summaries` to `workshop_read_messages`.
 
+**Managed runtime lane (Phase 3).** `ManagedRuntimeAdapter` generalizes the
+DeepSeek adapter into a Workshop-owned chat-completions tool loop
+(`ManagedProvider` presets for DeepSeek and Kimi) with lane-local
+`read_file`/`list_dir`/`write_file`/`exec` tools confined to the turn's
+fenced generation — `exec` runs under a per-generation `sandbox-exec`
+profile and refuses to run without one. Kimi keeps its native ACP lane and
+falls back to the managed lane (coding API authenticated with the CLI's
+OAuth grant) after classified native startup failures — `auth` immediately,
+other classes after two consecutive failures on the task. DeepSeek runs on
+the managed lane exclusively and now receives a fenced generation copy for
+file-level review. Devin has no managed lane because the Fusion relay
+exposes no completions route. Every message posted on the managed lane
+carries `"lane":"managed"` in its structured card; peers see the
+"(managed lane)" author tag and `getTask` reports the last recorded lane.
+
+**Codex return path (Phase 3).** `workshop_wait_for_events` is a bounded
+long-poll for committed task events (default 50 s, max 120 s, capped at 32
+concurrent waiters per principal kind): it returns immediately when events
+after `after_seq` exist and otherwise resumes when a `message.committed` or
+`task.state_changed` outbox row lands — no push into a Codex thread is
+claimed. Every Codex read (`wait_for_events` and `read_messages`) advances
+the task's `task_ingress.last_acknowledged_seq` cursor, surfaced as
+`acknowledgedSeq` in `getTask`. `workshop_post_message` and
+`workshop_request_review` accept an optional `idempotency_key` enforced
+server-side through the `operations` table, scoped per principal, so an
+uncertain append can be retried verbatim; a mismatched replay is -32009.
+Catalog 3 adds the tool and the optional `idempotency_key` fields.
+
+**Qualification as data (Phase 3).** `config/capabilities.json` records, per
+(engineer, lane, model), whether the isolated-writer recipe passed — the
+`workshop-daemon qualify --engineer <id> [--lane native|managed]` subcommand
+runs the phase-2 `hello.txt` recipe in a temporary home with the real adapter
+for that engineer (all others fake), checks the sealed snapshot contents and
+the harness log for permission rejections, then writes the record with the
+binary's SHA-256 and an evidence path; the live database is never opened.
+DaemonRuntime injects `CapabilityStore` lookups into every live lane, so an
+authoritative v2 turn runs only while a qualified record exists; a binary
+hash drift is advisory (probe detail plus one system event per daemon
+lifetime), and `workshop.reloadCapabilities` re-reads the file without a
+restart. The hardcoded relay path and model literal are gone.
+
+**Credential canaries (Phase 3).** At daemon start and every 30 minutes a
+zero-inference check per engineer reports `ok | missing | expired |
+unreadable`: Devin's `data/devin/credentials.toml` symlink must resolve to a
+readable file, Kimi's OAuth grant must read and be unexpired, DeepSeek's
+credential file must parse. Results prefix the engineer's `listEngineers`
+detail as `credentials: <state>` and downgrade health to `loginRequired`
+with the Phase 2a remedy before a wake is attempted; token values are never
+logged. See docs/credential-ownership.md.
+
 **Recovery wording (F2).** `recoverInterruptedStreams` reports what actually
 happened: "task blocked pending reconciliation" only when the transition was
 made, otherwise "stream marked uncertain; task remains <state>".

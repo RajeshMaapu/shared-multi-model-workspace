@@ -2,7 +2,7 @@ import Foundation
 import WorkshopCore
 
 /// Deterministic scripted adapter shared by tests and the daemon (WORKSHOP_ADAPTERS=fake).
-public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
+public final class FakeAdapter: CapabilityAwareAdapter, @unchecked Sendable {
     /// Thrown when `failAfterDeltas` injects a mid-turn failure.
     public struct InjectedFailure: Error, Equatable {
         public let afterDeltas: Int
@@ -19,11 +19,35 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
         case event(AdapterEvent)
         /// Suspend the stream until this turn is cancelled (pause/cancel tests).
         case waitForCancel
+        /// Suspend indefinitely — simulates a turn still in flight across an
+        /// abrupt daemon kill (restart-soak tests).
+        case stall
+        /// Pause mid-turn — keeps the streaming reply placeholder live so
+        /// readers racing the turn observe it (continuity-check tests).
+        case sleep(milliseconds: Int)
     }
 
     public let engineer: EngineerID
-    /// Tests may set false to exercise the unqualified-writer gate.
-    public var supportsIsolatedWorkspaceTurns = true
+    private var isolatedWriterFlag = true
+    /// Tests may set false to exercise the unqualified-writer gate. When a
+    /// capabilityLookup is injected (Phase 3c gate tests) the recorded
+    /// qualification wins over the flag.
+    public var supportsIsolatedWorkspaceTurns: Bool {
+        get {
+            if let capabilityLookup, let qualificationIdentity {
+                return capabilityLookup(qualificationIdentity)?.qualified ?? false
+            }
+            return isolatedWriterFlag
+        }
+        set { isolatedWriterFlag = newValue }
+    }
+    public var capabilityLookup: (@Sendable (QualificationIdentity) -> CapabilityRecord?)?
+    public var binaryDriftNotice: String?
+    public var qualificationIdentity: QualificationIdentity? {
+        QualificationIdentity(engineer: engineer, lane: "native",
+                              model: modelSelection)
+    }
+    public var qualificationBinaryPath: String? { nil }
     public let modelSelection: String? = "fake-model"
     /// Delay between streamed deltas. 0 in tests.
     public var delayPerDelta: Duration
@@ -36,6 +60,9 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
     /// When true, openTaskSession ignores the bound session id and returns a
     /// fresh native session id each call (cold-start simulation, G-D3 tests).
     public var reportsFreshSession = false
+    /// Relative path → content files written into the turn's fenced
+    /// workspace at turn start (qualification recipe tests).
+    public var workspaceWrites: [String: String] = [:]
     /// How scripted tool calls reach the service (set by tests/daemon).
     public var toolRunner: (@Sendable (String, JSONValue, Principal) async throws -> JSONValue)?
     private var scriptedHealth: EngineerHealth
@@ -100,10 +127,22 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
         let engineerName = engineer.displayName
         let script = self.script
         let runner = self.toolRunner
+        let writes = workspaceWrites
+        let workspacePath = context.workspace?.path
         let principal = Principal.engineer(engineer)
         return AsyncThrowingStream { continuation in
             Task {
                 continuation.yield(.turnStarted)
+                if let workspacePath {
+                    for (rel, content) in writes {
+                        let file = workspacePath + "/" + rel
+                        try? FileManager.default.createDirectory(
+                            atPath: (file as NSString).deletingLastPathComponent,
+                            withIntermediateDirectories: true)
+                        try? content.write(toFile: file, atomically: true,
+                                           encoding: .utf8)
+                    }
+                }
                 var emitted = 0
                 func emitDelta(_ text: String) {
                     continuation.yield(.messageDelta(text))
@@ -128,6 +167,14 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
                             continuation.yield(.turnCompleted)
                             continuation.finish()
                             return
+                        case .stall:
+                            while !Task.isCancelled {
+                                try? await Task.sleep(for: .milliseconds(50))
+                            }
+                            continuation.finish()
+                            return
+                        case .sleep(let ms):
+                            try? await Task.sleep(for: .milliseconds(ms))
                         }
                     }
                 } else {

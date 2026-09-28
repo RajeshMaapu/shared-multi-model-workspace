@@ -68,3 +68,26 @@ only, any key matching `codex-<33-64 hex>` to `codex-` + the first 32 hex
 characters before hashing and storing it — both spellings of the same brief
 dedupe to one task. Keys outside that shape are used verbatim; user-principal
 keys are never rewritten. Covered by `CodexBridgeTests.testCreateTaskKeyNormalization`.
+
+## Revision 2026-09-28
+
+The allowlist now stands at, verbatim:
+
+- `workshop_create_task` — task entry (§8.4); idempotent by invocation key.
+- `workshop_list_tasks` — read-only task inventory.
+- `workshop_get_task` — read-only task detail.
+- `workshop_read_messages` — read-only committed history; advances the
+  task's acknowledged cursor.
+- `workshop_post_message` — follow-up appends as `user` with
+  `{"via": "codex"}`; server-side `idempotency_key` dedupe since Phase 3.
+- `workshop_select_review_seed` — added in the sealed-snapshot hot fixes;
+  chooses a digest-verified owner discussion snapshot for fenced review on
+  Codex-originated tasks only.
+- `workshop_read_review_file` — added with it; bounded read of changed
+  regular files inside that snapshot for adapters without a filesystem.
+- `workshop_wait_for_events` — added in Phase 3 (G-A3): bounded read-only
+  long-poll (≤120 s) so a Codex turn can wait for replies without a push
+  channel; also advances the acknowledged cursor.
+
+The allowlist is pinned by `CodexBridgeTests.testCodexAllowlistMatchesADR0015`;
+any change requires a revision of this ADR.

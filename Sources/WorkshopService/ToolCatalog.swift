@@ -6,7 +6,9 @@ import WorkshopCore
 public enum WorkshopToolCatalog {
     /// Increment when any tool schema changes; additive/optional changes only.
     /// 2: `workshop_read_messages` gains optional `include_summaries`.
-    public static let catalogVersion = 2
+    /// 3: new `workshop_wait_for_events`; `workshop_post_message` and
+    ///    `workshop_request_review` gain optional `idempotency_key`.
+    public static let catalogVersion = 3
 
     public struct Tool: Sendable {
         public let name: String
@@ -67,11 +69,18 @@ public enum WorkshopToolCatalog {
                               required: ["task_id"])),
         Tool(name: "workshop_post_message",
              description: "Post a message to a task. Mention @devin/@kimi/@deepseek to wake a peer.",
-             inputSchema: obj(["task_id": s, "body": s, "kind": s],
+             inputSchema: obj(["task_id": s, "body": s, "kind": s,
+                               "idempotency_key": s],
                               required: ["task_id", "body"])),
+        Tool(name: "workshop_wait_for_events",
+             description: "Bounded long-poll for new committed events on a task. Returns immediately when events after `after_seq` exist, otherwise waits up to `timeout_seconds` (default 50, max 120). For Codex callers, advances the task's acknowledged cursor to the last returned seq.",
+             inputSchema: obj(["task_id": s, "after_seq": i,
+                               "timeout_seconds": i],
+                              required: ["task_id", "after_seq"])),
         Tool(name: "workshop_request_review",
              description: "Ask a participant engineer to review work on a task.",
-             inputSchema: obj(["task_id": s, "reviewer": s, "message": s],
+             inputSchema: obj(["task_id": s, "reviewer": s, "message": s,
+                               "idempotency_key": s],
                               required: ["task_id", "reviewer", "message"])),
         Tool(name: "workshop_select_review_seed",
              description: "Select a digest-verified owner discussion snapshot as the next fenced review/revision seed. Codex may select only for a task it originated. Does not promote the snapshot.",

@@ -86,6 +86,8 @@ public enum WorkshopProtocol {
         public static let blockedByDependency = -32007
         /// Report revision no longer current (T08).
         public static let staleRevision = -32008
+        /// Too many concurrent wait_for_events waiters for a principal kind.
+        public static let tooManyWaiters = -32011
     }
 }
 

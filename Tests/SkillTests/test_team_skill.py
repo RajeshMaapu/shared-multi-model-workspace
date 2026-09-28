@@ -60,6 +60,37 @@ class TeamSkillTests(unittest.TestCase):
         self.run_script(HELPER, 'receipt', '--journal', created['journal'], '--receipt', receipt_file, success=False)
         self.assertEqual(self.run_script(HELPER, 'show', '--journal', created['journal'])['receipt'], receipt)
 
+    def test_append_persists_idempotent_followup(self):
+        created = self.new()
+        body_file = self.root / 'follow-up.txt'
+        body_file.write_text('Please add a test for the change')
+        # No receipt yet: the follow-up cannot resolve a task.
+        self.run_script(HELPER, 'append', '--journal', created['journal'],
+                        '--body', body_file, success=False)
+        receipt_file = self.root / 'receipt.json'
+        receipt = {'task_id': 'task_test', 'committed_seq': 1,
+                   'state': 'queued', 'status': 'created'}
+        receipt_file.write_text(json.dumps(receipt))
+        self.run_script(HELPER, 'receipt', '--journal', created['journal'],
+                        '--receipt', receipt_file)
+        result = self.run_script(HELPER, 'append', '--journal',
+                                 created['journal'], '--body', body_file)
+        request = result['request']
+        self.assertEqual(request['task_id'], 'task_test')
+        self.assertEqual(request['body'], 'Please add a test for the change')
+        self.assertRegex(request['idempotency_key'],
+                         r'^codex-append-[0-9a-f-]{36}$')
+        # The key is durably persisted before dispatch; a second append gets
+        # its own key and the journal records both.
+        second = self.run_script(HELPER, 'append', '--journal',
+                                 created['journal'], '--body', body_file)
+        self.assertNotEqual(request['idempotency_key'],
+                            second['request']['idempotency_key'])
+        journal = self.run_script(HELPER, 'show', '--journal', created['journal'])
+        keys = [a['idempotency_key'] for a in journal['appends']]
+        self.assertEqual(sorted(keys), sorted([request['idempotency_key'],
+                                               second['request']['idempotency_key']]))
+
     def test_invalid_brief_has_no_side_effects(self):
         self.brief.write_text(json.dumps(dict(self.payload, participants=['kimi'])))
         self.run_script(HELPER, 'new', '--brief', self.brief, '--state-root', self.root / 'journals', success=False)

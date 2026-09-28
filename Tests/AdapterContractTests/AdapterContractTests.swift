@@ -736,9 +736,85 @@ final class AdapterContractTests: XCTestCase {
         let recorded = Recorder()
         let adapter = deepseek(responses: [(200, toolCallResponse())], recorded: recorded)
         let events = try await collect(adapter)
-        // 8 iterations all returning tool calls → stream ends with a throw.
-        XCTAssertFalse(events.contains(.turnCompleted))
-        XCTAssertEqual(recorded.bodies.count, 8)
+        // 24 iterations all returning tool calls → the bound ends the turn
+        // gracefully: committed work stands, the stream does not throw.
+        XCTAssertEqual(recorded.bodies.count, 24)
+        XCTAssertTrue(events.contains(.turnCompleted))
+        XCTAssertTrue(events.contains {
+            if case .uncertain(let s) = $0 {
+                return s.contains("tool loop bound reached")
+            }
+            return false })
+        XCTAssertFalse(events.contains(.uncertain("threw")))
+    }
+
+    /// A successful workshop_report_result injects a system nudge into the
+    /// NEXT provider request so the model closes the turn instead of
+    /// looping further tool calls.
+    func testReportResultNudgesTurnEnd() async throws {
+        let recorded = Recorder()
+        let reportCall: JSONValue = .object([
+            "choices": .array([.object(["message": .object([
+                "content": .null, "reasoning_content": .null,
+                "tool_calls": .array([.object([
+                    "id": .string("call_1"),
+                    "function": .object([
+                        "name": .string("workshop_report_result"),
+                        "arguments": .string(#"{"task_id":"task_x"}"#)])])])])])]),
+        ])
+        let adapter = deepseek(
+            responses: [(200, reportCall), (200, toolCallResponse())],
+            recorded: recorded,
+            tools: [
+                "workshop_report_result":
+                    #"{"id":"msg_1","structured":"{\"type\":\"result\",\"revision\":1}"}"#,
+                "workshop_get_task": #"{"ok":true}"#,
+            ])
+        _ = try await collect(adapter)
+        let second = recorded.bodies[1]
+        let nudge = second["messages"]?.arrayValue?.first {
+            $0["role"]?.stringValue == "system"
+                && ($0["content"]?.stringValue?
+                    .contains("recorded as revision 1") ?? false)
+        }
+        XCTAssertNotNil(nudge)
+        XCTAssertTrue(nudge?["content"]?.stringValue?
+            .contains("End the turn now") ?? false)
+        // The nudge is request-scoped: it must NOT persist into the
+        // session history a later turn replays.
+        let historyPath = dir + "/sessions/clean-v2/task_x/main.json"
+        let saved = try String(contentsOfFile: historyPath, encoding: .utf8)
+        XCTAssertFalse(saved.contains("recorded as revision"),
+                       "turn-nudge leaked into persisted history")
+    }
+
+    /// The caller-provided deadline bounds the loop: an already-expired
+    /// deadline ends the turn before the first provider request.
+    func testWallClockBoundEndsTurn() async throws {
+        let recorded = Recorder()
+        let adapter = deepseek(responses: [(200, toolCallResponse())],
+                               recorded: recorded)
+        let ref = SessionRef(engineer: .deepseek,
+                             nativeSessionID: "deepseek:task_y:main")
+        let task = WorkshopTask(id: TaskID("task_y"), channel: "main",
+                                title: "T", brief: "b", phase: .execution,
+                                state: .working, budgetPolicyRef: nil,
+                                createdAt: Date(), updatedAt: Date())
+        var events: [AdapterEvent] = []
+        let stream = adapter.sendTurn(
+            ref: ref, turnID: "t",
+            context: TurnContext(task: task, subtask: nil, recentMessages: []),
+            deadline: .distantPast)
+        do {
+            for try await e in stream { events.append(e) }
+        } catch { events.append(.uncertain("threw")) }
+        XCTAssertEqual(recorded.bodies.count, 0)
+        XCTAssertTrue(events.contains(.turnCompleted))
+        XCTAssertTrue(events.contains {
+            if case .uncertain(let s) = $0 {
+                return s.contains("tool loop bound reached")
+            }
+            return false })
     }
 
     func testCredentialScannerReadsKey() throws {
@@ -1128,5 +1204,55 @@ final class AdapterContractTests: XCTestCase {
         let mode = try FileManager.default
             .attributesOfItem(atPath: path)[.posixPermissions] as? Int
         XCTAssertEqual(mode, 0o600)
+    }
+
+    /// Phase 3c polish: when the session cwd is a git repo (a writer
+    /// generation), writeDevinMCPConfig keeps `.devin/` out of
+    /// `git status --porcelain` by creating/appending `.git/info/exclude`.
+    func testDevinMCPConfigExcludedFromGitStatus() async throws {
+        // Make the cwd a git repo like WriterGenerations.initializeRepository.
+        for args in [["init", "--template=", "--initial-branch=t/test"],
+                     ["-c", "user.name=T", "-c", "user.email=t@t", "commit",
+                      "--allow-empty", "-m", "base"]] {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            p.arguments = args
+            p.currentDirectoryURL = URL(fileURLWithPath: dir!)
+            p.environment = ["PATH": "/usr/bin:/bin", "HOME": dir!,
+                             "GIT_CONFIG_NOSYSTEM": "1",
+                             "GIT_CONFIG_GLOBAL": "/dev/null"]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            try p.run(); p.waitUntilExit()
+            XCTAssertEqual(p.terminationStatus, 0)
+        }
+        var s = spec(injection: .devinProjectConfigFile, engineer: .devin)
+        s.mcpURL = "http://127.0.0.1:1/mcp"
+        let adapter = ACPHarnessAdapter(
+            spec: s, transportFactory: { _, _ in
+                FakeACPTransport(responder: self.happyResponder())
+            })
+        _ = try await adapter.openTaskSession(
+            binding: SessionBinding(taskID: TaskID("task_x"),
+                                    engineerID: .devin, role: "owner",
+                                    workerID: "main"))
+        let exclude = try String(
+            contentsOfFile: dir! + "/.git/info/exclude")
+        XCTAssertTrue(exclude.contains(".devin/"))
+        let status = Process()
+        status.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        status.arguments = ["status", "--porcelain"]
+        status.currentDirectoryURL = URL(fileURLWithPath: dir!)
+        status.environment = ["PATH": "/usr/bin:/bin", "HOME": dir!,
+                              "GIT_CONFIG_NOSYSTEM": "1",
+                              "GIT_CONFIG_GLOBAL": "/dev/null"]
+        let pipe = Pipe()
+        status.standardOutput = pipe
+        status.standardError = FileHandle.nullDevice
+        try status.run()
+        let out = pipe.fileHandleForReading.readDataToEndOfFile()
+        status.waitUntilExit()
+        XCTAssertFalse(String(decoding: out, as: UTF8.self)
+            .contains(".devin/"), ".devin/ must not appear in git status")
     }
 }

@@ -32,6 +32,26 @@ credentials follow a reference pattern:
 - If the key rotates, edit `~/.kimi-code/config.toml`; no Workshop state to
   update.
 
+## Canaries (Phase 3, G-D1)
+
+At daemon start and every 30 minutes `CredentialCanary` runs a zero-inference
+check per engineer and reports `ok | missing | expired | unreadable`:
+
+- **Devin** — the profile's `data/devin/credentials.toml` symlink must resolve
+  to a readable file.
+- **Kimi** — `KimiOAuthCredential.readAccessToken` must succeed (an expired
+  grant reports `expired`); the `credentials` directory symlink must resolve.
+- **DeepSeek** — `DeepSeekAdapter.readCredential` must succeed.
+
+Token values are never logged or persisted. Results prefix the engineer's
+`listEngineers` detail with `credentials: <state>`; `expired` and `missing`
+downgrade health to `loginRequired` carrying the same remedy string shown
+above ("run `devin` once outside the sandbox", "`kimi --login`", "edit
+`~/.kimi-code/config.toml`"), so a dead credential surfaces on the card
+before a wake is attempted. A `WORKSHOP_LIVE=1`-gated LiveSmokeTests canary
+GETs `https://api.kimi.ai/coding/v1/models` with the OAuth grant and expects
+200.
+
 ## Capability tokens
 - Daemon generates `<WORKSHOP_HOME>/profiles/<engineer>/token` (32 random
   bytes hex, mode 0600) on first start. `workshop-mcp` passes it via

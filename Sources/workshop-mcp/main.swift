@@ -31,6 +31,9 @@ var principalName = ""
 var tokenFile = ""
 var runtimeDir: String?
 var i = 1
+// Writes to a closed stdout (client exited) or socket must error, not kill.
+signal(SIGPIPE, SIG_IGN)
+
 let args = CommandLine.arguments
 while i < args.count {
     switch args[i] {

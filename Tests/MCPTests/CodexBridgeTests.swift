@@ -242,4 +242,20 @@ final class CodexBridgeTests: XCTestCase {
         XCTAssertTrue(text.contains("Workshop service is not running"))
         XCTAssertTrue(text.contains("Nothing was submitted"))
     }
+
+    /// The Codex tool allowlist is pinned to ADR 0015. Any change here
+    /// requires an ADR 0015 revision
+    /// (docs/adr/0015-codex-principal-authority.md).
+    func testCodexAllowlistMatchesADR0015() {
+        XCTAssertEqual(CollaborationService.codexTools, Set([
+            "workshop_create_task", "workshop_list_tasks", "workshop_get_task",
+            "workshop_read_messages", "workshop_post_message",
+            "workshop_select_review_seed", "workshop_read_review_file",
+            "workshop_wait_for_events",
+        ]))
+        // Catalog 3: the new tool is advertised to Codex sessions.
+        XCTAssertEqual(WorkshopToolCatalog.catalogVersion, 3)
+        XCTAssertTrue(WorkshopToolCatalog.tools.contains {
+            $0.name == "workshop_wait_for_events" })
+    }
 }

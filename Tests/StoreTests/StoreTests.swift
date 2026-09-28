@@ -271,4 +271,22 @@ final class MigrationV2Tests: XCTestCase {
         XCTAssertEqual(try repo.taskMemory(taskID: TaskID("task_v9"),
                                            engineerID: .kimi).count, 8)
     }
+
+    /// A v10 database gains writer_generations.pruned_at at v11 (decision
+    /// D-e: the retention sweep stamps rows whose directories are gone).
+    func testV10ToV11AddsPrunedAt() throws {
+        let path = dir + "/mig1011.sqlite"
+        do {
+            let db = try Database(path: path)
+            try Migrator(migrations: Migrations.all.migrations
+                .filter { $0.version <= 10 }).migrate(db)
+            let columns = try db.query(
+                "PRAGMA table_info(writer_generations)")
+            XCTAssertNil(columns.first { $0["name"]?.text == "pruned_at" })
+        }
+        let db = try Database(path: path)
+        try Migrations.all.migrate(db)
+        let columns = try db.query("PRAGMA table_info(writer_generations)")
+        XCTAssertNotNil(columns.first { $0["name"]?.text == "pruned_at" })
+    }
 }

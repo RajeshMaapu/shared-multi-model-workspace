@@ -12,12 +12,14 @@ final class HTTPServerTests: XCTestCase {
     private var revoked = false
     private var authorizeError: Error?
     private var callToolError: Error?
+    private var callToolDelay: UInt64 = 0
     private var calls: [(String, JSONValue, Principal)] = []
 
     override func setUp() async throws {
         revoked = false
         authorizeError = nil
         callToolError = nil
+        callToolDelay = 0
         calls = []
         var config = MCPHTTPServer.Config()
         config.keepaliveSeconds = 0.05
@@ -36,6 +38,9 @@ final class HTTPServerTests: XCTestCase {
                 if let e = self.authorizeError { throw e }
             },
             callTool: { [self] name, args, principal in
+                if self.callToolDelay > 0 {
+                    try? await Task.sleep(nanoseconds: self.callToolDelay)
+                }
                 self.calls.append((name, args, principal))
                 if let e = self.callToolError { throw e }
                 return .object(["ok": .bool(true)])
@@ -122,7 +127,7 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertNotNil(sid)
         XCTAssertEqual(json?["result"]?["protocolVersion"]?.stringValue, "2025-11-25")
         XCTAssertTrue(json?["result"]?["serverInfo"]?["version"]?.stringValue?
-                        .contains("+catalog2") ?? false)
+                        .contains("+catalog3") ?? false)
         (_, json, sid) = try await initialize(version: "2099-01-01")
         XCTAssertEqual(json?["result"]?["protocolVersion"]?.stringValue, "2025-06-18")
         XCTAssertNotNil(sid)
@@ -186,7 +191,7 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertEqual(resp.statusCode, 200)
         let tools = json?["result"]?["tools"]?.arrayValue
         XCTAssertEqual(tools?.count, WorkshopToolCatalog.tools.count)
-        XCTAssertEqual(json?["result"]?["_meta"]?["workshop_catalog_version"]?.intValue, 2)
+        XCTAssertEqual(json?["result"]?["_meta"]?["workshop_catalog_version"]?.intValue, 3)
         // Catalog 2: workshop_read_messages accepts include_summaries.
         let readSchema = tools?.first {
             $0["name"]?.stringValue == "workshop_read_messages" }
@@ -229,6 +234,23 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertTrue(callLines[0].contains("tool=workshop_list_tasks ok"))
         XCTAssertTrue(callLines[1].contains("tool=workshop_list_tasks error"))
         XCTAssertTrue(callLines.allSatisfy { $0.contains("principal=") })
+    }
+
+    /// A slow tool call (long-poll shape) keeps response framing intact: the
+    /// connection thread blocks in syncRespond and the reply still arrives
+    /// well-formed.
+    func testSlowToolCall() async throws {
+        callToolDelay = 300_000_000
+        let (_, _, sid) = try await initialize()
+        let started = Date()
+        let (resp, json) = try await post(
+            #"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"workshop_wait_for_events","arguments":{"task_id":"task_x","after_seq":0,"timeout_seconds":1}}}"#,
+            session: sid)
+        XCTAssertEqual(resp.statusCode, 200)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.25)
+        XCTAssertEqual(json?["result"]?["isError"], .bool(false))
+        XCTAssertEqual(calls.first?.0, "workshop_wait_for_events")
+        XCTAssertEqual(calls.first?.1["after_seq"]?.intValue, 0)
     }
 
     func testAuthorizeFailureIsToolError() async throws {

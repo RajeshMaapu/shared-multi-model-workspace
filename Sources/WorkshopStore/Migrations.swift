@@ -310,5 +310,10 @@ public enum Migrations {
             PRIMARY KEY(task_id, engineer_id)
         );
         """)
-    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10])
+    /// Schema v11: generation retention (decision D-e) — rows whose run
+    /// and snapshot directories were deleted by the sweep are stamped.
+    public static let v11 = Migrator.Migration(version: 11, sql: """
+        ALTER TABLE writer_generations ADD COLUMN pruned_at TEXT;
+        """)
+    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11])
 }

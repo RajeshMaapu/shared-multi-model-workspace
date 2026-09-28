@@ -1,7 +1,9 @@
 # ADR 0009: workshop-mcp closures must be nonisolated; ACP permission matching via option labels
 
 ## Status
-Accepted (verified by live smoke run, 2026-09-13)
+Superseded by ADR 0017 (2026-09-28)
+
+(was: Accepted, verified by live smoke run, 2026-09-13)
 
 ## Context
 
