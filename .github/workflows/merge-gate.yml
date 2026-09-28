@@ -42,7 +42,7 @@ jobs:
         # .build/web-qa evidence artifacts that are intentionally
         # gitignored; it is the only environmental test and is skipped
         # by name pattern. The full Swift suite runs locally as the
-        # real CI gate (see docs/evidence/connection-redesign/).
+        # real CI gate (see the maintainers' private planning records).
         run: >
           node --test
           --test-skip-pattern 'web validation gate accepts the live repo manifest'
