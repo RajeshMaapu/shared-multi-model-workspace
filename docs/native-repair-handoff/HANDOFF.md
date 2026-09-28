@@ -2,7 +2,7 @@
 
 ## Scope and evidence
 
-Original development work and the independent repair snapshot are retained privately. This document describes the cancellation repair without local checkout paths.
+Original Devin WIP preserved at `~/projects/Workshop-community`. Independent source snapshot and applied repair: `/private/tmp/workshop-native-repair-20260916`, branch `codex/native-cancellation-recovery`.
 
 `acp-cancellation.patch` contains only this repair relative to the copied Devin source; do not copy the entire snapshot over ongoing Devin work. Apply only after `git apply --check` against the destination and inspect any concurrent changes.
 
@@ -35,8 +35,13 @@ Alternative: retain one exact writable path behind a separately managed OS/VM bo
 3. Keep `supportsIsolatedWorkspaceTurns` false until evidence covers its contract.
 4. Prepare and review bridge/daemon upgrade plus migration/rollback; obtain separate installed-app approval required by Workshop-community/AGENTS.md.
 5. Refresh the actual callable MCP schema and require schema_version, collaboration_mode and origin.
-6. Persist the user-approved Team invocation for its actual originating task; submit once and save/verify the receipt. Private task identifiers are omitted from this public report.
+6. Persist the exact Team invocation for source task `01a0ad3f-8cc9-7b51-9ea8-4f5bd8014cf7`; submit once and save/verify receipt.
 
-## Project-specific handoff
+## Preserved Thenali brief
 
-The unrelated project brief and originating task identifiers are retained privately and omitted from this public source snapshot. No project work was submitted during qualification.
+Fusion owner_only, execution phase; no peer wakeups. Deliver both:
+
+1. Evidence-backed table of ALL data RL actually sees for SPX shadow entry decisions: runtime versus intended config, freshness/missing/defaults, inference versus learning targets, actions/gates, cash-session cadence and whether shadow outcomes update the serving policy. Revalidate the prior findings rather than treating them as current proof.
+2. Alert Evidence and notification for EVERY attempted RL shadow-entry initiation regardless outcome, titled “Reinforcement Learning Trade Entry — Long/Short”. Include actual spread legs/entry details/status; distinguish pending/blocked/failed from corroborated opened shadow FIRE; never invent values. One durable notification per attempt with status updates and regression coverage. WITHHOLD alone is not an entry attempt.
+
+Reference evidence task: `01a0ad41-0486-7a41-a849-962d47870336`. No live Thenali runtime/trades, deletion or merge authorized. Use isolated worktree and existing branch/PR rules; preserve pinned policy semantics. No Workshop submission has been made by this repair task.

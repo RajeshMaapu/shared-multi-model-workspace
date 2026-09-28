@@ -23,11 +23,15 @@ public struct SessionBinding: Codable, Equatable, Sendable {
     public var modelSelection: String?
     public var recoveryState: String
     public var workspace: TaskWorkspace?
+    /// Service-verified writer paths for this task and engineer. Used only to
+    /// authorize read-only native session reload from a prior generation.
+    public var allowedSessionWorkspaces: [String]
 
     public init(taskID: TaskID, engineerID: EngineerID, role: String, workerID: String,
                 nativeSessionID: String? = nil, profileRevision: Int = 2,
                 modelSelection: String? = nil, recoveryState: String = "new",
-                workspace: TaskWorkspace? = nil) {
+                workspace: TaskWorkspace? = nil,
+                allowedSessionWorkspaces: [String] = []) {
         self.taskID = taskID
         self.engineerID = engineerID
         self.role = role
@@ -37,6 +41,7 @@ public struct SessionBinding: Codable, Equatable, Sendable {
         self.modelSelection = modelSelection
         self.recoveryState = recoveryState
         self.workspace = workspace
+        self.allowedSessionWorkspaces = allowedSessionWorkspaces
     }
 }
 
@@ -219,8 +224,6 @@ public enum AdapterEvent: Sendable, Equatable {
     case toolActivity(title: String, status: String, callID: String? = nil)
     /// A tool call was denied by the permission policy (Phase 3 adds user cards).
     case permissionDenied(String)
-    case permissionDecision(tool: String, operation: String, allowed: Bool,
-                            reason: String, callID: String? = nil)
     case uncertain(String)
 }
 

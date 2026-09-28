@@ -122,8 +122,10 @@ struct TaskPaneView: View {
         Menu {
             Button("Pause") { Task { await state.pauseTask() } }
                 .disabled(task.state != .working)
-            Button("Resume") { Task { await state.resumeTask() } }
-                .disabled(task.state != .paused)
+            Button(task.state == .blocked ? "Retry task" : "Resume") {
+                Task { await state.resumeTask() }
+            }
+                .disabled(task.state != .paused && task.state != .blocked)
             Button("Cancel task") { Task { await state.cancelTask() } }
                 .disabled(![.ready, .working].contains(task.state))
             Divider()

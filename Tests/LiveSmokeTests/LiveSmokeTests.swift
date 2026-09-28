@@ -1,5 +1,5 @@
 import XCTest
-import WorkshopDaemonKit
+@testable import WorkshopDaemonKit
 import WorkshopAdapters
 import WorkshopService
 import WorkshopStore
@@ -10,6 +10,25 @@ import WorkshopCore
 /// tasks only; each turn is tiny. Run:
 ///   WORKSHOP_LIVE=1 swift test --filter LiveSmokeTests
 final class LiveSmokeTests: XCTestCase {
+    func testBridgeCopyReplacesBundleSymlinkWithExecutable() throws {
+        let root = NSTemporaryDirectory() + "workshop-bridge-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        let source = root + "/source-mcp"
+        try Data("bridge-v1".utf8).write(to: URL(fileURLWithPath: source))
+        XCTAssertEqual(chmod(source, 0o755), 0)
+        let bin = root + "/bin"
+        try FileManager.default.createDirectory(atPath: bin, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: bin + "/workshop-mcp",
+                                                   withDestinationPath: source)
+
+        let path = DaemonRuntime.installBridgeCopy(home: root,
+            env: ["WORKSHOP_MCP_PATH": source], ownExecutable: root + "/daemon")
+        XCTAssertEqual(path, bin + "/workshop-mcp")
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: path!))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path!)), Data("bridge-v1".utf8))
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: path!))
+    }
     private static var home = ""
     private static var runtimeDir = ""
     private static var runtime: DaemonRuntime?

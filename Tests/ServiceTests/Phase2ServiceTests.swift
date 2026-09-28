@@ -121,6 +121,53 @@ final class Phase2ServiceTests: XCTestCase {
         XCTAssertTrue(messages.contains { $0.body == "all done" })
     }
 
+    func testRevisedResultAfterChangesRequestedGetsFreshReviewTarget() async throws {
+        let (svc, taskID) = try await service(participants: [.devin, .kimi])
+        let subID = try await claimSubtask(svc, taskID: taskID, owner: .devin)
+        func report(_ summary: String) async throws -> Message {
+            try await svc.toolReportResult(taskID: taskID, subtaskID: subID,
+                summary: summary, artifactIDs: [], validation: [], generation: 1,
+                principal: .engineer(.devin))
+        }
+        let original = try await report("original")
+        let retry = try await report("original")
+        XCTAssertEqual(retry.id, original.id)
+        do {
+            _ = try await report("unreviewed replacement")
+            XCTFail("replacement needs a changes-requested review")
+        } catch WorkshopError.invalidRequest {}
+        do {
+            _ = try await svc.toolReportResult(taskID: taskID, subtaskID: subID,
+                summary: "original", artifactIDs: [], validation: [], generation: 1,
+                principal: .engineer(.kimi))
+            XCTFail("even an idempotent retry requires ownership")
+        } catch WorkshopError.notOwner {}
+        _ = try await svc.toolSubmitReview(taskID: taskID,
+            proposalID: original.id.rawValue, severity: "medium",
+            disposition: "needs_changes", body: "revise", evidence: nil,
+            principal: .engineer(.kimi))
+        let revised = try await report("revised with evidence")
+        XCTAssertNotEqual(revised.id, original.id)
+        let revisedRetry = try await report("revised with evidence")
+        XCTAssertEqual(revisedRetry.id, revised.id)
+        let pending = try await svc.getTask(taskID)
+        XCTAssertEqual(pending.subtasks[0].verification, "pending")
+        do {
+            _ = try await svc.toolSubmitReview(taskID: taskID,
+                proposalID: original.id.rawValue, severity: "low",
+                disposition: "agree", body: "stale approval", evidence: nil,
+                principal: .engineer(.kimi))
+            XCTFail("stale approval cannot accept a revised result")
+        } catch WorkshopError.invalidRequest {}
+        _ = try await svc.toolSubmitReview(taskID: taskID,
+            proposalID: revised.id.rawValue, severity: "low",
+            disposition: "agree", body: "verified revision", evidence: nil,
+            principal: .engineer(.kimi))
+        let done = try await svc.getTask(taskID)
+        XCTAssertEqual(done.subtasks[0].verification, "passed")
+        await svc.shutdown()
+    }
+
     // MARK: - publish_artifact
 
     private func makeWorkspaceFile(_ taskID: TaskID, _ name: String,
@@ -267,6 +314,28 @@ final class Phase2ServiceTests: XCTestCase {
         XCTAssertEqual(kimiAdapter.turnCount, before + 1)
         XCTAssertEqual(devinAdapter.turnCount, 0, "author is never woken")
         await svc.shutdown()
+    }
+
+    func testPendingPeerWakeupRunsAfterServiceRestart() async throws {
+        let database = dir + "/restart-wakeup.sqlite"
+        let first = try CollaborationService(
+            databasePath: database, adapters: fakes(), dispatcherEnabled: false,
+            homeDir: dir, wakeupCoalescence: .zero)
+        let receipt = try await first.createTask(CreateTaskRequest(
+            idempotencyKey: "restart-wakeup", title: "T", objective: "obj",
+            phase: .execution, participants: [.devin, .kimi]))
+        _ = try await first.insertWakeupForTest(taskID: receipt.taskID,
+                                                engineer: .kimi, reason: "mention", state: "pending")
+        await first.shutdown()
+
+        let second = try CollaborationService(
+            databasePath: database, adapters: fakes(), dispatcherEnabled: true,
+            homeDir: dir, wakeupCoalescence: .zero)
+        await second.start()
+        let reply = await waitForEngineerReply(second, taskID: receipt.taskID,
+                                               engineer: .kimi, minSeq: 0)
+        XCTAssertNotNil(reply, "pending peer wakeup should resume after restart")
+        await second.shutdown()
     }
 
     /// Engineer↔engineer messages without a mention wake nobody.

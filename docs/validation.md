@@ -302,7 +302,7 @@ Packaging:                    scripts/package.sh 0.1.0-rc1 — exit 0
 lsregister:                   -f ~/Applications/Workshop.app exit 0;
                               LSCopyDefaultHandlerForURLScheme("workshop") →
                               ai.maapu.workshop (verified via swift script)
-Deep link:                    open "workshop://task/<redacted-task-id>" launches
+Deep link:                    open "workshop://task/task_<id>…" launches
                               the app and selects the task; unknown id shows
                               an in-app notice. Cold-launch race handled by a
                               bounded retry (6 s). Screenshot re-captured
@@ -333,7 +333,7 @@ Live calls (approved scope):  3 × codex exec (create, duplicate brief,
                               (create-task turn + follow-up wakeup turn).
                               Transcripts retained privately (no secrets);
                               summary in docs/evidence/phase5/report.md.
-Codex run results:            run 1 created <redacted-task-id> via
+Codex run results:            run 1 created task_<id>… via
                               workshop_create_task — receipt task_id,
                               committed_seq 2, state queued, deep_link present
                               (scheme verified by daemon). DeepSeek posted
@@ -341,7 +341,7 @@ Codex run results:            run 1 created <redacted-task-id> via
                               Run 2 (same brief): model emitted the FULL
                               64-char sha (skill says truncate to 32) →
                               distinct idempotency key → second task
-                              task_<redacted>… created. FIXED defensively in
+                              task_<id>… created. FIXED defensively in
                               rc1: the skill now prescribes an exact
                               `shasum -a 256 | cut -c1-32` recipe (key MUST
                               be 38 chars) and the service normalizes

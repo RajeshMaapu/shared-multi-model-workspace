@@ -35,7 +35,7 @@ final class StoreTests: XCTestCase {
             try Migrations.all.migrate(db)
             let count = try db.query("SELECT COUNT(*) AS c FROM schema_migrations")
                 .first?["c"]?.int
-            XCTAssertEqual(count, 7)
+            XCTAssertEqual(count, 8)
         }
     }
 

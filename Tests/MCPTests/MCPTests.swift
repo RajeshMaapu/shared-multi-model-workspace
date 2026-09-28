@@ -99,7 +99,9 @@ final class MCPTests: XCTestCase {
         XCTAssertTrue(names.contains("workshop_acquire_lease"))
         XCTAssertTrue(names.contains("workshop_renew_lease"))
         XCTAssertTrue(names.contains("workshop_release_lease"))
-        XCTAssertEqual(names.count, 22)
+        XCTAssertTrue(names.contains("workshop_select_review_seed"))
+        XCTAssertTrue(names.contains("workshop_read_review_file"))
+        XCTAssertEqual(names.count, 24)
         let create = r["result"]?["tools"]?.arrayValue?
             .first { $0["name"]?.stringValue == "workshop_create_task" }
         let props = create?["inputSchema"]?["properties"]

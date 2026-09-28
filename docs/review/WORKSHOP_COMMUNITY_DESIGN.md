@@ -27,7 +27,7 @@ Source geometry: 1586×992, top bar 46px, app rail 88px, sidebar 241px, center a
 - Existing skill: `~/.codex/skills/team/SKILL.md`, name `team`.
 - `$team` is its explicit invocation. `/team` and `/my-team` are textual aliases in the skill, **not verified registered slash commands**.
 - Installed MCP config has server `workshop`, launching the installed `workshop-mcp` with `--principal codex` and a token-file reference. Token contents were not read or copied.
-- Live read-only `workshop_list_tasks` succeeded. `workshop_read_messages` for `<redacted-task-id>` returned committed DeepSeek messages at seq 3 and 4 and a verification-pending event. This is evidence of persisted ingress/reply data, not a fresh three-model test or proof that the installed UI rendered it.
+- Live read-only `workshop_list_tasks` succeeded. `workshop_read_messages` for `task_<id>` returned committed DeepSeek messages at seq 3 and 4 and a verification-pending event. This is evidence of persisted ingress/reply data, not a fresh three-model test or proof that the installed UI rendered it.
 - `CollaborationService.createTask` atomically persists task, root message, participants, subtask, outbox and idempotent receipt. Research/proposal currently wakes each requested participant; execution dispatches through the existing execution path.
 - `WorkshopApp/AppState.swift` loads selected task messages through `readMessagePage` and subscribes for refresh. `TaskPaneView` renders those messages. This is code evidence for the app display path; no live installed-app UI verification was performed.
 - Earlier local Codex bridge tests were included in the passing 126-test clean-start suite. No new task or quota-consuming worker was launched for this design inspection.

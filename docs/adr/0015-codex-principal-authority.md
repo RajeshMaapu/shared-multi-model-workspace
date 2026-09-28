@@ -21,7 +21,13 @@ the authority the spec keeps in the app (§9.3).
 - `CollaborationService.authenticate` resolves the Codex token to `.codex`.
 - `callTool` enforces a Codex allowlist — `workshop_create_task`,
   `workshop_list_tasks`, `workshop_get_task`, `workshop_read_messages`,
-  `workshop_post_message`. Every other tool returns `-32005`
+  `workshop_post_message`, `workshop_select_review_seed`, and
+  `workshop_read_review_file`. The two review-seed tools are limited to tasks
+  whose recorded ingress source is `codex`. Selection requires the exact
+  immutable owner snapshot generation and its verified digest; it only seeds
+  fenced review and revision turns. Reading is limited to changed, regular
+  UTF-8 files under 64 KiB. Neither operation promotes files or accepts work.
+  Every other tool returns `-32005`
   (`userAuthorityRequired`).
 - The user-authority RPC methods (`approveArchitecture`, `requestChanges`,
   `chooseAlternative`, `acceptTask`, `pauseTask`, `resumeTask`, `cancelTask`,
@@ -44,6 +50,10 @@ the authority the spec keeps in the app (§9.3).
   bounded.
 - Token file theft grants task-creation and read access, not approvals —
   still reason to keep the file 0600 and the socket 0700.
+- For Codex-origin tasks, token access can also choose which already sealed
+  owner discussion snapshot peers review. The selection is recorded as a
+  task-visible system event. User-only architecture approval, assignment,
+  promotion, and acceptance remain unchanged.
 - Prompt-level idempotency (`codex-<sha256[:32]>`) depends on the model
   following the skill; run 2 of the live smoke emitted the untruncated hash
   and created a second task. Service-side dedupe is exact-key only — callers

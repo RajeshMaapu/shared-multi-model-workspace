@@ -93,9 +93,7 @@ public enum WorkspaceManager {
             return TaskWorkspace(taskID: taskID, path: dest)
         }
         guard !workspaceRef.isEmpty,
-              let project = registeredProjects(homeDir: home).first(where: {
-                  $0.id == workspaceRef || $0.path == workspaceRef
-              }) else {
+              let project = try registeredProject(homeDir: home, workspaceRef: workspaceRef) else {
             throw WorkshopError.invalidRequest("Requested workspace is not a registered repository")
         }
         let repository = canonical(project.path)
@@ -122,6 +120,30 @@ public enum WorkspaceManager {
         _ = try checkedGit(at: repository, args: ["worktree", "add", "-b", branch, dest, base])
         return TaskWorkspace(taskID: taskID, repositoryPath: repository, branch: branch,
                              path: dest, baseRevision: base)
+    }
+
+    /// Codex often supplies its checkout path rather than the stable project ID.
+    /// Accept another checkout only when Git proves it belongs to a registered
+    /// repository. Always create the task branch from the registered repository;
+    /// the caller's checkout is never used as the task's writable workspace.
+    private static func registeredProject(homeDir: String, workspaceRef: String) throws -> RegisteredProject? {
+        let projects = registeredProjects(homeDir: homeDir)
+        if let exact = projects.first(where: { $0.id == workspaceRef || $0.path == workspaceRef }) {
+            return exact
+        }
+        guard workspaceRef.hasPrefix("/"),
+              let top = try? checkedGit(at: workspaceRef, args: ["rev-parse", "--show-toplevel"]),
+              canonical(top) == canonical(workspaceRef),
+              let common = try? checkedGit(at: workspaceRef,
+                                           args: ["rev-parse", "--path-format=absolute", "--git-common-dir"]) else {
+            return nil
+        }
+        for project in projects {
+            guard let registeredCommon = try? checkedGit(at: project.path,
+                args: ["rev-parse", "--path-format=absolute", "--git-common-dir"]) else { continue }
+            if canonical(common) == canonical(registeredCommon) { return project }
+        }
+        return nil
     }
 
     private static func checkedGit(at cwd: String, args: [String]) throws -> String {

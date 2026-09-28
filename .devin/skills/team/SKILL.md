@@ -29,6 +29,8 @@ Use Codex as the entry point to one durable Workshop conversation. This skill pr
 
 Include title/objective, phase, explicit collaboration intent, requested peers, context/constraints, source references, registered workspace reference when known, acceptance criteria, approvals, budget limits and unresolved decisions. Preserve relevant corrections and rejected approaches without forwarding raw conversation history, credentials, unrelated personal instructions, or hidden reasoning.
 
+For `workspace_ref`, prefer the registered project ID from Workshop's project registry. A Codex worktree path is a checkout reference, not automatically a registered project. If using one, first verify that it shares the registered repository's Git common directory; otherwise omit the reference and report that project registration is needed. Never silently substitute an unrelated checkout.
+
 For UI work include this approved Workshop constraint:
 
 > First build the intended behavior as a web app. Use computer-use tooling to compare it against approved visuals and exercise interactions. Record the reference, exact web revision, screenshots, findings and passed retest. Only then carry the same renderer into Electron. Subsequent UI changes invalidate that validation. If computer use is blocked, report it and do not claim validation or proceed with carry-over. Native packaging and lifecycle need separate checks.

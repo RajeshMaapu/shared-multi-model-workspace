@@ -282,5 +282,16 @@ public enum Migrations {
         CREATE UNIQUE INDEX one_current_writer ON writer_generations(task_id)
             WHERE state IN ('writing','sealed');
         """)
-    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7])
+    /// A specific immutable discussion snapshot may be selected as the next
+    /// review/revision seed without granting it promotion authority.
+    public static let v8 = Migrator.Migration(version: 8, sql: """
+        CREATE TABLE writer_seed_pins(
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+            engineer TEXT NOT NULL,
+            generation_id TEXT NOT NULL REFERENCES writer_generations(id),
+            digest TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """)
+    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7, v8])
 }

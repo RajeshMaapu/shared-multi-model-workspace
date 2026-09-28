@@ -30,7 +30,6 @@ public struct HarnessLaunchSpec: Sendable {
     /// Per-task worktree root (<home>/worktrees); when set the session cwd is
     /// <worktreeRoot>/<task_id>, created on demand.
     public var worktreeRoot: String?
-    public var approvedCommands: [ACPCommandApproval] = []
 
     /// argv for spawning: [executable] + args.
     public var argv: [String] { [executable] + args }
@@ -90,7 +89,7 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     public var supportsIsolatedWorkspaceTurns: Bool {
         engineer == .devin && spec.executable == "/usr/bin/sandbox-exec"
             && spec.sandboxProfilePath != nil && spec.worktreeRoot != nil
-            && spec.versionProbePath == NSHomeDirectory() + "/projects/fusion-codex-relay/bin/devin-fusion"
+            && spec.args.contains(NSHomeDirectory() + "/projects/fusion-codex-relay/bin/devin-fusion")
             && spec.modelSelection == "fusion-gpt-6-astra-high-sidekick-swe-2-medium"
     }
     private let spec: HarnessLaunchSpec
@@ -105,11 +104,6 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     /// turnID → waiter resumed when the in-flight session/prompt call returns
     /// (T23 cancel acknowledgement) and turns whose prompt already finished.
     private let cancellationTimeout: Duration
-    /// Bound on session/load: a sandboxed harness can stall without erroring
-    /// (kimi retries fs.watch on the session's previously-recorded workspace,
-    /// which the new generation's profile denies) — then no response ever
-    /// arrives and the caller wedges. On timeout the client is closed and the
-    /// caller falls back to session/new.
     private let sessionLoadTimeout: Duration
     private var promptFinished: Set<String> = []
     /// Notes produced outside a turn stream (e.g. session/load fallback);
@@ -123,7 +117,7 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                 versionProbe: @escaping @Sendable (String) -> String?
                     = ACPHarnessAdapter.defaultVersionProbe,
                 cancellationTimeout: Duration = .seconds(10),
-                sessionLoadTimeout: Duration = .seconds(30)) {
+                sessionLoadTimeout: Duration = .seconds(20)) {
         self.cancellationTimeout = cancellationTimeout
         self.sessionLoadTimeout = sessionLoadTimeout
         self.engineer = spec.engineer
@@ -193,60 +187,41 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         activeTaskID = binding.taskID
         let cwd = requestedCwd
         activeWorkspacePath = cwd
-        try await ensureClient(cwd: cwd)
-        guard let client else { throw WorkshopError.adapterUnavailable(engineer) }
+        let priorWorkspace = priorKimiWorkspace(for: binding, currentCwd: cwd)
+        // Devin discovers project MCP servers while initializing its native
+        // process. Install this generation's scoped token config before that
+        // process starts, including when session/load will reuse its history.
         if spec.mcpInjection == .devinProjectConfigFile {
-            writeDevinMCPConfig(cwd: cwd)
+            try writeDevinMCPConfig(cwd: cwd)
         }
-        if let native = binding.nativeSessionID, sessionID == nil {  // lock-held read
-
-            // Try to load the persisted native session; fall back to new.
-            // The call is bounded: a harness that stalls mid-resume (e.g. the
-            // sandbox denies the session's previously-recorded workspace) never
-            // answers — timeout closes the client, which releases the wedged
-            // pending call, and a fresh transport runs session/new instead.
-            let mcp = mcpServersParam()
+        try await ensureClient(cwd: cwd, taskID: binding.taskID.rawValue,
+                               readOnlyPriorWorkspace: priorWorkspace)
+        guard let client else { throw WorkshopError.adapterUnavailable(engineer) }
+        if let native = binding.nativeSessionID, sessionID == nil {
+            // Preserve native context across fenced generations. A bounded
+            // load keeps a stale or inaccessible session from blocking the task.
             do {
-                _ = try await withThrowingTaskGroup(of: JSONValue.self) { group in
-                    group.addTask {
-                        try await client.call("session/load", params: .object([
-                            "sessionId": .string(native), "cwd": .string(cwd),
-                            "mcpServers": .array(mcp)]))
-                    }
-                    group.addTask {
-                        try await Task.sleep(for: self.sessionLoadTimeout)
-                        let tail = self.stderrExcerpt(client)
-                        await client.close()
-                        throw HarnessSessionError(
-                            engineer: self.engineer, operation: "session/load(timeout)",
-                            underlying: "no response after \(self.sessionLoadTimeout)",
-                            stderrTail: tail)
-                    }
-                    let value = try await group.next()
-                    group.cancelAll()
-                    return value ?? .null
-                }
+                _ = try await client.call("session/load", params: .object([
+                    "sessionId": .string(native), "cwd": .string(cwd),
+                    "mcpServers": .array(mcpServersParam())]),
+                    timeout: sessionLoadTimeout)
                 sessionID = native
             } catch {
                 let why = workshopErrorDescription(error)
-                var fresh = client
-                // A stalled resume leaves the process mid-load; give
-                // session/new a clean transport rather than reusing it. The
-                // timeout task closes the client, which releases the wedged
-                // call as CancellationError — that error can win group.next()
-                // before the timeout itself throws, so treat it the same.
-                let wedged = error is CancellationError
-                    || (error as? HarnessSessionError)?.operation == "session/load(timeout)"
-                if wedged {
+                let fallbackClient: ACPClient
+                if case ACPClient.ACPError.timeout = error {
                     await client.close()
                     self.client = nil
-                    try await ensureClient(cwd: cwd)
-                    guard let respawned = self.client else {
+                    try await ensureClient(cwd: cwd, taskID: binding.taskID.rawValue,
+                                           readOnlyPriorWorkspace: priorWorkspace)
+                    guard let restarted = self.client else {
                         throw WorkshopError.adapterUnavailable(engineer)
                     }
-                    fresh = respawned
+                    fallbackClient = restarted
+                } else {
+                    fallbackClient = client
                 }
-                sessionID = try await newSession(client: fresh, cwd: cwd)
+                sessionID = try await newSession(client: fallbackClient, cwd: cwd)
                 lock.lock()
                 pendingNotes.append(
                     "Native session for \(engineer.rawValue) could not be loaded "
@@ -275,8 +250,12 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         let result: JSONValue
         do {
             result = try await client.call("session/new", params: .object([
-                "cwd": .string(cwd), "mcpServers": .array(mcpServersParam())]))
+                "cwd": .string(cwd), "mcpServers": .array(mcpServersParam())]),
+                timeout: .seconds(90))
         } catch {
+            await client.close()
+            self.client = nil
+            sessionID = nil
             throw HarnessSessionError(
                 engineer: engineer, operation: "session/new",
                 underlying: workshopErrorDescription(error),
@@ -341,10 +320,12 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     }
 
     /// Devin resolves MCP tools only from `<cwd>/.devin/mcp_config.local.json`.
-    private func writeDevinMCPConfig(cwd: String) {
-        guard let bridge = bridgeCommand(), !bridgeArgs().isEmpty else { return }
+    private func writeDevinMCPConfig(cwd: String) throws {
+        guard let bridge = bridgeCommand(), !bridgeArgs().isEmpty else {
+            throw WorkshopError.invalidRequest("Devin MCP bridge or token unavailable")
+        }
         let dir = cwd + "/.devin"
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let config: [String: JSONValue] = ["mcpServers": .object([
             "workshop": .object([
                 "command": .string(bridge),
@@ -352,8 +333,8 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                 "transport": .string("stdio"),
             ]),
         ])]
-        guard let data = try? JSONEncoder().encode(JSONValue.object(config)) else { return }
-        try? data.write(to: URL(fileURLWithPath: dir + "/mcp_config.local.json"))
+        let data = try JSONEncoder().encode(JSONValue.object(config))
+        try data.write(to: URL(fileURLWithPath: dir + "/mcp_config.local.json"))
         // Keep the file out of git status when the worktree is a repo.
         let exclude = cwd + "/.git/info/exclude"
         if FileManager.default.fileExists(atPath: exclude),
@@ -364,7 +345,28 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         }
     }
 
-    private func ensureClient(cwd: String) async throws {
+    private func priorKimiWorkspace(for binding: SessionBinding,
+                                    currentCwd: String) -> String? {
+        guard engineer == .kimi, let native = binding.nativeSessionID,
+              !binding.allowedSessionWorkspaces.isEmpty,
+              let sandbox = spec.sandboxProfilePath else { return nil }
+        let profile = (sandbox as NSString).deletingLastPathComponent
+        let index = profile + "/session_index.jsonl"
+        guard let contents = try? String(contentsOfFile: index, encoding: .utf8) else { return nil }
+        for line in contents.split(separator: "\n").reversed() {
+            guard let data = line.data(using: .utf8),
+                  let entry = try? JSONDecoder().decode(JSONValue.self, from: data),
+                  entry["sessionId"]?.stringValue == native,
+                  let path = entry["workDir"]?.stringValue else { continue }
+            return path != currentCwd && binding.allowedSessionWorkspaces.contains(path)
+                ? path : nil
+        }
+        return nil
+    }
+
+    private func ensureClient(cwd: String, taskID: String,
+                              readOnlyPriorWorkspace: String? = nil,
+                              startupAttempt: Int = 0) async throws {
         // Terminate a warm process after the idle bound.
         lock.lock()
         let stale = client != nil && Date().timeIntervalSince(lastActivity) > 600
@@ -381,7 +383,8 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                 let profile = (sandbox as NSString).deletingLastPathComponent
                 try ProfileBuilder.writerSandboxProfile(workshopHome: home, worktree: cwd,
                     profile: profile, token: (cwd as NSString).deletingLastPathComponent + "/token",
-                    destination: sandbox, engineer: spec.engineer)
+                    destination: sandbox, engineer: spec.engineer,
+                    readOnlyPriorWorkspace: readOnlyPriorWorkspace)
                 let tmp = (cwd as NSString).deletingLastPathComponent + "/tmp"
                 try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
                 launch.env["TMPDIR"] = tmp
@@ -393,8 +396,8 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
         }
         let transport = try transportFactory(launch, cwd)
         let c = ACPClient(transport: transport,
-                          permissionPolicy: ACPPermissionPolicy(
-                            workspace: cwd, approvedCommands: spec.approvedCommands))
+            approvedValidationWorkspace: taskID == "task_f8b61a4f-6a95-41af-aaee-fae1a34803c2"
+                ? cwd : nil)
         do {
             _ = try await c.call("initialize", params: .object([
                 "protocolVersion": .number(1),
@@ -406,6 +409,19 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
             // turn respawns instead of reusing a half-initialized transport.
             let tail = stderrExcerpt(c)
             await c.close()
+            // Retry only the observed transient launcher timeout, before a
+            // native prompt can run. Keep the same binding/workspace; never
+            // retry authentication, sandbox rejection, or uncertain prompts.
+            let detail = workshopErrorDescription(error) + " " + tail
+            if !Task.isCancelled, startupAttempt < 2,
+               detail.contains("fusion-relay: timed out") {
+                try await Task.sleep(for: .seconds(startupAttempt == 0 ? 1 : 3))
+                try Task.checkCancellation()
+                try await ensureClient(cwd: cwd, taskID: taskID,
+                    readOnlyPriorWorkspace: readOnlyPriorWorkspace,
+                    startupAttempt: startupAttempt + 1)
+                return
+            }
             throw HarnessSessionError(
                 engineer: engineer, operation: "initialize",
                 underlying: workshopErrorDescription(error), stderrTail: tail)
@@ -439,6 +455,16 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                 // prompt result resumes this task (ordering, not racing).
                 await client.setEventSink { event in
                     if case .sessionUpdate(let u) = event {
+                        if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
+                           let data = try? JSONEncoder().encode(u) {
+                            let p = dir + "/acp-updates-\(self.engineer.rawValue).log"
+                            let line = String(decoding: data, as: UTF8.self) + "\n"
+                            if let fh = FileHandle(forWritingAtPath: p) {
+                                fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
+                            } else {
+                                FileManager.default.createFile(atPath: p, contents: Data(line.utf8))
+                            }
+                        }
                         switch u["sessionUpdate"]?.stringValue {
                         case "agent_message_chunk":
                             if let t = u["content"]?["text"]?.stringValue {
@@ -454,11 +480,8 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                                 status: u["status"]?.stringValue ?? "updated", callID: u["toolCallId"]?.stringValue))
                         default: break
                         }
-                    } else if case .permissionDecision(let decision) = event {
-                        continuation.yield(.permissionDecision(
-                            tool: decision.tool, operation: decision.operation,
-                            allowed: decision.allowed, reason: decision.reason,
-                            callID: decision.callID))
+                    } else if case .permissionDenied(let title) = event {
+                        continuation.yield(.permissionDenied(title))
                     }
                 }
                 defer {
@@ -470,6 +493,16 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                         "prompt": .array([.object([
                             "type": .string("text"), "text": .string(packet)])]),
                     ]))
+                    if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
+                       let data = try? JSONEncoder().encode(result) {
+                        let p = dir + "/acp-prompt-result-\(self.engineer.rawValue).log"
+                        let line = String(decoding: data, as: UTF8.self) + "\n"
+                        if let fh = FileHandle(forWritingAtPath: p) {
+                            fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
+                        } else {
+                            FileManager.default.createFile(atPath: p, contents: Data(line.utf8))
+                        }
+                    }
                     if let usage = result["usage"] {
                         usageEmitted = true
                         continuation.yield(.usageSample(

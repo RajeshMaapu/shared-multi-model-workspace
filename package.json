@@ -12,8 +12,5 @@
     "desktop": "electron .",
     "test:desktop": "node --test Desktop/tests/*.test.mjs",
     "package:desktop": "node Desktop/package.mjs"
-  },
-  "overrides": {
-    "@xmldom/xmldom": "0.9.12"
   }
 }

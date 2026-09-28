@@ -14,6 +14,23 @@ public final class WriterGenerations {
         public let engineer: EngineerID
         public let path: String
         public let basePath: String
+        public let sourceDigest: String?
+        public let expectedPinGenerationID: String?
+        public let reviewSeedOwner: Bool
+
+        public init(id: String, taskID: TaskID, engineer: EngineerID,
+                    path: String, basePath: String, sourceDigest: String? = nil,
+                    expectedPinGenerationID: String? = nil,
+                    reviewSeedOwner: Bool = false) {
+            self.id = id
+            self.taskID = taskID
+            self.engineer = engineer
+            self.path = path
+            self.basePath = basePath
+            self.sourceDigest = sourceDigest
+            self.expectedPinGenerationID = expectedPinGenerationID
+            self.reviewSeedOwner = reviewSeedOwner
+        }
     }
     public struct Candidate: Equatable, Sendable {
         public let lease: Lease
@@ -24,12 +41,66 @@ public final class WriterGenerations {
     private let home: String
     public init(db: Database, home: String) { self.db = db; self.home = home }
 
-    public func begin(task: TaskWorkspace, engineer: EngineerID, authoritative: Bool = true) throws -> Lease {
+    /// Select an immutable owner discussion snapshot for subsequent fenced
+    /// review and revision turns. It remains non-promotable.
+    public func pinReviewSeed(taskID: TaskID, engineer: EngineerID,
+                              generationID: String, verifiedDigest: String) throws {
+        guard let row = try db.query("""
+            SELECT snapshot_path,digest FROM writer_generations
+            WHERE id=? AND task_id=? AND engineer=? AND state='review_only'
+            """, [.text(generationID), .text(taskID.rawValue),
+                  .text(engineer.rawValue)]).first,
+              let snapshot = row["snapshot_path"]?.text,
+              let digest = row["digest"]?.text,
+              digest == verifiedDigest,
+              try SafeTree.digest(snapshot) == digest else {
+            throw WorkshopError.invalidRequest("Review seed identity or digest mismatch")
+        }
+        try db.execute("""
+            INSERT INTO writer_seed_pins(task_id,engineer,generation_id,digest,created_at)
+            VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET
+            engineer=excluded.engineer,generation_id=excluded.generation_id,
+            digest=excluded.digest,created_at=excluded.created_at
+            """, [.text(taskID.rawValue), .text(engineer.rawValue),
+                  .text(generationID), .text(digest),
+                  .text(WorkshopTime.string(Date()))])
+    }
+
+    public func begin(task: TaskWorkspace, engineer: EngineerID,
+                      authoritative: Bool = true,
+                      seedEngineer: EngineerID? = nil,
+                      reviewSeedOwner: Bool = false) throws -> Lease {
         let id = UUID().uuidString.lowercased()
         let path = home + "/writer-runs/" + id + "/workspace"
         try FileManager.default.createDirectory(atPath: home + "/writer-runs/" + id,
                                                withIntermediateDirectories: true)
-        _ = try SafeTree.copy(from: task.path, to: path)
+        // Both review and revision turns need the latest proposal's files.
+        // Verify the immutable snapshot before copying it into a fresh fenced
+        // generation; this does not promote it to the shared task workspace.
+        var source = task.path
+        // A daemon restart revokes a sealed generation by marking it
+        // interrupted, but its immutable snapshot remains reviewable.
+        let pin = try db.query("""
+            SELECT g.snapshot_path,g.digest,p.generation_id FROM writer_seed_pins p
+            JOIN writer_generations g ON g.id=p.generation_id
+            WHERE p.task_id=? AND p.engineer=? AND p.digest=g.digest
+              AND g.task_id=p.task_id AND g.engineer=p.engineer
+              AND g.state='review_only' AND g.snapshot_path IS NOT NULL
+            """, [.text(task.taskID.rawValue),
+                  .text((seedEngineer ?? engineer).rawValue)]).first
+        let ownerFilter = seedEngineer == nil ? "" : " AND engineer=?"
+        var parameters: [SQLiteValue?] = [.text(task.taskID.rawValue)]
+        if let seedEngineer { parameters.append(.text(seedEngineer.rawValue)) }
+        let latest = try db.query("SELECT snapshot_path,digest FROM writer_generations WHERE task_id=?\(ownerFilter) AND state IN ('sealed','interrupted','review_only') AND snapshot_path IS NOT NULL ORDER BY rowid DESC LIMIT 1", parameters).first
+        if let row = pin ?? latest {
+            guard let snapshot = row["snapshot_path"]?.text,
+                  let digest = row["digest"]?.text,
+                  try SafeTree.digest(snapshot) == digest else {
+                throw WorkshopError.invalidRequest("Sealed writer snapshot changed; review required")
+            }
+            source = snapshot
+        }
+        let sourceDigest = try SafeTree.copy(from: source, to: path)
         let token = (0..<32).map { _ in UInt8.random(in: .min ... .max) }.map { String(format: "%02x", $0) }.joined()
         let tokenPath = (path as NSString).deletingLastPathComponent + "/token"
         try token.write(toFile: tokenPath, atomically: true, encoding: .utf8)
@@ -37,7 +108,10 @@ public final class WriterGenerations {
         let tokenHash = SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
         try initializeRepository(at: path, generation: id)
         let lease = Lease(id: id, taskID: task.taskID, engineer: engineer,
-                          path: path, basePath: task.path)
+                          path: path, basePath: task.path,
+                          sourceDigest: sourceDigest,
+                          expectedPinGenerationID: pin?["generation_id"]?.text,
+                          reviewSeedOwner: !authoritative && reviewSeedOwner)
         try db.transaction {
             if authoritative { try db.execute("UPDATE writer_generations SET state='superseded' WHERE task_id=? AND state IN ('writing','sealed')", [.text(task.taskID.rawValue)]) }
             try db.execute("INSERT INTO writer_generations(id,task_id,engineer,path,base_path,state,token_hash) VALUES(?,?,?,?,?,?,?)", [.text(id), .text(task.taskID.rawValue), .text(engineer.rawValue), .text(path), .text(task.path), .text(authoritative ? "writing" : "discussion"), .text(tokenHash)])
@@ -77,6 +151,25 @@ public final class WriterGenerations {
         try db.transaction {
             try requireCurrent(lease, state: state)
             try db.execute("UPDATE writer_generations SET state=?,snapshot_path=?,digest=? WHERE id=?", [.text(state == "writing" ? "sealed" : "review_only"), .text(path), .text(digest), .text(lease.id)])
+            if state == "discussion", lease.reviewSeedOwner,
+               lease.sourceDigest != digest {
+                // A changed owner proposal is immediately readable in fresh
+                // fenced review workspaces. Never promote it to the accepted
+                // task workspace, and never replace a pin changed mid-turn.
+                let currentPin = try db.query(
+                    "SELECT generation_id FROM writer_seed_pins WHERE task_id=?",
+                    [.text(lease.taskID.rawValue)]).first?["generation_id"]?.text
+                if currentPin == lease.expectedPinGenerationID {
+                    try db.execute("""
+                        INSERT INTO writer_seed_pins(task_id,engineer,generation_id,digest,created_at)
+                        VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET
+                        engineer=excluded.engineer,generation_id=excluded.generation_id,
+                        digest=excluded.digest,created_at=excluded.created_at
+                        """, [.text(lease.taskID.rawValue), .text(lease.engineer.rawValue),
+                              .text(lease.id), .text(digest),
+                              .text(WorkshopTime.string(Date()))])
+                }
+            }
         }
         return Candidate(lease: lease, path: path, digest: digest)
     }

@@ -101,10 +101,10 @@ public final class DaemonRuntime: @unchecked Sendable {
             chmod(codexTokenPath, 0o600)
         }
 
-        // Stable bridge path (§4.5): ~/.codex/config.toml points at
-        // <home>/bin/workshop-mcp; re-point it at every start so rebuilds
-        // never leave a stale path behind.
-        Self.installBridgeSymlink(home: home, ownExecutable: ownExecutable)
+        // Keep the bridge at a stable, executable path outside the app bundle.
+        // Launching a nested app resource can stall in dyld after a bundle swap.
+        let bridgePath = Self.installBridgeCopy(home: home, env: env,
+                                                ownExecutable: ownExecutable)
 
         let runtime = runtimeDir ?? IPCServer.defaultRuntimeDir()
         self.runtimeDir = runtime
@@ -141,9 +141,7 @@ public final class DaemonRuntime: @unchecked Sendable {
             return false
         }
 
-        // workshop-mcp discovery: WORKSHOP_MCP_PATH env, then a sibling
-        // `workshop-mcp` next to this executable; missing = fail loudly.
-        let bridgePath = Self.resolveMCPBridge(env: env, ownExecutable: ownExecutable)
+        // Bridge copy failed or was unavailable: live adapters fail visibly.
         if bridgePath == nil, adaptersMode != "fake" {
             Self.log("workshop-mcp not found: set WORKSHOP_MCP_PATH or place "
                      + "workshop-mcp next to the daemon executable")
@@ -204,11 +202,6 @@ public final class DaemonRuntime: @unchecked Sendable {
                     ?? UnconfiguredAdapter(engineer: $0))
         }
         self.adapters = built
-        let fakeNames = EngineerID.allCases.filter { isFake($0) }.map(\.rawValue)
-        if !fakeNames.isEmpty {
-            Self.log("WARNING: fake adapters active for [\(fakeNames.joined(separator: ", "))] "
-                + "(WORKSHOP_ADAPTERS=\(adaptersMode)); their turns are marked '[FAKE ADAPTER]' in the journal")
-        }
         self.adaptersModeLive = Set(EngineerID.allCases.filter { !isFake($0) })
 
         let dbPath = home + "/db/workshop.sqlite"
@@ -245,6 +238,17 @@ public final class DaemonRuntime: @unchecked Sendable {
                     ?? DeepSeekAdapter.defaultModel,
                 keyReader: { try DeepSeekAdapter.readCredential() },
                 toolExecutor: { name, args in
+                    if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
+                       let data = try? JSONEncoder().encode(
+                        JSONValue.object(["tool": .string(name), "args": args])) {
+                        let p = dir + "/tool-calls.log"
+                        let line = String(decoding: data, as: UTF8.self) + "\n"
+                        if let fh = FileHandle(forWritingAtPath: p) {
+                            fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
+                        } else {
+                            FileManager.default.createFile(atPath: p, contents: Data(line.utf8))
+                        }
+                    }
                     guard WorkshopToolCatalog.method(for: name) != nil else {
                         return #"{"error":"unknown tool"}"#
                     }
@@ -504,22 +508,29 @@ public final class DaemonRuntime: @unchecked Sendable {
         return handler == "ai.maapu.workshop"
     }
 
-    /// <home>/bin/workshop-mcp → sibling of this executable.
-    static func installBridgeSymlink(home: String, ownExecutable: String) {
+    /// Atomically refresh the stable MCP executable used by Codex and peers.
+    static func installBridgeCopy(home: String, env: [String: String],
+                                  ownExecutable: String) -> String? {
         let fm = FileManager.default
-        let target = (ownExecutable as NSString).deletingLastPathComponent
-            + "/workshop-mcp"
-        guard fm.fileExists(atPath: target) else { return }
+        guard let source = resolveMCPBridge(env: env, ownExecutable: ownExecutable) else {
+            return nil
+        }
         let binDir = home + "/bin"
-        try? fm.createDirectory(atPath: binDir, withIntermediateDirectories: true)
-        let link = binDir + "/workshop-mcp"
-        if (try? fm.destinationOfSymbolicLink(atPath: link)) == target { return }
-        try? fm.removeItem(atPath: link)
+        let destination = binDir + "/workshop-mcp"
+        let staging = binDir + "/.workshop-mcp-\(UUID().uuidString)"
         do {
-            try fm.createSymbolicLink(atPath: link, withDestinationPath: target)
-            Self.log("bridge symlink \(link) -> \(target)")
+            try fm.createDirectory(atPath: binDir, withIntermediateDirectories: true)
+            try fm.copyItem(atPath: source, toPath: staging)
+            guard chmod(staging, 0o755) == 0,
+                  rename(staging, destination) == 0 else {
+                throw WorkshopError.invalidRequest("Cannot install Workshop MCP bridge")
+            }
+            Self.log("bridge copy \(destination) from \(source)")
+            return destination
         } catch {
-            Self.log("bridge symlink failed: \(error.localizedDescription)")
+            try? fm.removeItem(atPath: staging)
+            Self.log("bridge copy failed: \(error.localizedDescription)")
+            return nil
         }
     }
 

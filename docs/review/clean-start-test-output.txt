@@ -2,7 +2,7 @@ Building for debugging...
 [0/10] Write sources
 [2/10] Write swift-version--58304C5D6DBC2206.txt
 [4/8] Emitting module WorkshopAdapters
-<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:80:41: warning: converting non-Sendable function value to '@Sendable (String) -> String?' may introduce data races
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPHarness.swift:80:41: warning: converting non-Sendable function value to '@Sendable (String) -> String?' may introduce data races
  78 |                     = { try ProcessACPTransport(argv: $0.argv, env: $0.env, cwd: $1) },
  79 |                 versionProbe: @escaping @Sendable (String) -> String?
  80 |                     = ACPHarnessAdapter.defaultVersionProbe) {
@@ -10,7 +10,7 @@ Building for debugging...
  81 |         self.engineer = spec.engineer
  82 |         self.spec = spec
 
-<isolated-checkout>/Sources/WorkshopAdapters/ACPClient.swift:135:20: warning: cannot access property 'readerTask' here in nonisolated initializer; this is an error in the Swift 6 language mode
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPClient.swift:135:20: warning: cannot access property 'readerTask' here in nonisolated initializer; this is an error in the Swift 6 language mode
 133 |         self.transport = transport
 134 |         let t = transport
 135 |         readerTask = Task { await self.readLoop(t.lines) }
@@ -20,7 +20,7 @@ Building for debugging...
 137 | 
 [5/8] Compiling WorkshopAdapters Profiles.swift
 [6/9] Compiling WorkshopAdapters ACPHarness.swift
-<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:80:41: warning: converting non-Sendable function value to '@Sendable (String) -> String?' may introduce data races
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPHarness.swift:80:41: warning: converting non-Sendable function value to '@Sendable (String) -> String?' may introduce data races
  78 |                     = { try ProcessACPTransport(argv: $0.argv, env: $0.env, cwd: $1) },
  79 |                 versionProbe: @escaping @Sendable (String) -> String?
  80 |                     = ACPHarnessAdapter.defaultVersionProbe) {
@@ -28,7 +28,7 @@ Building for debugging...
  81 |         self.engineer = spec.engineer
  82 |         self.spec = spec
 
-<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:161:22: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPHarness.swift:161:22: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
 159 |             } catch {
 160 |                 sessionID = try await newSession(client: client, cwd: cwd)
 161 |                 lock.lock()
@@ -42,7 +42,7 @@ Foundation.NSLock.lock:2:11: note: 'lock()' declared here
   |           `- note: 'lock()' declared here
 3 | 
 
-<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:165:22: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPHarness.swift:165:22: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
 163 |                     "Native session for \(engineer.rawValue) could not be loaded; "
 164 |                     + "started a new session (no checkpoint available yet)")
 165 |                 lock.unlock()
@@ -56,7 +56,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
   |           `- note: 'unlock()' declared here
 3 | 
 
-<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:199:19: warning: immutable value 'bridge' was never used; consider replacing with '_' or removing it [#no-usage]
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPHarness.swift:199:19: warning: immutable value 'bridge' was never used; consider replacing with '_' or removing it [#no-usage]
 197 |         let env = spec.env
 198 |         let tokenKey = "WORKSHOP_TOKEN_\(engineer.rawValue.uppercased())"
 199 |         guard let bridge = env["WORKSHOP_MCP_PATH"]
@@ -64,7 +64,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
 200 |                 ?? ProcessInfo.processInfo.environment["WORKSHOP_MCP_PATH"],
 201 |               let tokenFile = env[tokenKey]
 
-<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:255:14: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPHarness.swift:255:14: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
 253 |     private func ensureClient(cwd: String) async throws {
 254 |         // Terminate a warm process after the idle bound.
 255 |         lock.lock()
@@ -78,7 +78,7 @@ Foundation.NSLock.lock:2:11: note: 'lock()' declared here
   |           `- note: 'lock()' declared here
 3 | 
 
-<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:257:14: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPHarness.swift:257:14: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
 255 |         lock.lock()
 256 |         let stale = client != nil && Date().timeIntervalSince(lastActivity) > 600
 257 |         lock.unlock()
@@ -92,7 +92,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
   |           `- note: 'unlock()' declared here
 3 | 
 
-<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:260:18: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPHarness.swift:260:18: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
 258 |         if stale {
 259 |             await client?.close()
 260 |             lock.lock(); client = nil; sessionID = nil; lock.unlock()
@@ -106,7 +106,7 @@ Foundation.NSLock.lock:2:11: note: 'lock()' declared here
   |           `- note: 'lock()' declared here
 3 | 
 
-<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:260:62: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPHarness.swift:260:62: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
 258 |         if stale {
 259 |             await client?.close()
 260 |             lock.lock(); client = nil; sessionID = nil; lock.unlock()
@@ -120,7 +120,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
   |           `- note: 'unlock()' declared here
 3 | 
 
-<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:424:18: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPHarness.swift:424:18: warning: instance method 'lock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
 422 |         if !acknowledged {
 423 |             await client.close()
 424 |             lock.lock()
@@ -134,7 +134,7 @@ Foundation.NSLock.lock:2:11: note: 'lock()' declared here
   |           `- note: 'lock()' declared here
 3 | 
 
-<isolated-checkout>/Sources/WorkshopAdapters/ACPHarness.swift:427:18: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopAdapters/ACPHarness.swift:427:18: warning: instance method 'unlock' is unavailable from asynchronous contexts; Use async-safe scoped locking instead; this is an error in the Swift 6 language mode
 425 |             self.client = nil
 426 |             self.sessionID = nil
 427 |             lock.unlock()
@@ -149,7 +149,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
 3 | 
 [7/15] Emitting module AdapterContractTests
 [8/15] Compiling AdapterContractTests AdapterContractTests.swift
-<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:82:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+/private/tmp/workshop-clean-start-20260915/Tests/AdapterContractTests/AdapterContractTests.swift:82:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
  80 | 
  81 |     func testCallCorrelatesByID() async throws {
  82 |         let transport = FakeACPTransport(responder: happyResponder())
@@ -157,7 +157,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
  83 |         let client = ACPClient(transport: transport)
  84 |         let result = try await client.call("initialize")
 
-<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:90:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+/private/tmp/workshop-clean-start-20260915/Tests/AdapterContractTests/AdapterContractTests.swift:90:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
  88 | 
  89 |     func testStreamMappingToAdapterEvents() async throws {
  90 |         let transport = FakeACPTransport(responder: happyResponder())
@@ -165,7 +165,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
  91 |         let adapter = ACPHarnessAdapter(
  92 |             spec: spec(), transportFactory: { _, _ in transport })
 
-<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:117:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+/private/tmp/workshop-clean-start-20260915/Tests/AdapterContractTests/AdapterContractTests.swift:117:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
 115 | 
 116 |     func testMalformedLinesAreSkipped() async throws {
 117 |         let transport = FakeACPTransport(responder: happyResponder())
@@ -173,7 +173,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
 118 |         let client = ACPClient(transport: transport)
 119 |         transport.inject("not json at all")
 
-<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:127:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+/private/tmp/workshop-clean-start-20260915/Tests/AdapterContractTests/AdapterContractTests.swift:127:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
 125 | 
 126 |     func testPermissionAllowOnceForWorkshopTool() async throws {
 127 |         let transport = FakeACPTransport(responder: happyResponder())
@@ -181,7 +181,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
 128 |         let client = ACPClient(transport: transport)
 129 |         transport.inject(#"{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"t1","title":"Calling workshop_ping from workshop","rawInput":{},"_meta":{"cognition.ai/toolName":"mcp__workshop__workshop_ping"}},"options":[{"optionId":"o1","name":"Approve once","kind":"allow_once"},{"optionId":"o2","name":"Reject","kind":"reject_once"}]}}"#)
 
-<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:141:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+/private/tmp/workshop-clean-start-20260915/Tests/AdapterContractTests/AdapterContractTests.swift:141:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
 139 | 
 140 |     func testPermissionRejectedForShellTool() async throws {
 141 |         let transport = FakeACPTransport(responder: happyResponder())
@@ -189,7 +189,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
 142 |         let client = ACPClient(transport: transport)
 143 |         transport.inject(#"{"jsonrpc":"2.0","id":98,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"t2","title":"Bash rm -rf /","rawInput":{},"_meta":{"cognition.ai/toolName":"shell"}},"options":[{"optionId":"a1","name":"Allow","kind":"allow_once"},{"optionId":"r1","name":"Reject","kind":"reject_once"}]}}"#)
 
-<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:156:14: warning: concurrently-executed local function 'encode' must be marked as '@Sendable'; this is an error in the Swift 6 language mode
+/private/tmp/workshop-clean-start-20260915/Tests/AdapterContractTests/AdapterContractTests.swift:156:14: warning: concurrently-executed local function 'encode' must be marked as '@Sendable'; this is an error in the Swift 6 language mode
 154 | 
 155 |     func testSessionLoadFailureFallsBackToNew() async throws {
 156 |         func encode(_ v: JSONValue) -> String {
@@ -197,7 +197,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
 157 |             String(decoding: try! JSONEncoder().encode(v), as: UTF8.self)
 158 |         }
 
-<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:199:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+/private/tmp/workshop-clean-start-20260915/Tests/AdapterContractTests/AdapterContractTests.swift:199:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
 197 | 
 198 |     func testKimiSessionNewCarriesMCPServers() async throws {
 199 |         let transport = FakeACPTransport(responder: happyResponder())
@@ -205,7 +205,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
 200 |         let adapter = ACPHarnessAdapter(
 201 |             spec: spec(injection: .acpSessionParam, engineer: .kimi),
 
-<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:212:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+/private/tmp/workshop-clean-start-20260915/Tests/AdapterContractTests/AdapterContractTests.swift:212:53: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
 210 | 
 211 |     func testDevinWritesProjectMCPConfig() async throws {
 212 |         let transport = FakeACPTransport(responder: happyResponder())
@@ -213,7 +213,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
 213 |         let adapter = ACPHarnessAdapter(
 214 |             spec: spec(injection: .devinProjectConfigFile, engineer: .devin),
 
-<isolated-checkout>/Tests/AdapterContractTests/AdapterContractTests.swift:239:46: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
+/private/tmp/workshop-clean-start-20260915/Tests/AdapterContractTests/AdapterContractTests.swift:239:46: warning: converting non-Sendable function value to '@Sendable (String) -> [String]' may introduce data races
 237 |     func testProbeUntestedVersionReported() async throws {
 238 |         let adapter = ACPHarnessAdapter(spec: spec()) { _, _ in
 239 |             FakeACPTransport(responder: self.happyResponder())
@@ -222,7 +222,7 @@ Foundation.NSLock.unlock:2:11: note: 'unlock()' declared here
 241 |         let probe = await adapter.probe()
 [9/15] Compiling AdapterContractTests CleanProfileTests.swift
 [10/16] Compiling WorkshopDaemonKit DaemonRuntime.swift
-<isolated-checkout>/Sources/WorkshopDaemonKit/DaemonRuntime.swift:471:29: warning: 'LSCopyDefaultHandlerForURLScheme' was deprecated in macOS 10.15: Use -[NSWorkspace URLForApplicationToOpenURL:] instead. [#DeprecatedDeclaration]
+/private/tmp/workshop-clean-start-20260915/Sources/WorkshopDaemonKit/DaemonRuntime.swift:471:29: warning: 'LSCopyDefaultHandlerForURLScheme' was deprecated in macOS 10.15: Use -[NSWorkspace URLForApplicationToOpenURL:] instead. [#DeprecatedDeclaration]
 469 |     /// True when Launch Services resolves `workshop://` to this app's bundle id.
 470 |     static func deepLinkRegistered() -> Bool {
 471 |         guard let handler = LSCopyDefaultHandlerForURLScheme("workshop" as CFString)?
@@ -341,25 +341,25 @@ Test Suite 'LatencyBench' passed at 2026-09-15 19:29:40.147.
 	 Executed 1 test, with 0 failures (0 unexpected) in 8.014 (8.014) seconds
 Test Suite 'LiveSmokeTests' started at 2026-09-15 19:29:40.148.
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL1Devin]' started.
-<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL1Devin] : Test skipped - WORKSHOP_LIVE not set
+/private/tmp/workshop-clean-start-20260915/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL1Devin] : Test skipped - WORKSHOP_LIVE not set
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL1Devin]' skipped (0.001 seconds).
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL2Kimi]' started.
-<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL2Kimi] : Test skipped - WORKSHOP_LIVE not set
+/private/tmp/workshop-clean-start-20260915/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL2Kimi] : Test skipped - WORKSHOP_LIVE not set
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL2Kimi]' skipped (0.000 seconds).
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL3DeepSeek]' started.
-<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL3DeepSeek] : Test skipped - WORKSHOP_LIVE not set
+/private/tmp/workshop-clean-start-20260915/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL3DeepSeek] : Test skipped - WORKSHOP_LIVE not set
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL3DeepSeek]' skipped (0.000 seconds).
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL4PeerRoundtrip]' started.
-<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL4PeerRoundtrip] : Test skipped - WORKSHOP_LIVE not set
+/private/tmp/workshop-clean-start-20260915/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL4PeerRoundtrip] : Test skipped - WORKSHOP_LIVE not set
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL4PeerRoundtrip]' skipped (0.000 seconds).
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL5RestartRecall]' started.
-<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL5RestartRecall] : Test skipped - WORKSHOP_LIVE not set
+/private/tmp/workshop-clean-start-20260915/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL5RestartRecall] : Test skipped - WORKSHOP_LIVE not set
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL5RestartRecall]' skipped (0.000 seconds).
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL6ResearchApprovalAllocation]' started.
-<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL6ResearchApprovalAllocation] : Test skipped - WORKSHOP_LIVE not set
+/private/tmp/workshop-clean-start-20260915/Tests/LiveSmokeTests/LiveSmokeTests.swift:36: -[LiveSmokeTests.LiveSmokeTests testL6ResearchApprovalAllocation] : Test skipped - WORKSHOP_LIVE not set
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL6ResearchApprovalAllocation]' skipped (0.000 seconds).
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL7DeepSeekBalance]' started.
-<isolated-checkout>/Tests/LiveSmokeTests/LiveSmokeTests.swift:452: -[LiveSmokeTests.LiveSmokeTests testL7DeepSeekBalance] : Test skipped - WORKSHOP_LIVE not set
+/private/tmp/workshop-clean-start-20260915/Tests/LiveSmokeTests/LiveSmokeTests.swift:452: -[LiveSmokeTests.LiveSmokeTests testL7DeepSeekBalance] : Test skipped - WORKSHOP_LIVE not set
 Test Case '-[LiveSmokeTests.LiveSmokeTests testL7DeepSeekBalance]' skipped (0.000 seconds).
 Test Suite 'LiveSmokeTests' passed at 2026-09-15 19:29:40.151.
 	 Executed 7 tests, with 7 tests skipped and 0 failures (0 unexpected) in 0.003 (0.003) seconds

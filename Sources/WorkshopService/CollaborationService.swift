@@ -200,6 +200,94 @@ public actor CollaborationService {
             .init(lease: lease, path: snapshot, digest: digest), verifiedDigest: verifiedDigest)
     }
 
+    public func selectReviewSeed(taskID: TaskID, engineer: EngineerID,
+                                 generationID: String, verifiedDigest: String,
+                                 principal: Principal) throws {
+        if principal != .user {
+            guard principal == .codex,
+                  try repo.taskIngress(taskID)?.source == "codex" else {
+                throw WorkshopError.userAuthorityRequired("select review seed")
+            }
+        }
+        guard let homeDir else {
+            throw WorkshopError.invalidRequest("no writer store configured")
+        }
+        guard try repo.subtasks(taskID).contains(where: { $0.ownerID == engineer }) else {
+            throw WorkshopError.invalidRequest("review seed engineer is not the task owner")
+        }
+        try WriterGenerations(db: repo.db, home: homeDir).pinReviewSeed(
+            taskID: taskID, engineer: engineer,
+            generationID: generationID, verifiedDigest: verifiedDigest)
+        let timestamp = now()
+        try repo.insertMessage(Message(id: MessageID(newID("msg")), taskID: taskID,
+            seq: try repo.nextMessageSeq(taskID), author: .system,
+            kind: .systemEvent,
+            body: "Digest-verified owner discussion snapshot selected as fenced review seed"
+                + (principal == .codex ? " via Codex" : "")
+                + "; snapshot remains unpromoted",
+            deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+        publishCommitted()
+    }
+
+    /// Expose a bounded file from the selected immutable proposal to peers
+    /// whose adapters have no filesystem. This is review access, not promotion.
+    public func readReviewFile(taskID: TaskID, path: String,
+                               principal: Principal) throws -> JSONValue {
+        if let engineer = principal.engineerID {
+            try requireParticipant(engineer, taskID: taskID)
+        } else if principal == .codex {
+            guard try repo.taskIngress(taskID)?.source == "codex" else {
+                throw WorkshopError.userAuthorityRequired("read review file")
+            }
+        }
+        guard !path.isEmpty, !path.hasPrefix("/"),
+              !path.split(separator: "/").contains("..") else {
+            throw WorkshopError.workspaceEscape(path)
+        }
+        guard let row = try repo.db.query("""
+            SELECT g.snapshot_path,g.digest,g.id FROM writer_seed_pins p
+            JOIN writer_generations g ON g.id=p.generation_id
+            WHERE p.task_id=? AND g.task_id=p.task_id
+              AND g.engineer=p.engineer AND g.state='review_only'
+              AND g.digest=p.digest
+            """, [.text(taskID.rawValue)]).first,
+              let snapshot = row["snapshot_path"]?.text,
+              let digest = row["digest"]?.text,
+              let generationID = row["id"]?.text,
+              try SafeTree.digest(snapshot) == digest else {
+            throw WorkshopError.invalidRequest("Verified review seed unavailable")
+        }
+        let source = try WorkspaceManager.resolveInsideWorkspace(snapshot, path)
+        guard source != snapshot else { throw WorkshopError.workspaceEscape(path) }
+        let attributes = try FileManager.default.attributesOfItem(atPath: source)
+        guard attributes[.type] as? FileAttributeType == .typeRegular,
+              ((attributes[.size] as? NSNumber)?.intValue ?? Int.max) <= 64 * 1024 else {
+            throw WorkshopError.invalidRequest("Review file is not a regular UTF-8 file under 64 KiB")
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: source))
+        guard data.count <= 64 * 1024, let content = String(data: data, encoding: .utf8) else {
+            throw WorkshopError.invalidRequest("Review file is not a regular UTF-8 file under 64 KiB")
+        }
+        // A review capability exposes proposal changes, not arbitrary files
+        // copied from the user's repository into the writer snapshot.
+        guard let accepted = try repo.taskWorkspace(taskID)?.path else {
+            throw WorkshopError.invalidRequest("Task workspace unavailable")
+        }
+        let acceptedFile = try WorkspaceManager.resolveInsideWorkspace(accepted, path)
+        if FileManager.default.fileExists(atPath: acceptedFile) {
+            let acceptedAttributes = try FileManager.default.attributesOfItem(atPath: acceptedFile)
+            guard acceptedAttributes[.type] as? FileAttributeType == .typeRegular,
+                  ((acceptedAttributes[.size] as? NSNumber)?.intValue ?? Int.max) <= 64 * 1024,
+                  try Data(contentsOf: URL(fileURLWithPath: acceptedFile)) != data else {
+                throw WorkshopError.invalidRequest("Review file is not a bounded proposal change")
+            }
+        }
+        return .object(["task_id": .string(taskID.rawValue),
+                        "generation_id": .string(generationID),
+                        "snapshot_digest": .string(digest),
+                        "path": .string(path), "content": .string(content)])
+    }
+
     /// Recovery, then process any pending dispatch rows exactly once (T03).
     public func start() async {
         reconcileOnStart()
@@ -207,7 +295,9 @@ public actor CollaborationService {
         if let homeDir {
             _ = attempt("recoverWriters") { try WriterGenerations(db: repo.db, home: homeDir).recover() }
         }
+        recoverUnstartedChangeRequests()
         scheduleDispatch()
+        scheduleWakeupCoalescer()
         scheduleLeaseSweeper()
         scheduleWalMonitor()
     }
@@ -764,12 +854,6 @@ public actor CollaborationService {
             throw WorkshopError.invalidRequest(
                 "generation required (ownership_generation from the packet)")
         }
-        // T06: idempotent retry returns the original structured message.
-        if let existing = try repo.resultMessage(taskID: taskID,
-                                                 subtaskID: subtaskID,
-                                                 generation: generation) {
-            return existing
-        }
         guard let subtask = try repo.subtask(subtaskID), subtask.taskID == taskID,
               subtask.ownerID == engineer else {
             throw WorkshopError.notOwner
@@ -782,6 +866,24 @@ public actor CollaborationService {
             throw WorkshopError.staleGeneration(engineer: engineer,
                                                 supplied: generation,
                                                 current: subtask.generation)
+        }
+        // An exact retry is idempotent. A changed result may replace the latest
+        // result only after a reviewer requested changes; ownership stays fenced.
+        if let existing = try repo.resultMessage(taskID: taskID,
+                                                 subtaskID: subtaskID,
+                                                 generation: generation) {
+            let payload = existing.structured.flatMap {
+                try? JSONDecoder().decode(JSONValue.self, from: Data($0.utf8))
+            }
+            if existing.body == summary,
+               payload?["artifact_ids"] == .array(artifactIDs.map { .string($0) }),
+               payload?["validation"] == .array(validation) {
+                return existing
+            }
+            guard subtask.verification == "changes_requested" else {
+                throw WorkshopError.invalidRequest(
+                    "result revision requires a changes_requested review")
+            }
         }
         let timestamp = now()
         let structured = String(
@@ -801,6 +903,7 @@ public actor CollaborationService {
             try repo.insertMessage(m)
             committed = m
             try repo.updateSubtaskState(subtaskID, .review, at: timestamp)
+            try repo.updateSubtaskVerification(subtaskID, "pending", at: timestamp)
             if let task = try repo.task(taskID), task.state == .working {
                 try transition(taskID, from: .working, to: .verifying, at: timestamp)
             }
@@ -937,11 +1040,12 @@ public actor CollaborationService {
     /// Unified entry point for the §8.3 collaboration tools — used by the IPC
     /// daemon, the workshop-mcp bridge, and the DeepSeek tool loop. Author
     /// identity always comes from `principal`, never from args.
-    /// Tools the Codex principal may call (§9.3, ADR 0015): task entry and
-    /// read/follow-up only — approvals, allocation, acceptance stay user-only.
+    /// Codex may also select and read a digest-verified review seed for a task
+    /// it originated. This never promotes files or accepts work.
     private static let codexTools: Set<String> = [
         "workshop_create_task", "workshop_list_tasks", "workshop_get_task",
         "workshop_read_messages", "workshop_post_message",
+        "workshop_select_review_seed", "workshop_read_review_file",
     ]
 
     /// Set by the daemon after verifying `workshop://` is registered to
@@ -1020,6 +1124,24 @@ public actor CollaborationService {
             }
             return try .from(try toolRequestReview(taskID: id, reviewer: reviewer,
                                                    message: message, principal: principal))
+        case "workshop_select_review_seed":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            guard let engineerRaw = args["engineer"]?.stringValue,
+                  let engineer = EngineerID(rawValue: engineerRaw),
+                  let generationID = args["generation_id"]?.stringValue,
+                  let digest = args["verified_digest"]?.stringValue else {
+                throw WorkshopError.invalidRequest("engineer, generation_id and verified_digest required")
+            }
+            try selectReviewSeed(taskID: id, engineer: engineer,
+                                 generationID: generationID,
+                                 verifiedDigest: digest, principal: principal)
+            return .object(["selected": .bool(true)])
+        case "workshop_read_review_file":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            guard let path = args["path"]?.stringValue else {
+                throw WorkshopError.invalidRequest("path required")
+            }
+            return try readReviewFile(taskID: id, path: path, principal: principal)
         case "workshop_publish_artifact":
             let id = TaskID(args["task_id"]?.stringValue ?? "")
             guard let path = args["path"]?.stringValue else {
@@ -1151,15 +1273,6 @@ public actor CollaborationService {
                 .compactMap(\.ownerID).first, participantIDs.contains(owner) {
                 targets.append((owner, "user_message"))
             }
-            // Explicit @mentions of participants wake them too — the compose UI
-            // advertises "@mention an engineer" and the mentioned turn runs as
-            // read-only discussion, so this cannot grant write reach.
-            for engineer in EngineerID.allCases
-            where message.body.contains("@\(engineer.rawValue)")
-                && participantIDs.contains(engineer)
-                && !targets.contains(where: { $0.0 == engineer }) {
-                targets.append((engineer, "mention"))
-            }
         case .engineer(let author):
             // Explicit @mentions of other participants.
             for engineer in EngineerID.allCases where engineer != author {
@@ -1289,7 +1402,10 @@ public actor CollaborationService {
                 }) ?? nil
                 await runTurn(adapter: adapter, engineer: group.engineer, task: task,
                               subtask: owned ?? fallback,
-                              wakeReason: group.reasons.last)
+                              wakeReason: group.reasons.first {
+                                  ["assigned", "resumed", "changes_requested",
+                                   "changes_requested_retry"].contains($0)
+                              } ?? group.reasons.last)
                 for id in group.rows {
                     _ = attempt("wakeupDone",
                                 { try repo.setWakeupState(id, "done", at: now()) })
@@ -1354,6 +1470,32 @@ public actor CollaborationService {
             }
         }
         publishCommitted()
+    }
+
+    /// A process can fail before a revision turn row is created. The wakeup
+    /// was consumed, but the reviewed subtask still needs its writer turn.
+    private func recoverUnstartedChangeRequests() {
+        let timestamp = now()
+        _ = attempt("recoverUnstartedChangeRequests") {
+            let rows = try repo.db.query("""
+                SELECT s.task_id,s.owner_id FROM subtasks s
+                JOIN tasks t ON t.id=s.task_id
+                WHERE s.verification='changes_requested' AND s.state='working'
+                  AND t.state='working' AND s.owner_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM wakeups w WHERE w.task_id=s.task_id
+                      AND w.engineer_id=s.owner_id AND w.state IN ('pending','running')
+                      AND w.reason IN ('changes_requested','changes_requested_retry'))
+                """)
+            for row in rows {
+                guard let task = row["task_id"]?.text,
+                      let owner = row["owner_id"]?.text,
+                      let engineer = EngineerID(rawValue: owner) else { continue }
+                try repo.insertWakeup(taskID: TaskID(task), engineerID: engineer,
+                                      reason: "changes_requested", triggerSeq: nil,
+                                      at: timestamp)
+            }
+        }
     }
 
     // MARK: - Dispatcher
@@ -1756,9 +1898,8 @@ public actor CollaborationService {
         var usage: UsageSample?
     }
 
-    /// Run one adapter turn. `wakeReason == nil` is the owner-execution turn
-    /// (subtask → review, task → verifying on success); non-nil is a discussion
-    /// wakeup turn which only commits a reply message.
+    /// Run one adapter turn. Assigned/resumed/change-requested owner turns are
+    /// execution turns; user-message and peer wakeups are discussion turns.
     private func runTurn(adapter: EngineerAdapter, engineer: EngineerID,
                          task: WorkshopTask, subtask: Subtask?,
                          wakeReason: String?) async {
@@ -1776,6 +1917,7 @@ public actor CollaborationService {
         // review_only and can never be promoted.
         let executionReason = wakeReason == nil || wakeReason == "assigned"
             || wakeReason == "resumed" || wakeReason == "changes_requested"
+            || wakeReason == "changes_requested_retry"
         let authoritative = (executionReason && subtask?.ownerID == engineer)
             || (engineer == .devin && subtask == nil && wakeReason == nil)
         if schemaV2, authoritative, !adapter.supportsIsolatedWorkspaceTurns {
@@ -1802,7 +1944,10 @@ public actor CollaborationService {
             if schemaV2, let homeDir, let base = workspace {
                 if adapter.usesWorkspaceFilesystem {
                     let lease = try WriterGenerations(db: repo.db, home: homeDir).begin(
-                        task: base, engineer: engineer, authoritative: authoritative)
+                        task: base, engineer: engineer, authoritative: authoritative,
+                        seedEngineer: subtask?.ownerID,
+                        reviewSeedOwner: subtask?.ownerID == engineer
+                            || (subtask == nil && engineer == .devin))
                     writerLease = lease
                     workspace = TaskWorkspace(taskID: task.id, repositoryPath: base.repositoryPath,
                         path: lease.path, baseRevision: base.baseRevision,
@@ -1884,6 +2029,12 @@ public actor CollaborationService {
             bound.recoveryState = stored.recoveryState
             storedModelSelection = stored.modelSelection
         }
+        if engineer == .kimi, bound.nativeSessionID != nil {
+            bound.allowedSessionWorkspaces =
+                (try? repo.db.query("SELECT path FROM writer_generations WHERE task_id=? AND engineer=?",
+                                    [.text(task.id.rawValue), .text(engineer.rawValue)]))?
+                    .compactMap { $0["path"]?.text } ?? []
+        }
         let ref: SessionRef
         do {
             ref = try await adapter.openTaskSession(binding: bound)
@@ -1916,6 +2067,28 @@ public actor CollaborationService {
                     deliveryState: .committed, createdAt: timestamp,
                     updatedAt: timestamp))
             }
+            // Startup did not reach a prompt. Preserve ownership and the
+            // candidate, and expose recovery immediately instead of waiting
+            // for the lease sweeper to mislabel this as abandoned execution.
+            if executionReason, let subtask, subtask.ownerID == engineer {
+                _ = attempt("blockFailedOwnerStartup") {
+                    try repo.db.transaction {
+                        try repo.updateSubtaskState(subtask.id, .blocked, at: now())
+                        if let current = try repo.task(task.id),
+                           current.state.canTransition(to: .blocked) {
+                            try transition(task.id, from: current.state, to: .blocked, at: now())
+                        }
+                        try repo.insertMessage(Message(
+                            id: MessageID(newID("msg")), taskID: task.id,
+                            seq: try repo.nextMessageSeq(task.id), author: .system,
+                            kind: .systemEvent,
+                            body: "Owner startup failed before execution; generation "
+                                + "\(subtask.generation) and proposal preserved for recovery",
+                            deliveryState: .committed, createdAt: now(), updatedAt: now()))
+                    }
+                }
+            }
+            publishCommitted()
             return
         }
 
@@ -2046,12 +2219,6 @@ public actor CollaborationService {
                 case .permissionDenied:
                     recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
                                    kind: "permission", title: "Tool permission denied", status: "denied")
-                case .permissionDecision(let tool, let operation, let allowed, let reason, let callID):
-                    recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
-                                   kind: "permission",
-                                   title: "Permission " + (allowed ? "allowed" : "denied")
-                                       + " · " + operation + " · " + reason + " · " + tool,
-                                   status: allowed ? "completed" : "denied", callID: callID)
                 case .authRequired:
                     recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
                                    kind: "status", title: "Authentication required", status: "failed")
@@ -2108,6 +2275,13 @@ public actor CollaborationService {
                 let candidate = try WriterGenerations(db: repo.db, home: homeDir).seal(writerLease)
                 body += "\n\nWriter proposal sealed for independent verification. No changes promoted. Snapshot: "
                     + candidate.path + "\nSHA-256: " + candidate.digest
+                if writerLease.reviewSeedOwner,
+                   let selected = try repo.db.query(
+                    "SELECT generation_id FROM writer_seed_pins WHERE task_id=?",
+                    [.text(task.id.rawValue)]).first?["generation_id"]?.text,
+                   selected == writerLease.id {
+                    body += "\nThis revised proposal is automatically available in fenced peer review workspaces and through workshop_read_review_file. No user copy or promotion is needed for review."
+                }
             } catch {
                 failedReason = "Writer snapshot failed: " + workshopErrorDescription(error)
             }
@@ -2172,7 +2346,7 @@ public actor CollaborationService {
                         kind: .systemEvent, body: "Cancellation completed",
                         deliveryState: .committed, createdAt: endTime, updatedAt: endTime))
                 } else if let failedReason {
-                    if wakeReason == nil {
+                    if executionReason && authoritative {
                         if let subtask {
                             try repo.updateSubtaskState(subtask.id, .blocked, at: endTime)
                         }
@@ -2192,7 +2366,7 @@ public actor CollaborationService {
                                               payload: String(decoding: payload, as: UTF8.self),
                                               deliveryState: "pending", at: endTime)
                     }
-                } else if wakeReason == nil {
+                } else if executionReason && authoritative {
                     if let subtask {
                         try repo.updateSubtaskState(subtask.id, .review, at: endTime)
                     }
@@ -2493,6 +2667,21 @@ public actor CollaborationService {
         guard ["agree", "disagree", "needs_changes"].contains(disposition) else {
             throw WorkshopError.invalidRequest(
                 "disposition must be agree|disagree|needs_changes")
+        }
+        // A review of an earlier result must never approve a revised delivery.
+        if let target = try repo.message(MessageID(proposalID)),
+           let text = target.structured,
+           let payload = try? JSONDecoder().decode(JSONValue.self, from: Data(text.utf8)),
+           payload["type"]?.stringValue == "result",
+           let subtaskRaw = payload["subtask_id"]?.stringValue,
+           let generation = payload["generation"]?.intValue {
+            guard target.taskID == taskID,
+                  let subtask = try repo.subtask(SubtaskID(subtaskRaw)),
+                  subtask.generation == Int(generation),
+                  try repo.resultMessage(taskID: taskID, subtaskID: subtask.id,
+                                         generation: Int(generation))?.id == target.id else {
+                throw WorkshopError.invalidRequest("review target is a superseded result")
+            }
         }
         var structured: [String: JSONValue] = [
             "type": .string("review"),
@@ -3072,14 +3261,26 @@ public actor CollaborationService {
         }
     }
 
-    /// Resume a paused task back to Ready (or Researching for research tasks)
+    /// Resume a paused task, or retry a workspace-blocked execution task whose
+    /// writer never started. Preserve its immutable ingress and owner.
     /// and re-wake the owner / participants.
     public func resumeTask(taskID: TaskID, principal: Principal) async throws {
         try requireUser(principal, "resume task")
         let task = try loadTask(taskID)
-        guard task.state == .paused else {
+        let workspaceRetry: Bool
+        if task.state == .blocked && task.phase == .execution {
+            let hasWorkspace = try repo.taskWorkspace(taskID) != nil
+            let workspaceFailed = try repo.messages(taskID).contains {
+                $0.kind == .systemEvent
+                    && $0.body == "Task workspace unavailable; existing files preserved for review"
+            }
+            workspaceRetry = !hasWorkspace && workspaceFailed
+        } else {
+            workspaceRetry = false
+        }
+        guard task.state == .paused || workspaceRetry else {
             throw WorkshopError.invalidRequest(
-                "only a paused task can be resumed (state: \(task.state.rawValue))")
+                "only a paused task or workspace-blocked execution task can be resumed (state: \(task.state.rawValue))")
         }
         let timestamp = now()
         try repo.db.transaction {
@@ -3092,10 +3293,13 @@ public actor CollaborationService {
                                           triggerSeq: nil, at: timestamp)
                 }
             } else {
-                try transition(taskID, from: .paused, to: .ready, at: timestamp)
+                try transition(taskID, from: task.state, to: .ready, at: timestamp)
                 if let sub = try repo.subtasks(taskID)
                     .first(where: { $0.ownerID != nil }),
                    let owner = sub.ownerID {
+                    if workspaceRetry, sub.state == .blocked {
+                        try repo.updateSubtaskState(sub.id, .claimed, at: timestamp)
+                    }
                     try repo.insertWakeup(taskID: taskID, engineerID: owner,
                                           reason: "resumed", triggerSeq: nil,
                                           at: timestamp)
