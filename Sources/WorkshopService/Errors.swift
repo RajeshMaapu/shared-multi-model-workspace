@@ -121,3 +121,44 @@ public func workshopErrorDescription(_ error: Error) -> String {
     if error is CancellationError { return "cancelled" }
     return String(describing: error)
 }
+
+/// Coarse classification of a turn-startup failure (G-D2): decides whether a
+/// retry can help (timeout/transport) or must stop (auth) and what remedy to
+/// surface on the engineer card.
+public enum StartupFailureClass: String, Sendable {
+    case auth, timeout, transport, sandbox, `internal`, unknown
+
+    public static func classify(_ description: String) -> StartupFailureClass {
+        let d = description.lowercased()
+        if ["authentication required", "-32000", "oauthunauthorized",
+            "authorization grant", "login required"].contains(where: d.contains) {
+            return .auth
+        }
+        if ["timed out", "timeout", "no response after"].contains(where: d.contains) {
+            return .timeout
+        }
+        if ["broken pipe", "filehandle", "connection closed", "eof",
+            "cancelled"].contains(where: d.contains) {
+            return .transport
+        }
+        if ["eperm", "operation not permitted", "sandbox"].contains(where: d.contains) {
+            return .sandbox
+        }
+        if ["-32603", "internal error"].contains(where: d.contains) {
+            return .internal
+        }
+        return .unknown
+    }
+
+    /// User-facing remedy for an auth-class failure, per engineer.
+    public static func loginRemedy(for engineer: EngineerID) -> String {
+        switch engineer {
+        case .devin:
+            return "run `devin` once in a terminal to refresh credentials"
+        case .kimi:
+            return "run `kimi acp --login` (or `kimi --login`) in a terminal"
+        case .deepseek:
+            return "check the DeepSeek API key reference in the Kimi config"
+        }
+    }
+}

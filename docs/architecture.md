@@ -99,6 +99,16 @@ without an intervening user message → further rows `suppressed` + one
 "Discussion round limit reached" event; silent turns and failed launches do
 not count.
 
+**Task memory (Phase 2).** Workshop keeps a per-(task, engineer) ring of the
+last 8 turn records (`task_memory`) plus the latest valid checkpoint and
+renders them into every turn packet ("## Your memory for this task"), so a
+cold native session does not lose the engineer's own history. Owner wakes
+while a revision is open (subtask claimed/working) run as authoritative
+writer turns rather than read-only discussion copies. Startup failures are
+classified (auth/timeout/transport/sandbox/internal); authentication
+failures stop after one retry and surface a login remedy on the engineer
+card via `listEngineers`.
+
 **Consumed cursor.** `participants.last_read_seq` bounds the turn context to
 unseen messages (≤60, oldest truncated with a note) and advances only when a
 turn completes — never on send.
@@ -209,7 +219,12 @@ research path (ADR 0010).
 `seq ≥ 1_000_000_000` so they sort last while streaming and are excluded from
 context packets and cursor advancement; at commit the row is reassigned
 `nextMessageSeq`, so a tool-posted message mid-turn ends up *before* the
-streamed reply.
+streamed reply. The streamed native reply of a turn that also posted
+through Workshop tools is stored as `turn_summary`: excluded from packets,
+cursors, wakeups and default reads (`include_summaries` opts in).
+`work.activity` outbox rows are pruned to the newest 200 per task after
+each turn and once at startup; `workshop.readActivity` serves that ring.
+Catalog 2 adds `include_summaries` to `workshop_read_messages`.
 
 **Recovery wording (F2).** `recoverInterruptedStreams` reports what actually
 happened: "task blocked pending reconciliation" only when the transition was

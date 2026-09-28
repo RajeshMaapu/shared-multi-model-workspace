@@ -299,5 +299,16 @@ public enum Migrations {
         ALTER TABLE wakeups ADD COLUMN not_before TEXT;
         ALTER TABLE wakeups ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
         """)
-    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7, v8, v9])
+    /// Schema v10: per-(task, engineer) ring of recent turn records rendered
+    /// into turn packets so a cold native session keeps its own history.
+    public static let v10 = Migrator.Migration(version: 10, sql: """
+        CREATE TABLE task_memory(
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            engineer_id TEXT NOT NULL,
+            turn_records TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(task_id, engineer_id)
+        );
+        """)
+    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10])
 }

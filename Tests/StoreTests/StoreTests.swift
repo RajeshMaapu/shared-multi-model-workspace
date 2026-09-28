@@ -225,4 +225,50 @@ final class MigrationV2Tests: XCTestCase {
             XCTAssertNotNil(next)
         }
     }
+
+    /// A v9 database gains task_memory at v10; appendTurnRecord keeps only
+    /// the newest records per (task, engineer).
+    func testV9ToV10AddsTaskMemoryRing() throws {
+        let path = dir + "/mig910.sqlite"
+        do {
+            let db = try Database(path: path)
+            try Migrator(migrations: Migrations.all.migrations
+                .filter { $0.version <= 9 }).migrate(db)
+            try db.execute("""
+                INSERT INTO tasks(id, channel, title, brief, phase, state,
+                                  created_at, updated_at)
+                VALUES('task_v9', 'main', 'old task', 'brief', 'execution',
+                       'queued', 't0', 't0')
+                """)
+        }
+        let db = try Database(path: path)
+        try Migrations.all.migrate(db)
+        XCTAssertTrue(try db.query("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='task_memory'
+            """).count == 1)
+
+        let repo = WorkshopRepository(db: db)
+        for i in 0..<10 {
+            try repo.appendTurnRecord(
+                taskID: TaskID("task_v9"), engineerID: .kimi,
+                TurnRecord(turnID: "t\(i)", endedAt: Date(), reason: "mention",
+                           outcome: "completed", postedSeqs: [Int64(i)]))
+        }
+        let records = try repo.taskMemory(taskID: TaskID("task_v9"),
+                                          engineerID: .kimi)
+        XCTAssertEqual(records.count, 8)
+        XCTAssertEqual(records.first?.turnID, "t2")
+        XCTAssertEqual(records.last?.turnID, "t9")
+        // Independent key per engineer.
+        XCTAssertTrue(try repo.taskMemory(taskID: TaskID("task_v9"),
+                                          engineerID: .devin).isEmpty)
+        try repo.appendTurnRecord(taskID: TaskID("task_v9"), engineerID: .devin,
+                                  TurnRecord(turnID: "d0", endedAt: Date(),
+                                             outcome: "silent"))
+        XCTAssertEqual(try repo.taskMemory(taskID: TaskID("task_v9"),
+                                           engineerID: .devin).count, 1)
+        XCTAssertEqual(try repo.taskMemory(taskID: TaskID("task_v9"),
+                                           engineerID: .kimi).count, 8)
+    }
 }

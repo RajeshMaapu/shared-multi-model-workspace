@@ -583,7 +583,9 @@ final class Phase3ServiceTests: XCTestCase {
             try await svc.getTask(receipt.taskID).task.state == .verifying
         }
         XCTAssertTrue(done)
-        let messages = try await svc.readMessages(receipt.taskID)
+        // The streamed reply commits as turn_summary (E3): opt in to see it.
+        let messages = try await svc.readMessages(receipt.taskID,
+                                                  includeSummaries: true)
         let tool = messages.first { $0.body == "TOOL_POSTED_MARKER" }
         let reply = messages.first { $0.body == "STREAMED_REPLY_MARKER" }
         XCTAssertNotNil(tool); XCTAssertNotNil(reply)

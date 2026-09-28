@@ -49,6 +49,9 @@ public final class MCPHTTPServer: @unchecked Sendable {
 
     public private(set) var boundPort: UInt16 = 0
 
+    /// One line per client session lifecycle event (never tokens or headers).
+    public var logger: (@Sendable (String) -> Void)?
+
     public var url: String { "http://127.0.0.1:\(boundPort)/mcp" }
 
     public init(config: Config, serverVersion: String,
@@ -458,6 +461,11 @@ public final class MCPHTTPServer: @unchecked Sendable {
                                     protocolVersion: version, lastSeen: Date(),
                                     streamFD: nil)
             lock.unlock()
+            let clientName = msg["params"]?["clientInfo"]?["name"]?.stringValue ?? "unknown"
+            let clientVersion = msg["params"]?["clientInfo"]?["version"]?.stringValue ?? "unknown"
+            logger?("mcp client session \(sid.prefix(8)) "
+                + "principal=\(principal.displayName) "
+                + "client=\(clientName)/\(clientVersion) protocol=\(version)")
             respondWithMessage(fd, msg: msg, sessionID: sid, token: token,
                                principal: principal)
             return
@@ -482,6 +490,23 @@ public final class MCPHTTPServer: @unchecked Sendable {
             // Notification: accepted, no body.
             return respond(fd, status: 202, text: "Accepted",
                            contentType: "text/plain", body: "")
+        }
+        // A-5: per-call audit — method + tool name + outcome only, never
+        // arguments or content.
+        let id8 = sessionID.prefix(8)
+        switch msg["method"]?.stringValue {
+        case "tools/call":
+            let name = msg["params"]?["name"]?.stringValue ?? "unknown"
+            var isError = false
+            if case .bool(let b) = response["result"]?["isError"] { isError = b }
+            logger?("mcp call \(id8) principal=\(principal.displayName) "
+                + "tool=\(name) \(isError ? "error" : "ok")")
+        case "tools/list":
+            let count = response["result"]?["tools"]?.arrayValue?.count ?? 0
+            logger?("mcp list \(id8) principal=\(principal.displayName) "
+                + "tools=\(count)")
+        default:
+            break
         }
         let body = String(decoding: (try? JSONEncoder().encode(response)) ?? Data(),
                           as: UTF8.self)
@@ -580,6 +605,7 @@ public final class MCPHTTPServer: @unchecked Sendable {
             shutdownIfLive(s)
         }
         lock.unlock()
+        logger?("mcp client session \(sid.prefix(8)) deleted")
         respond(fd, status: 200, text: "OK", body: "{}")
     }
 }

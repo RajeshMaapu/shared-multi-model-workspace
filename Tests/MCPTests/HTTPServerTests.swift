@@ -122,10 +122,29 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertNotNil(sid)
         XCTAssertEqual(json?["result"]?["protocolVersion"]?.stringValue, "2025-11-25")
         XCTAssertTrue(json?["result"]?["serverInfo"]?["version"]?.stringValue?
-                        .contains("+catalog1") ?? false)
+                        .contains("+catalog2") ?? false)
         (_, json, sid) = try await initialize(version: "2099-01-01")
         XCTAssertEqual(json?["result"]?["protocolVersion"]?.stringValue, "2025-06-18")
         XCTAssertNotNil(sid)
+    }
+
+    /// A successful initialize logs one client-session line with the
+    /// negotiated protocol and clientInfo (never tokens or headers).
+    func testInitializeLogsClientSession() async throws {
+        var logged: [String] = []
+        server.logger = { logged.append($0) }
+        let (resp, _) = try await post(
+            #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"rmcp","version":"0.9.1"}}}"#)
+        XCTAssertEqual(resp.statusCode, 200)
+        let sid8 = String((resp.value(forHTTPHeaderField: "Mcp-Session-Id") ?? "")
+            .prefix(8))
+        let line = logged.first { $0.contains("mcp client session") }
+        XCTAssertNotNil(line)
+        XCTAssertTrue(line?.contains(sid8) ?? false)
+        XCTAssertTrue(line?.contains("principal=Kimi K3") ?? false)
+        XCTAssertTrue(line?.contains("client=rmcp/0.9.1") ?? false)
+        XCTAssertTrue(line?.contains("protocol=2025-06-18") ?? false)
+        XCTAssertFalse(line?.contains("Bearer") ?? true)
     }
 
     func testAuthFailures() async throws {
@@ -159,16 +178,29 @@ final class HTTPServerTests: XCTestCase {
     }
 
     func testToolsList() async throws {
+        var logged: [String] = []
+        server.logger = { logged.append($0) }
         let (_, _, sid) = try await initialize()
         let (resp, json) = try await post(
             #"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#, session: sid)
         XCTAssertEqual(resp.statusCode, 200)
         let tools = json?["result"]?["tools"]?.arrayValue
         XCTAssertEqual(tools?.count, WorkshopToolCatalog.tools.count)
-        XCTAssertEqual(json?["result"]?["_meta"]?["workshop_catalog_version"]?.intValue, 1)
+        XCTAssertEqual(json?["result"]?["_meta"]?["workshop_catalog_version"]?.intValue, 2)
+        // Catalog 2: workshop_read_messages accepts include_summaries.
+        let readSchema = tools?.first {
+            $0["name"]?.stringValue == "workshop_read_messages" }
+        XCTAssertEqual(readSchema?["inputSchema"]?["properties"]?["include_summaries"]?["type"]?.stringValue, "boolean")
+        // A-5: the call is logged with principal + count, no payload.
+        let line = logged.first { $0.contains("mcp list") }
+        XCTAssertNotNil(line)
+        XCTAssertTrue(line?.contains("tools=\(WorkshopToolCatalog.tools.count)") ?? false)
+        XCTAssertTrue(line?.contains("principal=") ?? false)
     }
 
     func testToolsCall() async throws {
+        var logged: [String] = []
+        server.logger = { logged.append($0) }
         let (_, _, sid) = try await initialize()
         let (resp, json) = try await post(
             #"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"workshop_list_tasks","arguments":{"a":1}}}"#,
@@ -191,6 +223,12 @@ final class HTTPServerTests: XCTestCase {
         let text2 = json2?["result"]?["content"]?.arrayValue?
             .first?["text"]?.stringValue ?? ""
         XCTAssertTrue(text2.contains("\(WorkshopError.methodNotFound("x").rpcCode)"))
+        // A-5: per-call log lines carry tool name + ok|error, no arguments.
+        let callLines = logged.filter { $0.contains("mcp call") }
+        XCTAssertEqual(callLines.count, 2)
+        XCTAssertTrue(callLines[0].contains("tool=workshop_list_tasks ok"))
+        XCTAssertTrue(callLines[1].contains("tool=workshop_list_tasks error"))
+        XCTAssertTrue(callLines.allSatisfy { $0.contains("principal=") })
     }
 
     func testAuthorizeFailureIsToolError() async throws {

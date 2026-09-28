@@ -83,6 +83,45 @@ public struct Message: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// One completed turn as recorded in Workshop-owned task memory (Phase 2,
+/// G-D3): what a cold native session needs to reconstruct its own history.
+public struct TurnRecord: Codable, Equatable, Sendable {
+    public var turnID: String
+    public var endedAt: Date
+    /// Wake reason for this turn, or "execution" for owner dispatch turns.
+    public var reason: String?
+    /// completed | silent | failed | cancelled
+    public var outcome: String
+    /// Engineer-authored messages committed this turn (tool posts + reply).
+    public var postedSeqs: [Int64]
+    /// Set when a structured result revision was created this turn.
+    public var resultRevision: Int?
+    /// Set when a review was submitted this turn (the reviewed message id).
+    public var reviewedMessageID: String?
+    /// ≤ 20 relative paths; authoritative writer turns only.
+    public var filesTouched: [String]
+    public var nativeSessionID: String?
+    /// false when the adapter reported a fresh native session this turn.
+    public var sessionResumed: Bool
+
+    public init(turnID: String, endedAt: Date, reason: String? = nil,
+                outcome: String, postedSeqs: [Int64] = [],
+                resultRevision: Int? = nil, reviewedMessageID: String? = nil,
+                filesTouched: [String] = [], nativeSessionID: String? = nil,
+                sessionResumed: Bool = false) {
+        self.turnID = turnID
+        self.endedAt = endedAt
+        self.reason = reason
+        self.outcome = outcome
+        self.postedSeqs = postedSeqs
+        self.resultRevision = resultRevision
+        self.reviewedMessageID = reviewedMessageID
+        self.filesTouched = filesTouched
+        self.nativeSessionID = nativeSessionID
+        self.sessionResumed = sessionResumed
+    }
+}
+
 public struct Participant: Codable, Equatable, Sendable {
     public var taskID: TaskID
     public var engineerID: EngineerID

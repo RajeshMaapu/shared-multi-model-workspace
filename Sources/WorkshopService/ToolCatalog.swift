@@ -5,7 +5,8 @@ import WorkshopCore
 /// MCP bridge (tools/list) and the DeepSeek adapter (tools param).
 public enum WorkshopToolCatalog {
     /// Increment when any tool schema changes; additive/optional changes only.
-    public static let catalogVersion = 1
+    /// 2: `workshop_read_messages` gains optional `include_summaries`.
+    public static let catalogVersion = 2
 
     public struct Tool: Sendable {
         public let name: String
@@ -21,6 +22,7 @@ public enum WorkshopToolCatalog {
 
     private static var s: JSONValue { .object(["type": .string("string")]) }
     private static var i: JSONValue { .object(["type": .string("integer")]) }
+    private static var b: JSONValue { .object(["type": .string("boolean")]) }
 
     public static let tools: [Tool] = [
         Tool(name: "workshop_create_task",
@@ -60,7 +62,8 @@ public enum WorkshopToolCatalog {
              inputSchema: obj(["task_id": s], required: ["task_id"])),
         Tool(name: "workshop_read_messages",
              description: "Read committed messages in a task after a seq.",
-             inputSchema: obj(["task_id": s, "after_seq": i, "limit": i],
+             inputSchema: obj(["task_id": s, "after_seq": i, "limit": i,
+                               "include_summaries": b],
                               required: ["task_id"])),
         Tool(name: "workshop_post_message",
              description: "Post a message to a task. Mention @devin/@kimi/@deepseek to wake a peer.",

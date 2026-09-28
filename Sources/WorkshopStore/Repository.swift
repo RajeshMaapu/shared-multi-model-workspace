@@ -180,9 +180,12 @@ public final class WorkshopRepository {
             ])
     }
 
-    public func messages(_ taskID: TaskID, afterSeq: Int64 = 0, limit: Int = 500) throws -> [Message] {
-        try db.query("""
-            SELECT * FROM messages WHERE task_id=? AND seq>? ORDER BY seq LIMIT ?
+    public func messages(_ taskID: TaskID, afterSeq: Int64 = 0, limit: Int = 500,
+                         includeSummaries: Bool = false) throws -> [Message] {
+        let kindClause = includeSummaries ? "" : " AND kind != 'turn_summary'"
+        return try db.query("""
+            SELECT * FROM messages WHERE task_id=? AND seq>?\(kindClause)
+            ORDER BY seq LIMIT ?
             """, [.text(taskID.rawValue), .integer(afterSeq), .integer(Int64(limit))]).map(messageFrom)
     }
 
@@ -190,13 +193,15 @@ public final class WorkshopRepository {
     /// rows; else the `limit` rows immediately before beforeSeq. Both return
     /// ascending order; provisional seqs excluded.
     public func messagePage(_ taskID: TaskID, beforeSeq: Int64? = nil,
-                            limit: Int = 500) throws -> [Message] {
+                            limit: Int = 500,
+                            includeSummaries: Bool = false) throws -> [Message] {
         let cap = min(limit, 500)
+        let kindClause = includeSummaries ? "" : " AND kind != 'turn_summary'"
         if let beforeSeq {
             return try db.query("""
                 SELECT * FROM (
                     SELECT * FROM messages
-                    WHERE task_id=? AND seq<? AND seq<?
+                    WHERE task_id=? AND seq<? AND seq<?\(kindClause)
                     ORDER BY seq DESC LIMIT ?
                 ) ORDER BY seq
                 """, [.text(taskID.rawValue), .integer(beforeSeq),
@@ -206,7 +211,7 @@ public final class WorkshopRepository {
         return try db.query("""
             SELECT * FROM (
                 SELECT * FROM messages
-                WHERE task_id=? AND seq<?
+                WHERE task_id=? AND seq<?\(kindClause)
                 ORDER BY seq DESC LIMIT ?
             ) ORDER BY seq
             """, [.text(taskID.rawValue), .integer(Self.provisionalSeqBase),
@@ -229,6 +234,12 @@ public final class WorkshopRepository {
 
     public func deleteMessage(_ id: MessageID) throws {
         try db.execute("DELETE FROM messages WHERE id=?", [.text(id.rawValue)])
+    }
+
+    public func updateMessageKind(_ id: MessageID, _ kind: MessageKind, at now: Date) throws {
+        try db.execute("UPDATE messages SET kind=?, updated_at=? WHERE id=?", [
+            .text(kind.rawValue), .text(WorkshopTime.string(now)), .text(id.rawValue),
+        ])
     }
 
     public func updateMessageDelivery(_ id: MessageID, _ state: DeliveryState, at now: Date) throws {
@@ -565,6 +576,35 @@ public final class WorkshopRepository {
                 payload = payload || ' [error: ' || ? || ']', delivered_at=?
             WHERE seq=?
             """, [.text(reason), .text(WorkshopTime.string(now)), .integer(seq)])
+    }
+
+    /// E4: bound the work.activity ring — delete delivered rows older than
+    /// the newest `keep` for the task. Gaps are fine: consumers select
+    /// `seq > cursor` and dispatch only touches `dispatch.requested` rows.
+    @discardableResult
+    public func pruneWorkActivity(taskID: TaskID, keep: Int) throws -> Int {
+        try db.execute("""
+            DELETE FROM outbox
+            WHERE task_id=? AND event_type='work.activity' AND delivery_state='delivered'
+              AND seq NOT IN (
+                SELECT seq FROM outbox
+                WHERE task_id=? AND event_type='work.activity' AND delivery_state='delivered'
+                ORDER BY seq DESC LIMIT ?
+              )
+            """, [.text(taskID.rawValue), .text(taskID.rawValue), .integer(Int64(keep))])
+        return db.changes()
+    }
+
+    @discardableResult
+    public func pruneAllWorkActivity(keep: Int) throws -> Int {
+        let taskIDs = try db.query(
+            "SELECT DISTINCT task_id FROM outbox WHERE event_type='work.activity'")
+            .compactMap { $0["task_id"]?.text }.map { TaskID($0) }
+        var deleted = 0
+        for taskID in taskIDs {
+            deleted += try pruneWorkActivity(taskID: taskID, keep: keep)
+        }
+        return deleted
     }
 
     public func latestOutboxEvent(taskID: TaskID, eventType: String) throws -> OutboxEvent? {
@@ -1316,5 +1356,35 @@ public final class WorkshopRepository {
          schemaVersion: Int(r["schema_version"]!.int!),
          content: r["content"]!.text!, valid: (r["valid"]?.int ?? 1) == 1,
          createdAt: WorkshopTime.date(r["created_at"]!.text!))
+    }
+
+    // MARK: - Task memory (Phase 2, G-D3)
+
+    /// Per-(task, engineer) turn records, oldest first (bounded ring).
+    public func taskMemory(taskID: TaskID, engineerID: EngineerID) throws -> [TurnRecord] {
+        guard let text = try db.query(
+            "SELECT turn_records FROM task_memory WHERE task_id=? AND engineer_id=?",
+            [.text(taskID.rawValue), .text(engineerID.rawValue)]
+        ).first?["turn_records"]?.text,
+              let records = try? JSONDecoder().decode([TurnRecord].self,
+                                                      from: Data(text.utf8))
+        else { return [] }
+        return records
+    }
+
+    /// Append one record, keeping the newest `keep` (ring semantics).
+    public func appendTurnRecord(taskID: TaskID, engineerID: EngineerID,
+                                 _ record: TurnRecord, keep: Int = 8) throws {
+        var records = try taskMemory(taskID: taskID, engineerID: engineerID)
+        records.append(record)
+        if records.count > keep { records = Array(records.suffix(keep)) }
+        let json = String(decoding: try JSONEncoder().encode(records), as: UTF8.self)
+        try db.execute("""
+            INSERT INTO task_memory(task_id, engineer_id, turn_records, updated_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(task_id, engineer_id) DO UPDATE SET
+                turn_records=excluded.turn_records, updated_at=excluded.updated_at
+            """, [.text(taskID.rawValue), .text(engineerID.rawValue), .text(json),
+                  .text(WorkshopTime.string(Date()))])
     }
 }

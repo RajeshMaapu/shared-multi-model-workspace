@@ -209,6 +209,7 @@ public final class DaemonRuntime: @unchecked Sendable {
                 return try await service.callTool(method, args: args,
                                                   principal: principal)
             })
+        mcpServer.logger = { Self.log($0) }
         try mcpServer.bind()
         self.mcpServer = mcpServer
         Self.log("mcp endpoint bound at \(mcpServer.url)")
@@ -408,7 +409,11 @@ public final class DaemonRuntime: @unchecked Sendable {
                 let afterSeq = params?["after_seq"]?.intValue ?? 0
                 let limit = Int(params?["limit"]?.intValue ?? 500)
                 return try .from(try await service.readMessages(id, afterSeq: afterSeq,
-                                                              limit: limit))
+                    limit: limit,
+                    includeSummaries: params?["include_summaries"].flatMap {
+                        if case .bool(let b) = $0 { return b }
+                        return nil
+                    } ?? false))
             case WorkshopProtocol.postMessage:
                 let id = TaskID(params?["task_id"]?.stringValue ?? "")
                 let body = params?["body"]?.stringValue ?? ""
@@ -489,7 +494,11 @@ public final class DaemonRuntime: @unchecked Sendable {
                 let beforeSeq = params?["before_seq"]?.intValue
                 let limit = Int(params?["limit"]?.intValue ?? 500)
                 return try .from(try await service.readMessagePage(
-                    id, beforeSeq: beforeSeq, limit: limit))
+                    id, beforeSeq: beforeSeq, limit: limit,
+                    includeSummaries: params?["include_summaries"].flatMap {
+                        if case .bool(let b) = $0 { return b }
+                        return nil
+                    } ?? false))
             case WorkshopProtocol.recoverySummary:
                 let id = TaskID(params?["task_id"]?.stringValue ?? "")
                 return try await service.recoverySummary(taskID: id)

@@ -70,6 +70,10 @@ public actor CollaborationService {
     private var harnessAliveProbes: [EngineerID: @Sendable () -> Bool] = [:]
     /// Checkpoint JSON carried into the next resume_from_checkpoint packet.
     private var pendingCheckpointDetail: [EngineerID: String] = [:]
+    /// Most recent classified turn-startup failure per engineer (G-D2);
+    /// merged into listEngineers for ~30 min, cleared on a successful open.
+    private var lastStartupFailure:
+        [EngineerID: (klass: StartupFailureClass, detail: String, at: Date)] = [:]
     private var lastWalCheckpoint: Date?
     /// Research-phase deadlines in seconds; <= 0 disables the timer (tests).
     private let researchDeadline: TimeInterval
@@ -301,6 +305,11 @@ public actor CollaborationService {
     public func start() async {
         reconcileOnStart()
         recoverInterruptedStreams()
+        if let pruned = attempt("pruneAllWorkActivity", {
+            try repo.pruneAllWorkActivity(keep: 200)
+        }), pruned > 0 {
+            log.notice("pruned \(pruned) delivered work.activity rows at startup")
+        }
         if let homeDir {
             _ = attempt("recoverWriters") { try WriterGenerations(db: repo.db, home: homeDir).recover() }
         }
@@ -442,28 +451,53 @@ public actor CollaborationService {
         try repo.usageSamples(taskID)
     }
 
-    public func readMessages(_ taskID: TaskID, afterSeq: Int64 = 0, limit: Int = 500) throws -> [Message] {
-        try repo.messages(taskID, afterSeq: afterSeq, limit: min(limit, 500))
+    public func readMessages(_ taskID: TaskID, afterSeq: Int64 = 0, limit: Int = 500,
+                             includeSummaries: Bool = false) throws -> [Message] {
+        try repo.messages(taskID, afterSeq: afterSeq, limit: min(limit, 500),
+                          includeSummaries: includeSummaries)
     }
 
     /// T31 paging: newest page when beforeSeq is nil, else the window before it.
     public func readMessagePage(_ taskID: TaskID, beforeSeq: Int64? = nil,
-                                limit: Int = 500) throws -> [Message] {
-        try repo.messagePage(taskID, beforeSeq: beforeSeq, limit: limit)
+                                limit: Int = 500,
+                                includeSummaries: Bool = false) throws -> [Message] {
+        try repo.messagePage(taskID, beforeSeq: beforeSeq, limit: limit,
+                             includeSummaries: includeSummaries)
     }
 
     public func listEngineers() async -> [AdapterProbe] {
         var probes: [AdapterProbe] = []
         for engineer in EngineerID.allCases {
+            var probe: AdapterProbe
             if let adapter = adapters[engineer] {
-                probes.append(await adapter.probe())
+                probe = await adapter.probe()
             } else {
-                probes.append(AdapterProbe(engineer: engineer,
-                                           health: .unavailable("adapter not configured")))
+                probe = AdapterProbe(engineer: engineer,
+                                     health: .unavailable("adapter not configured"))
             }
+            // G-D2: surface a recent startup failure on the engineer card;
+            // auth failures read as unavailable with a login remedy.
+            if let failure = lastStartupFailure[engineer],
+               now().timeIntervalSince(failure.at) < 1800 {
+                let time = Self.clockTime.string(from: failure.at)
+                if failure.klass == .auth {
+                    probe.health = .unavailable("Login required: \(failure.detail)")
+                } else {
+                    probe.health = EngineerHealth(probe.health.kind,
+                        detail: "\(probe.health.detail) — last start failed "
+                            + "(\(failure.klass.rawValue)) at \(time)")
+                }
+            }
+            probes.append(probe)
         }
         return probes
     }
+
+    private static let clockTime: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     public func outboxEvents(afterSeq: Int64) throws -> [OutboxEvent] {
         try repo.outboxEvents(afterSeq: afterSeq)
@@ -737,12 +771,14 @@ public actor CollaborationService {
 
     /// workshop_read_messages for an engineer principal.
     public func toolReadMessages(taskID: TaskID, afterSeq: Int64, limit: Int,
+                                 includeSummaries: Bool = false,
                                  principal: Principal) throws -> [Message] {
         if let engineer = principal.engineerID {
             try requireParticipant(engineer, taskID: taskID)
         }
         // Provisional-seq rows are still streaming; engineers never see them.
-        return try repo.messages(taskID, afterSeq: afterSeq, limit: limit)
+        return try repo.messages(taskID, afterSeq: afterSeq, limit: limit,
+                                 includeSummaries: includeSummaries)
             .filter { $0.deliveryState == .committed }
     }
 
@@ -757,7 +793,8 @@ public actor CollaborationService {
             messageKind = .text
             structured = #"{"help_request":true}"#
         case let raw:
-            guard let parsed = MessageKind(rawValue: raw), parsed != .systemEvent else {
+            guard let parsed = MessageKind(rawValue: raw),
+                  parsed != .systemEvent, parsed != .turnSummary else {
                 throw WorkshopError.invalidRequest("unsupported kind: \(raw)")
             }
             messageKind = parsed
@@ -1157,7 +1194,12 @@ public actor CollaborationService {
             let id = TaskID(args["task_id"]?.stringValue ?? "")
             return try .from(try toolReadMessages(
                 taskID: id, afterSeq: args["after_seq"]?.intValue ?? 0,
-                limit: Int(args["limit"]?.intValue ?? 200), principal: principal))
+                limit: Int(args["limit"]?.intValue ?? 200),
+                includeSummaries: args["include_summaries"].flatMap {
+                    if case .bool(let b) = $0 { return b }
+                    return nil
+                } ?? false,
+                principal: principal))
         case "workshop_post_message":
             let id = TaskID(args["task_id"]?.stringValue ?? "")
             guard let body = args["body"]?.stringValue else {
@@ -1310,6 +1352,9 @@ public actor CollaborationService {
     /// Compute wakeup targets for a committed message and insert pending rows.
     /// Must be called inside the committing transaction.
     private func enqueueWakeups(for message: Message, at timestamp: Date) throws {
+        // Turn summaries never wake — even a "@kimi" inside one is output
+        // recap, not a call to act.
+        if message.kind == .turnSummary { return }
         let participants = try repo.participants(message.taskID)
         let participantIDs = Set(participants.map(\.engineerID))
         var targets: [(EngineerID, String)] = []
@@ -1476,6 +1521,14 @@ public actor CollaborationService {
                 let fallback: Subtask? = attempt("wakeupFallbackSubtask", {
                     try repo.subtasks(task.id).first
                 }) ?? nil
+                // G-C4: while the owner's revision is open (claimed/working),
+                // a discussion-shaped reason in the group is coalesced into
+                // the authoritative writer turn — prefer it over unrelated
+                // trailing reasons so the turn isn't run as read-only.
+                let ownedOpenRevision = owned.map {
+                    $0.ownerID == group.engineer
+                        && ($0.state == .claimed || $0.state == .working)
+                } ?? false
                 let outcome = await runTurn(adapter: adapter, engineer: group.engineer,
                                             task: task,
                                             subtask: owned ?? fallback,
@@ -1483,7 +1536,12 @@ public actor CollaborationService {
                                                 ["assigned", "resumed", "changes_requested",
                                                  "changes_requested_retry",
                                                  "report_requested"].contains($0)
-                                            } ?? group.reasons.last)
+                                            } ?? (ownedOpenRevision ? group.reasons.first {
+                                                ["mention", "user_message", "user_mention",
+                                                 "review_request"].contains(
+                                                    $0.split(separator: ":").first
+                                                        .map(String.init) ?? $0)
+                                            } : nil) ?? group.reasons.last)
                 switch outcome {
                 case .completed(let substantive):
                     for row in group.rows {
@@ -1507,6 +1565,8 @@ public actor CollaborationService {
                         publishCommitted()
                     }
                 case .failedToStart(let detail):
+                    lastStartupFailure[group.engineer] =
+                        (StartupFailureClass.classify(detail), detail, now())
                     deferWakeups(rows: group.rows, taskID: task.id,
                                  engineer: group.engineer, detail: detail,
                                  reasons: group.reasons,
@@ -1546,7 +1606,11 @@ public actor CollaborationService {
                               eventPrefix: String? = nil) {
         let timestamp = now()
         let attempt = (rows.map(\.attempt).max() ?? 0) + 1
-        let maxAttempts = wakeupRetryBackoff.count
+        // G-D2: classify the failure; authentication failures cannot be cured
+        // by retrying, so they get a single deferred retry only.
+        let klass = StartupFailureClass.classify(detail)
+        let shortDetail = String(detail.prefix(200))
+        let maxAttempts = klass == .auth ? 1 : wakeupRetryBackoff.count
         if attempt <= maxAttempts {
             let delay = wakeupRetryBackoff[attempt - 1]
             let notBefore = timestamp.addingTimeInterval(Self.durationSeconds(delay))
@@ -1556,7 +1620,8 @@ public actor CollaborationService {
                                          notBefore: notBefore, at: timestamp) })
             }
             let prefix = eventPrefix
-                ?? "Waiting for \(engineer.displayName): \(detail)"
+                ?? "Waiting for \(engineer.displayName) (\(klass.rawValue): "
+                    + "\(shortDetail))"
             _ = self.attempt("wakeupDeferEvent") {
                 try repo.insertMessage(Message(
                     id: MessageID(newID("msg")), taskID: taskID,
@@ -1586,9 +1651,17 @@ public actor CollaborationService {
             }
             _ = self.attempt("wakeupLaunchFailedEvent") {
                 try repo.db.transaction {
-                    var body = "Could not start \(engineer.displayName) after "
-                        + "\(maxAttempts) attempts: \(detail); will retry on "
-                        + "the next message or resume"
+                    var body: String
+                    if klass == .auth {
+                        body = "Login required for \(engineer.displayName): "
+                            + "\(shortDetail). Fix: "
+                            + StartupFailureClass.loginRemedy(for: engineer)
+                            + "; then mention the engineer again."
+                    } else {
+                        body = "Could not start \(engineer.displayName) after "
+                            + "\(maxAttempts) attempts: \(shortDetail); will "
+                            + "retry on the next message or resume"
+                    }
                     if let subtask = ownerSubtask {
                         try repo.updateSubtaskState(subtask.id, .blocked,
                                                     at: timestamp)
@@ -1862,20 +1935,37 @@ public actor CollaborationService {
         try repo.updateTaskState(taskID, state, at: now())
     }
 
+    /// Test hook: this engineer's task-memory turn records (oldest first).
+    public func taskMemoryForTest(taskID: TaskID,
+                                  engineer: EngineerID) throws -> [TurnRecord] {
+        try repo.taskMemory(taskID: taskID, engineerID: engineer)
+    }
+
+    /// Test hook: the newest writer-generation state for (task, engineer).
+    public func writerGenerationStateForTest(taskID: TaskID,
+                                             engineer: EngineerID) throws -> String? {
+        try repo.db.query("""
+            SELECT state FROM writer_generations
+            WHERE task_id=? AND engineer=? ORDER BY rowid DESC LIMIT 1
+            """, [.text(taskID.rawValue), .text(engineer.rawValue)])
+            .first?["state"]?.text
+    }
+
     /// Run a turn directly (no dispatch); concurrent=true detaches it.
     public func runTurnForTest(engineer: EngineerID, taskID: TaskID,
-                               concurrent: Bool = false) async {
+                               concurrent: Bool = false,
+                               wakeReason: String = "assigned") async {
         guard let adapter = adapters[engineer],
               let task = try? repo.task(taskID) else { return }
         let sub = try? repo.latestOwnedSubtask(taskID: taskID, owner: engineer)
         if concurrent {
             Task {
                 await self.runTurn(adapter: adapter, engineer: engineer,
-                                   task: task, subtask: sub, wakeReason: "assigned")
+                                   task: task, subtask: sub, wakeReason: wakeReason)
             }
         } else {
             await runTurn(adapter: adapter, engineer: engineer, task: task,
-                          subtask: sub, wakeReason: "assigned")
+                          subtask: sub, wakeReason: wakeReason)
         }
     }
 
@@ -2151,10 +2241,24 @@ public actor CollaborationService {
         // (mentions, research, reviews, reports) run on an explicitly read-only
         // footing: a fenced non-authoritative generation that seals to
         // review_only and can never be promoted.
+        // G-C4: while the owner has an open revision (subtask claimed/working),
+        // a discussion-shaped wake coalesces into its authoritative writer
+        // turn — the owner can apply the requested change and reply from the
+        // same turn instead of a read-only discussion copy. Once the subtask
+        // is in review there is nothing to edit and mentions stay discussion.
+        let reasonHead = wakeReason?.split(separator: ":").first.map(String.init)
+        let ownerHasOpenRevision = subtask?.ownerID == engineer
+            && (subtask?.state == .claimed || subtask?.state == .working)
+        let coalescedOwnerTurn = ownerHasOpenRevision
+            && (!schemaV2 || adapter.supportsIsolatedWorkspaceTurns)
+            && reasonHead.map({
+                ["mention", "user_message", "user_mention", "review_request"].contains($0)
+            }) == true
         let executionReason = wakeReason == nil || wakeReason == "assigned"
             || wakeReason == "resumed" || wakeReason == "changes_requested"
             || wakeReason == "changes_requested_retry"
             || wakeReason == "report_requested"
+            || coalescedOwnerTurn
         let authoritative = (executionReason && subtask?.ownerID == engineer)
             || (engineer == .devin && subtask == nil && wakeReason == nil)
         if schemaV2, authoritative, !adapter.supportsIsolatedWorkspaceTurns {
@@ -2272,9 +2376,12 @@ public actor CollaborationService {
                                     [.text(task.id.rawValue), .text(engineer.rawValue)]))?
                     .compactMap { $0["path"]?.text } ?? []
         }
+        // The native session id the adapter was asked to resume (nil → fresh).
+        let requestedNativeSessionID = bound.nativeSessionID
         let ref: SessionRef
         do {
             ref = try await adapter.openTaskSession(binding: bound)
+            lastStartupFailure.removeValue(forKey: engineer)
             if bound.modelSelection == nil {
                 bound.modelSelection = adapter.modelSelection
             }
@@ -2343,6 +2450,18 @@ public actor CollaborationService {
             truncatedNote = "\(recent.count - 60) older messages omitted"
             recent = Array(recent.suffix(60))
         }
+        // G-D6: also bound the conversation bytes — drop the oldest until the
+        // remaining bodies fit 24 KiB.
+        var droppedForSize = 0
+        while recent.count > 1,
+              recent.reduce(0, { $0 + $1.body.utf8.count }) > 24 * 1024 {
+            recent.removeFirst()
+            droppedForSize += 1
+        }
+        if droppedForSize > 0 {
+            truncatedNote = (truncatedNote.map { $0 + "; " } ?? "")
+                + "\(droppedForSize) older messages omitted for size"
+        }
         let maxSeq = recent.map(\.seq).max() ?? lastRead
 
         var body = ""
@@ -2350,9 +2469,14 @@ public actor CollaborationService {
         var failedReason: String?
         var sawCompletion = false
         var sawUncertain = false
+        var sawSessionNotLoaded = false
         // A pending stop request (pause/cancel/quota-stop) asks the turn to
         // end with a checkpoint — only while a turn is running (§6.3).
         let wantsCheckpoint = checkpointRequested.remove(engineer) != nil
+        // A resumed native session carries provider-side context; a fresh one
+        // relies on the Workshop-owned memory section below.
+        let sessionResumed = requestedNativeSessionID != nil
+            && requestedNativeSessionID == ref.nativeSessionID
         let context = TurnContext(task: task, subtask: subtask,
                                   recentMessages: recent,
                                   wakeReason: wakeReason,
@@ -2363,7 +2487,12 @@ public actor CollaborationService {
                                   checkpointRequest: wantsCheckpoint,
                                   ingress: ingress, workspace: workspace,
                                   capabilities: workspace?.state == "discussion"
-                                      ? .discussion : .writer)
+                                      ? .discussion : .writer,
+                                  memory: taskMemoryPacket(
+                                      task: task, engineer: engineer,
+                                      subtask: subtask,
+                                      sessionResumed: sessionResumed),
+                                  authoritativeOwnerTurn: coalescedOwnerTurn)
         packetInspector?(engineer, context.packetText(for: engineer))
         let turnID = newID("turn")
         runningTurnRefs[turnKey] = (adapter, ref, turnID)
@@ -2460,6 +2589,9 @@ public actor CollaborationService {
                     recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
                                    kind: "status", title: "Provider reported an uncertain outcome", status: "uncertain")
                     sawUncertain = true
+                    if note.localizedCaseInsensitiveContains("could not be loaded") {
+                        sawSessionNotLoaded = true
+                    }
                     _ = attempt("uncertainNote") {
                         let t = now()
                         try repo.insertMessage(Message(
@@ -2524,6 +2656,19 @@ public actor CollaborationService {
                     try repo.deleteMessage(messageID)
                 } else {
                     try repo.updateMessageBody(messageID, body: body, at: endTime)
+                    // E3: when the turn already posted through tools, the
+                    // streamed reply is a turn summary — committed with a
+                    // real seq but hidden from packets/cursors/default reads.
+                    let toolPosts = try repo.messages(
+                        task.id, afterSeq: maxSeq, includeSummaries: true)
+                        .filter { $0.author == .engineer(engineer)
+                            && $0.id != messageID
+                            && $0.deliveryState == .committed
+                            && $0.kind != .systemEvent }
+                    if !toolPosts.isEmpty,
+                       !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        try repo.updateMessageKind(messageID, .turnSummary, at: endTime)
+                    }
                     // F1: the placeholder takes its real seq now, so
                     // tool-posted messages from the same turn keep their
                     // earlier seqs.
@@ -2624,18 +2769,152 @@ public actor CollaborationService {
             }
         }
         publishCommitted()
-        if cancelled { return .failed("cancelled") }
-        if let failedReason { return .failed(failedReason) }
         // Substantive = the engineer committed at least one message in this
         // turn (the streamed reply or any tool-posted message with a seq
         // beyond the turn-start boundary).
-        let substantive = (attempt("turnSubstantive", {
-            try repo.messages(task.id)
-        }) ?? []).contains {
+        let turnMessages = (attempt("turnSubstantive", {
+            try repo.messages(task.id, includeSummaries: true)
+        }) ?? []).filter {
             $0.author == .engineer(engineer) && $0.seq > maxSeq
                 && $0.deliveryState == .committed
         }
+        let substantive = !turnMessages.isEmpty
+        // Phase 2 (G-D3): record the turn in Workshop-owned task memory so the
+        // next packet carries this engineer's own history even when the
+        // provider session was cold. Best-effort; never fails the turn.
+        do {
+            var resultRevision: Int?
+            var reviewedMessageID: String?
+            for m in turnMessages {
+                guard let s = m.structured,
+                      let v = try? JSONDecoder().decode(JSONValue.self,
+                                                        from: Data(s.utf8))
+                else { continue }
+                if v["type"]?.stringValue == "result" {
+                    resultRevision = v["revision"]?.intValue.map(Int.init)
+                } else if v["type"]?.stringValue == "review" {
+                    reviewedMessageID = v["proposal_id"]?.stringValue
+                }
+            }
+            let outcome = cancelled ? "cancelled"
+                : (failedReason != nil ? "failed"
+                   : (substantive ? "completed" : "silent"))
+            let record = TurnRecord(
+                turnID: turnID, endedAt: endTime, reason: wakeReason ?? "execution",
+                outcome: outcome, postedSeqs: turnMessages.map(\.seq),
+                resultRevision: resultRevision,
+                reviewedMessageID: reviewedMessageID,
+                filesTouched: authoritative ? filesTouched(at: writerLease?.path) : [],
+                nativeSessionID: ref.nativeSessionID,
+                sessionResumed: sessionResumed && !sawSessionNotLoaded)
+            _ = attempt("appendTurnRecord", {
+                try repo.appendTurnRecord(taskID: task.id, engineerID: engineer,
+                                          record)
+            })
+        }
+        // E4: bound the work.activity ring for this task (delivered rows only;
+        // pending/dispatch.requested rows are never touched).
+        if let pruned = attempt("pruneWorkActivity", {
+            try repo.pruneWorkActivity(taskID: task.id, keep: 200)
+        }), pruned > 0 {
+            log.notice("pruned \(pruned) delivered work.activity rows for task \(task.id.rawValue)")
+        }
+        if cancelled { return .failed("cancelled") }
+        if let failedReason { return .failed(failedReason) }
         return .completed(substantive: substantive)
+    }
+
+    /// `git status --porcelain` paths for a writer lease directory (≤ 20),
+    /// empty on any error. Restricted env mirrors WriterGenerations.
+    private func filesTouched(at path: String?) -> [String] {
+        guard let path else { return [] }
+        do {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = ["status", "--porcelain"]
+            process.currentDirectoryURL = URL(fileURLWithPath: path)
+            process.environment = ["PATH": "/usr/bin:/bin", "HOME": path,
+                                   "GIT_CONFIG_NOSYSTEM": "1",
+                                   "GIT_CONFIG_GLOBAL": "/dev/null"]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            let deadline = DispatchWorkItem {
+                if process.isRunning { process.terminate() }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 30,
+                                              execute: deadline)
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            deadline.cancel()
+            guard process.terminationStatus == 0 else { return [] }
+            var paths: [String] = []
+            for line in String(decoding: data, as: UTF8.self)
+                .components(separatedBy: "\n") where line.count > 3 {
+                paths.append(String(line.suffix(line.count - 3)))
+                if paths.count >= 20 { break }
+            }
+            return paths
+        } catch { return [] }
+    }
+
+    /// Assemble the Workshop-owned memory section for this turn's packet
+    /// (G-D3): turn-record ring, latest valid checkpoint, the engineer's own
+    /// recent messages, and the latest result revision + peer dispositions.
+    private func taskMemoryPacket(task: WorkshopTask, engineer: EngineerID,
+                                  subtask: Subtask?, sessionResumed: Bool)
+        -> TaskMemoryPacket {
+        let records = attempt("taskMemory", {
+            try repo.taskMemory(taskID: task.id, engineerID: engineer)
+        }) ?? []
+        let checkpoint: JSONValue? = (attempt("latestCheckpoint", {
+            try repo.latestValidCheckpoint(taskID: task.id, engineerID: engineer)
+        }) ?? nil).flatMap {
+            try? JSONDecoder().decode(JSONValue.self, from: Data($0.content.utf8))
+        }
+        let committed = (attempt("memoryMessages", {
+            try repo.messages(task.id)
+        }) ?? []).filter { $0.deliveryState == .committed }
+        let own = committed.filter {
+            $0.author == .engineer(engineer) && $0.kind != .systemEvent
+                && $0.kind != .turnSummary
+                && ($0.structured.map {
+                    (try? JSONDecoder().decode(JSONValue.self,
+                        from: Data($0.utf8)))?["type"]?.stringValue != "result"
+                } ?? true)
+        }.suffix(3)
+        let target = subtask ?? (attempt("memorySubtask", {
+            try repo.subtasks(task.id).first
+        }) ?? nil)
+        var latestResult: (String, Int, String)?
+        var peerDispositions: [(EngineerID, String, Int64)] = []
+        if let target {
+            let results = attempt("memoryResults", {
+                try repo.resultMessages(taskID: task.id, subtaskID: target.id)
+            }) ?? []
+            if let latest = results.last {
+                latestResult = (latest.id.rawValue, results.count,
+                                target.id.rawValue)
+                for m in committed {
+                    guard let s = m.structured,
+                          let v = try? JSONDecoder().decode(
+                              JSONValue.self, from: Data(s.utf8)),
+                          v["type"]?.stringValue == "review",
+                          v["proposal_id"]?.stringValue == latest.id.rawValue,
+                          case .engineer(let peer) = m.author
+                    else { continue }
+                    peerDispositions.append(
+                        (peer, v["disposition"]?.stringValue ?? "unknown", m.seq))
+                }
+            }
+        }
+        return TaskMemoryPacket(turnRecords: records,
+                                latestCheckpoint: checkpoint,
+                                ownRecentMessages: Array(own),
+                                latestResult: latestResult,
+                                peerDispositions: peerDispositions,
+                                sessionResumed: sessionResumed)
     }
 
     // MARK: - Phase 3: collaboration policy (§5.1, §5.3, §5.5, §8.2)
@@ -4377,7 +4656,8 @@ extension CollaborationService {
         let task = try loadTask(taskID)
         let fm = FileManager.default
         try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true)
-        let messages = try repo.messages(taskID, afterSeq: 0, limit: 10_000)
+        let messages = try repo.messages(taskID, afterSeq: 0, limit: 10_000,
+                                         includeSummaries: true)
             .filter { $0.deliveryState == .committed }
         let decisions = try repo.decisions(taskID)
         let proposals = try repo.proposals(taskID).filter { $0.visibility == "published" }

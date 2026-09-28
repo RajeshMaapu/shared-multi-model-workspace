@@ -60,6 +60,145 @@ public struct TurnCapabilityManifest: Sendable, Codable, Equatable {
     }
 }
 
+/// Workshop-owned per-(task, engineer) history rendered into every turn
+/// packet so a cold native session does not lose the engineer's own context
+/// (Phase 2, G-D3). Bounded when rendered (see renderedSection).
+public struct TaskMemoryPacket: Sendable, Equatable {
+    /// Newest last.
+    public var turnRecords: [TurnRecord]
+    /// Latest valid checkpoint JSON for this engineer+task, if any.
+    public var latestCheckpoint: JSONValue?
+    /// This engineer's last committed non-event messages (≤ 3).
+    public var ownRecentMessages: [Message]
+    public var latestResult: (messageID: String, revision: Int, subtaskID: String)?
+    /// Latest review disposition per peer on the latest result.
+    public var peerDispositions: [(engineer: EngineerID, disposition: String, messageSeq: Int64)]
+    /// Whether the native session carried over previous context.
+    public var sessionResumed: Bool
+
+    public init(turnRecords: [TurnRecord] = [], latestCheckpoint: JSONValue? = nil,
+                ownRecentMessages: [Message] = [],
+                latestResult: (String, Int, String)? = nil,
+                peerDispositions: [(EngineerID, String, Int64)] = [],
+                sessionResumed: Bool) {
+        self.turnRecords = turnRecords
+        self.latestCheckpoint = latestCheckpoint
+        self.ownRecentMessages = ownRecentMessages
+        self.latestResult = latestResult
+        self.peerDispositions = peerDispositions
+        self.sessionResumed = sessionResumed
+    }
+
+    public static func == (a: TaskMemoryPacket, b: TaskMemoryPacket) -> Bool {
+        a.turnRecords == b.turnRecords
+            && a.latestCheckpoint == b.latestCheckpoint
+            && a.ownRecentMessages == b.ownRecentMessages
+            && a.sessionResumed == b.sessionResumed
+            && (a.latestResult == nil) == (b.latestResult == nil)
+            && (a.latestResult.map {
+                $0.messageID == b.latestResult?.messageID
+                    && $0.revision == b.latestResult?.revision
+                    && $0.subtaskID == b.latestResult?.subtaskID
+            } ?? true)
+            && a.peerDispositions.count == b.peerDispositions.count
+            && zip(a.peerDispositions, b.peerDispositions).allSatisfy {
+                $0.engineer == $1.engineer && $0.disposition == $1.disposition
+                    && $0.messageSeq == $1.messageSeq
+            }
+    }
+
+    /// The "## Your memory for this task" section lines, ≤ 6 KiB total.
+    /// Oldest turn records are dropped first, then message bodies clamp.
+    public func renderedSection() -> [String] {
+        var records = turnRecords
+        var messages = ownRecentMessages
+        while true {
+            let lines = render(records: records, messages: messages)
+            if lines.joined(separator: "\n").utf8.count <= 6144 { return lines }
+            if !records.isEmpty {
+                records.removeFirst()
+            } else if let last = messages.last, last.body.count > 300 {
+                messages = messages.map {
+                    var m = $0
+                    m.body = String(m.body.prefix(300))
+                    return m
+                }
+            } else {
+                return lines
+            }
+        }
+    }
+
+    private static let recordTime: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
+    private func render(records: [TurnRecord], messages: [Message]) -> [String] {
+        var lines: [String] = []
+        lines.append("")
+        lines.append("## Your memory for this task")
+        lines.append(sessionResumed
+            ? "Native session: resumed"
+            : "Native session: fresh — your earlier context was not loaded; "
+                + "rely on this section.")
+        if let checkpoint = latestCheckpoint, case .object(let o) = checkpoint {
+            var picked: [String: JSONValue] = [:]
+            for key in ["objective", "completed", "decisions", "unresolved",
+                        "next_action"] {
+                if let v = o[key] { picked[key] = v }
+            }
+            if !picked.isEmpty {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = .sortedKeys
+                if let data = try? encoder.encode(picked),
+                   let text = String(data: data, encoding: .utf8) {
+                    lines.append("Your last checkpoint: \(text)")
+                }
+            }
+        }
+        if !records.isEmpty {
+            lines.append("Your recent turns:")
+            for r in records {
+                var line = "[\(Self.recordTime.string(from: r.endedAt))] "
+                    + "\(r.reason ?? "execution") → \(r.outcome)"
+                if !r.postedSeqs.isEmpty {
+                    line += "; posted seq "
+                        + r.postedSeqs.map(String.init).joined(separator: ", ")
+                }
+                if let rev = r.resultRevision { line += "; result revision \(rev)" }
+                if let mid = r.reviewedMessageID { line += "; reviewed \(mid)" }
+                if !r.filesTouched.isEmpty {
+                    line += "; files: " + r.filesTouched.joined(separator: ", ")
+                }
+                lines.append(line)
+            }
+        }
+        if !messages.isEmpty {
+            lines.append("Your last messages:")
+            for m in messages {
+                lines.append("[\(m.seq)] \(String(m.body.prefix(300)))")
+            }
+        }
+        if let latest = latestResult {
+            var line = "Latest result: \(latest.messageID) revision "
+                + "\(latest.revision) for subtask \(latest.subtaskID)"
+            if !peerDispositions.isEmpty {
+                let seen = EngineerID.allCases.map { e in
+                    peerDispositions.last(where: { $0.engineer == e })
+                }
+                line += "; peer reviews: " + seen.map {
+                    $0.map { "\($0.engineer.rawValue)=\($0.disposition) (seq \($0.messageSeq))" }
+                        ?? ""
+                }.filter { !$0.isEmpty }.joined(separator: ", ")
+            }
+            lines.append(line)
+        }
+        return lines
+    }
+}
+
 /// Context handed to an adapter for one turn.
 public struct TurnContext: Sendable {
     public var task: WorkshopTask
@@ -79,12 +218,20 @@ public struct TurnContext: Sendable {
     public var workspace: TaskWorkspace?
     /// Residual permission policy for this turn (see TurnCapabilityManifest).
     public var capabilities: TurnCapabilityManifest
+    /// Workshop-owned task memory section for this engineer (Phase 2).
+    public var memory: TaskMemoryPacket?
+    /// True when a discussion-shaped wake reason was coalesced into the
+    /// owner's authoritative writer turn (G-C4): the packet then carries
+    /// both the wake-reason text and the authoritative-ownership line.
+    public var authoritativeOwnerTurn: Bool
 
     public init(task: WorkshopTask, subtask: Subtask?, recentMessages: [Message],
                 wakeReason: String? = nil, wakeDetail: String? = nil,
                 truncatedNote: String? = nil, checkpointRequest: Bool = false,
                 ingress: TaskIngress? = nil, workspace: TaskWorkspace? = nil,
-                capabilities: TurnCapabilityManifest = .writer) {
+                capabilities: TurnCapabilityManifest = .writer,
+                memory: TaskMemoryPacket? = nil,
+                authoritativeOwnerTurn: Bool = false) {
         self.task = task
         self.subtask = subtask
         self.recentMessages = recentMessages
@@ -95,6 +242,8 @@ public struct TurnContext: Sendable {
         self.ingress = ingress
         self.workspace = workspace
         self.capabilities = capabilities
+        self.memory = memory
+        self.authoritativeOwnerTurn = authoritativeOwnerTurn
     }
 
     /// Render the turn context packet (spec §G): stable header, task brief,
@@ -141,12 +290,23 @@ public struct TurnContext: Sendable {
         if let subtask, !subtask.acceptance.isEmpty {
             lines.append("Acceptance: " + subtask.acceptance.joined(separator: "; "))
         }
+        if authoritativeOwnerTurn, let subtask {
+            lines.append("")
+            lines.append("You own subtask \(subtask.id.rawValue) (generation "
+                + "\(subtask.generation)); this is your authoritative writer "
+                + "turn — apply changes here and report via "
+                + "workshop_report_result.")
+        }
+        if let memory {
+            lines.append(contentsOf: memory.renderedSection())
+        }
         if let truncatedNote { lines.append("(\(truncatedNote))") }
         if !recentMessages.isEmpty {
             lines.append("")
             lines.append("## Conversation")
-            for m in recentMessages where m.deliveryState == .committed {
-                lines.append("[\(m.seq)] \(m.author.displayName): \(m.body)")
+            for m in recentMessages
+            where m.deliveryState == .committed && m.kind != .turnSummary {
+                lines.append("[\(m.seq)] \(m.author.displayName): \(m.body.strippedInlineImages)")
             }
         }
         if let wakeReason {
@@ -285,4 +445,30 @@ public extension EngineerAdapter {
     var supportsIsolatedWorkspaceTurns: Bool { false }
     var modelSelection: String? { nil }
     var usesWorkspaceFilesystem: Bool { true }
+}
+
+extension String {
+    /// G-D6: inline base64 images never reach a packet — replace each
+    /// `data:image/…;base64,…` blob with a marker.
+    var strippedInlineImages: String {
+        var result = ""
+        var rest = Substring(self)
+        while let range = rest.range(of: "data:image/") {
+            result += rest[..<range.lowerBound]
+            var tail = rest[range.lowerBound...]
+            // Consume "<mime>;base64," then the base64 payload.
+            if let markerEnd = tail.range(of: ";base64,") {
+                tail = tail[markerEnd.upperBound...]
+                let end = tail.firstIndex(where: {
+                    $0.isWhitespace || $0 == "\"" || $0 == "'" || $0 == "<"
+                }) ?? tail.endIndex
+                rest = tail[end...]
+            } else {
+                rest = tail
+            }
+            result += "[image omitted]"
+        }
+        result += rest
+        return result
+    }
 }

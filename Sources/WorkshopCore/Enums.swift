@@ -77,6 +77,10 @@ public enum MessageKind: String, Codable, CaseIterable, Sendable {
     case review
     case artifact
     case decision
+    /// Streamed native reply of a turn that also posted through tools:
+    /// committed with a real seq but excluded from packets, cursors, wakeups
+    /// and default reads (E3).
+    case turnSummary = "turn_summary"
     case systemEvent = "system_event"
 }
 

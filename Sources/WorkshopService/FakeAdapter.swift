@@ -33,6 +33,9 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
     public var script: (@Sendable (TurnContext) async -> [ScriptedAction])?
     /// When set, openTaskSession throws this instead of opening (launch-retry tests).
     public var openSessionError: Error?
+    /// When true, openTaskSession ignores the bound session id and returns a
+    /// fresh native session id each call (cold-start simulation, G-D3 tests).
+    public var reportsFreshSession = false
     /// How scripted tool calls reach the service (set by tests/daemon).
     public var toolRunner: (@Sendable (String, JSONValue, Principal) async throws -> JSONValue)?
     private var scriptedHealth: EngineerHealth
@@ -43,6 +46,7 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
     private struct State {
         var turnCount = 0
         var probeCount = 0
+        var openAttempts = 0
         var contexts: [TurnContext] = []
         var cancelledTurns: [String] = []
     }
@@ -62,6 +66,8 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
 
     public var probeCount: Int { state.with { $0.probeCount } }
 
+    public var openAttempts: Int { state.with { $0.openAttempts } }
+
     public func probe() async -> AdapterProbe {
         state.with { $0.probeCount += 1 }
         return AdapterProbe(
@@ -74,8 +80,12 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
     }
 
     public func openTaskSession(binding: SessionBinding) async throws -> SessionRef {
+        state.with { $0.openAttempts += 1 }
         if let openSessionError { throw openSessionError }
-        return SessionRef(engineer: engineer, nativeSessionID: "fake-session-\(binding.taskID.rawValue)")
+        return SessionRef(engineer: engineer,
+                          nativeSessionID: reportsFreshSession
+                              ? "fake-session-\(UUID().uuidString)"
+                              : "fake-session-\(binding.taskID.rawValue)")
     }
 
     public func sendTurn(ref: SessionRef, turnID: String, context: TurnContext,
