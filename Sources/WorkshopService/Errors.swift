@@ -25,6 +25,8 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
     case blockedByDependency(SubtaskID)
     /// Report revision no longer current (-32008, T08).
     case staleRevision(expected: Int, actual: Int?)
+    /// Review targeted a superseded result message (-32008).
+    case staleResult(latestMessageID: String, latestRevision: Int)
     /// Stale ownership generation fenced at the tool boundary (-32004, T05).
     case staleGeneration(engineer: EngineerID, supplied: Int, current: Int)
     /// Free disk below the storage-guard threshold (-32010, T30).
@@ -57,7 +59,7 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
             return WorkshopProtocol.ErrorCode.approvalRequired
         case .blockedByDependency:
             return WorkshopProtocol.ErrorCode.blockedByDependency
-        case .staleRevision:
+        case .staleRevision, .staleResult:
             return WorkshopProtocol.ErrorCode.staleRevision
         case .illegalTransition, .adapterUnavailable:
             return WorkshopProtocol.ErrorCode.internalError
@@ -94,6 +96,8 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
             return "Subtask \(sub.rawValue) has unfinished dependencies"
         case .staleRevision(let expected, let actual):
             return "Stale report revision \(expected); current is \(actual.map(String.init) ?? "none")"
+        case .staleResult(let latestMessageID, let latestRevision):
+            return "result superseded; review the latest result \(latestMessageID) (revision \(latestRevision))"
         case .staleGeneration(let engineer, let supplied, let current):
             return "Stale ownership generation \(supplied) from \(engineer.rawValue); current is \(current)"
         case .storageLow(let freeBytes):

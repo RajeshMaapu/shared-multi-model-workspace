@@ -332,4 +332,40 @@ final class WriterGenerationTests: XCTestCase {
             XCTAssertThrowsError(try store.seal(lease))
         }
     }
+
+    /// The Workshop-written MCP config carries a bearer token: excluded from
+    /// copies and digests at top level only; nested .devin content survives.
+    func testSafeTreeExcludesTopLevelMCPConfig() throws {
+        let root = "/private/tmp/safetree-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let src = root + "/src"
+        try FileManager.default.createDirectory(
+            atPath: src + "/.devin", withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            atPath: src + "/sub/.devin", withIntermediateDirectories: true)
+        try "a".write(toFile: src + "/a.txt", atomically: true, encoding: .utf8)
+        try "cfg".write(toFile: src + "/.devin/config.json", atomically: true,
+                        encoding: .utf8)
+        try "token-one".write(toFile: src + "/.devin/mcp_config.local.json",
+                              atomically: true, encoding: .utf8)
+        try "nested".write(toFile: src + "/sub/.devin/mcp_config.local.json",
+                           atomically: true, encoding: .utf8)
+
+        let dst = root + "/dst"
+        _ = try SafeTree.copy(from: src, to: dst)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dst + "/.devin/mcp_config.local.json"))
+        XCTAssertEqual(try String(contentsOfFile: dst + "/.devin/config.json"),
+                       "cfg")
+        XCTAssertEqual(
+            try String(contentsOfFile: dst + "/sub/.devin/mcp_config.local.json"),
+            "nested")
+
+        let d1 = try SafeTree.digest(src)
+        try "token-two".write(toFile: src + "/.devin/mcp_config.local.json",
+                              atomically: true, encoding: .utf8)
+        XCTAssertEqual(try SafeTree.digest(src), d1)
+        try "b".write(toFile: src + "/a.txt", atomically: true, encoding: .utf8)
+        XCTAssertNotEqual(try SafeTree.digest(src), d1)
+    }
 }

@@ -45,6 +45,21 @@ public struct SessionBinding: Codable, Equatable, Sendable {
     }
 }
 
+/// What this turn's harness may do without asking. The sandbox is the hard
+/// boundary; this only shapes the residual ACP permission decisions.
+public struct TurnCapabilityManifest: Sendable, Codable, Equatable {
+    public var edit: Bool      // file edit/delete/move kinds
+    public var execute: Bool   // shell
+    public var fetch: Bool     // network fetch kinds
+    public static let writer = TurnCapabilityManifest(edit: true, execute: true, fetch: true)
+    public static let discussion = TurnCapabilityManifest(edit: true, execute: true, fetch: true) // fenced scratch copy: edits are harmless and never promoted
+    public init(edit: Bool, execute: Bool, fetch: Bool) {
+        self.edit = edit
+        self.execute = execute
+        self.fetch = fetch
+    }
+}
+
 /// Context handed to an adapter for one turn.
 public struct TurnContext: Sendable {
     public var task: WorkshopTask
@@ -62,11 +77,14 @@ public struct TurnContext: Sendable {
     public var checkpointRequest: Bool
     public var ingress: TaskIngress?
     public var workspace: TaskWorkspace?
+    /// Residual permission policy for this turn (see TurnCapabilityManifest).
+    public var capabilities: TurnCapabilityManifest
 
     public init(task: WorkshopTask, subtask: Subtask?, recentMessages: [Message],
                 wakeReason: String? = nil, wakeDetail: String? = nil,
                 truncatedNote: String? = nil, checkpointRequest: Bool = false,
-                ingress: TaskIngress? = nil, workspace: TaskWorkspace? = nil) {
+                ingress: TaskIngress? = nil, workspace: TaskWorkspace? = nil,
+                capabilities: TurnCapabilityManifest = .writer) {
         self.task = task
         self.subtask = subtask
         self.recentMessages = recentMessages
@@ -76,6 +94,7 @@ public struct TurnContext: Sendable {
         self.checkpointRequest = checkpointRequest
         self.ingress = ingress
         self.workspace = workspace
+        self.capabilities = capabilities
     }
 
     /// Render the turn context packet (spec §G): stable header, task brief,
@@ -112,6 +131,7 @@ public struct TurnContext: Sendable {
         if let workspace {
             lines.append("Shared task workspace: " + workspace.path)
             lines.append("Workspace identity is shared by task participants. A shared path is not proof of an active writer lease; do not assume permission to mutate from this path alone.")
+            lines.append("Tool permissions: shell commands, file edits and Workshop MCP tools run without prompts inside this workspace; the sandbox denies writes anywhere else.")
             if workspace.state == "discussion" {
                 lines.append("Read-only discussion turn: this is a fenced scratch copy. "
                     + "Changes here are sealed for review only and are never promoted "
@@ -165,7 +185,9 @@ public struct TurnContext: Sendable {
             case "assigned":
                 lines.append("You own this subtask now. Implement it, publish artifacts "
                     + "via workshop_publish_artifact, then call workshop_report_result "
-                    + "{task_id, subtask_id, summary, artifact_ids, validation}.")
+                    + "{task_id, subtask_id, summary, artifact_ids, validation}."
+                    + " Reviews bind to the latest result revision; re-report to "
+                    + "create the next revision.")
             case "dispute":
                 lines.append("An engineer disputed an assignment; see the decision log "
                     + "and conversation. Reassign via workshop_assign_subtask or explain "
@@ -183,9 +205,19 @@ public struct TurnContext: Sendable {
                 lines.append("The task was resumed by the user.")
             case "collaboration_requested":
                 lines.append("The user explicitly requested your collaboration on this execution task. Inspect the brief and shared conversation, post a concise contribution or question with workshop_post_message, and preserve disagreements. Do not assume writing ownership or create another task. Report unavailable tools honestly.")
+            case "user_mention":
+                lines.append("The user mentioned you directly; respond in this task.")
             case "changes_requested":
                 lines.append("Verification requested changes on your subtask; "
-                    + "address them and report again via workshop_report_result.")
+                    + "address them and report again via workshop_report_result."
+                    + " Reviews bind to the latest result revision; re-report to "
+                    + "create the next revision.")
+            case "report_requested":
+                lines.append("Your previous turn ended without a structured result. "
+                    + "Call workshop_report_result {task_id, subtask_id, summary, "
+                    + "generation, artifact_ids, validation} now — this creates the "
+                    + "next result revision and reviews bind to the latest revision — "
+                    + "or post a message stating exactly what blocks you.")
             case "resume_from_checkpoint":
                 lines.append("Your previous turn was interrupted. The wake detail "
                     + "carries your last valid checkpoint JSON — re-read the task's "

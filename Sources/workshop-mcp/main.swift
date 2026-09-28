@@ -20,6 +20,13 @@ struct ServiceUnavailable: WorkshopRPCError {
     }
 }
 
+struct TokenUnavailable: WorkshopRPCError {
+    var rpcCode: Int { -32000 }
+    var message: String {
+        "Workshop token unavailable; nothing was submitted."
+    }
+}
+
 var principalName = ""
 var tokenFile = ""
 var runtimeDir: String?
@@ -47,8 +54,8 @@ guard principalName == "codex" || EngineerID(rawValue: principalName) != nil,
     exit(2)
 }
 
-guard let token = try? String(contentsOfFile: tokenFile, encoding: .utf8)
-    .trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
+guard let startupToken = try? String(contentsOfFile: tokenFile, encoding: .utf8)
+    .trimmingCharacters(in: .whitespacesAndNewlines), !startupToken.isEmpty else {
     FileHandle.standardError.write(
         Data("workshop-mcp: cannot read token file\n".utf8))
     exit(2)
@@ -70,9 +77,15 @@ func makeOutput() -> (String) -> Void {
 // thread, which is blocked in runStdio.
 // Connect for each call so startup-before-daemon and daemon restarts recover.
 // Never replay a request after dispatch: a dropped response can be ambiguous.
-func makeToolCaller(socketPath: String, token: String)
+// The token file is re-read on every call so a rotated generation token takes
+// effect without restarting the shim.
+func makeToolCaller(socketPath: String, tokenFile: String)
     -> (String, JSONValue) async throws -> JSONValue {
     { method, args in
+        guard let token = try? String(contentsOfFile: tokenFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
+            throw TokenUnavailable()
+        }
         let client = WorkshopClient(socketPath: socketPath)
         do { try await client.connect() }
         catch { throw ServiceUnavailable() }
@@ -90,6 +103,6 @@ func makeToolCaller(socketPath: String, token: String)
 }
 
 let bridge = MCPBridge(engineer: .devin,
-    toolCaller: makeToolCaller(socketPath: socketPath, token: token),
+    toolCaller: makeToolCaller(socketPath: socketPath, tokenFile: tokenFile),
     output: makeOutput())
 bridge.runStdio()

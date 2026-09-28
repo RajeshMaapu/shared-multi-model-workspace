@@ -35,7 +35,7 @@ final class StoreTests: XCTestCase {
             try Migrations.all.migrate(db)
             let count = try db.query("SELECT COUNT(*) AS c FROM schema_migrations")
                 .first?["c"]?.int
-            XCTAssertEqual(count, 8)
+            XCTAssertEqual(count, Int64(Migrations.all.migrations.count))
         }
     }
 
@@ -178,6 +178,51 @@ final class MigrationV2Tests: XCTestCase {
             }
             // artifacts.generation added.
             _ = try db.query("SELECT generation FROM artifacts")
+        }
+    }
+
+    /// A v8 database gains wakeup retry columns at v9; deferred rows are
+    /// hidden from pendingWakeups until their backoff expires.
+    func testV8ToV9AddsWakeupRetryColumns() throws {
+        let path = dir + "/mig89.sqlite"
+        do {
+            let db = try Database(path: path)
+            try Migrator(migrations: [Migrations.v1, Migrations.v2,
+                                      Migrations.v3, Migrations.v4,
+                                      Migrations.v5, Migrations.v6,
+                                      Migrations.v7, Migrations.v8]).migrate(db)
+            try db.execute("""
+                INSERT INTO tasks(id, channel, title, brief, phase, state,
+                                  created_at, updated_at)
+                VALUES('task_v8', 'main', 'old task', 'brief', 'execution',
+                       'queued', 't0', 't0')
+                """)
+            try db.execute("""
+                INSERT INTO wakeups(task_id, engineer_id, reason, state,
+                                    created_at, updated_at)
+                VALUES('task_v8', 'kimi', 'mention', 'pending', 't0', 't0')
+                """)
+        }
+        do {
+            let db = try Database(path: path)
+            try Migrations.all.migrate(db)
+            let row = try db.query(
+                "SELECT attempt, not_before FROM wakeups").first
+            XCTAssertEqual(row?["attempt"]?.int, 0)
+            XCTAssertEqual(row?["not_before"], .null)
+
+            let repo = WorkshopRepository(db: db)
+            // The migrated row is immediately due.
+            let due = try repo.pendingWakeups()
+            XCTAssertEqual(due.count, 1)
+            // A deferred row is hidden until not_before passes.
+            try repo.insertWakeup(taskID: TaskID("task_v8"), engineerID: .kimi,
+                                  reason: "mention", triggerSeq: nil,
+                                  notBefore: Date().addingTimeInterval(3600),
+                                  attempt: 1, at: Date())
+            XCTAssertEqual(try repo.pendingWakeups().count, 1)
+            let next = try repo.earliestDeferredWakeup(at: Date())
+            XCTAssertNotNil(next)
         }
     }
 }

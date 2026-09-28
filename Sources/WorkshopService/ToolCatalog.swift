@@ -4,6 +4,9 @@ import WorkshopCore
 /// Schema catalog for the Workshop collaboration tools (§8.3). Shared by the
 /// MCP bridge (tools/list) and the DeepSeek adapter (tools param).
 public enum WorkshopToolCatalog {
+    /// Increment when any tool schema changes; additive/optional changes only.
+    public static let catalogVersion = 1
+
     public struct Tool: Sendable {
         public let name: String
         public let description: String
@@ -81,7 +84,7 @@ public enum WorkshopToolCatalog {
              inputSchema: obj(["task_id": s, "path": s, "description": s, "generation": i],
                               required: ["task_id", "path", "description"])),
         Tool(name: "workshop_report_result",
-             description: "Owner only: report a subtask result with artifacts and validation. generation (ownership_generation from the packet) is required; stale generations are fenced.",
+             description: "Owner only: report a subtask result with artifacts and validation. generation (ownership_generation from the packet) is required; stale generations are fenced. Re-reporting after changes creates the next result revision; an identical retry returns the existing revision.",
              inputSchema: obj(["task_id": s, "subtask_id": s, "summary": s,
                                "generation": i,
                                "artifact_ids": .object(["type": .string("array"),
@@ -112,7 +115,7 @@ public enum WorkshopToolCatalog {
              description: "Read published proposals (and your own draft) for a research task.",
              inputSchema: obj(["task_id": s], required: ["task_id"])),
         Tool(name: "workshop_submit_review",
-             description: "Submit a review of a published proposal or a result message.",
+             description: "Submit a review of a published proposal or a result message. For results, proposal_id must be the latest result message id (see workshop_get_task).",
              inputSchema: obj(["task_id": s, "proposal_id": s, "severity": s,
                                "disposition": s, "body": s, "evidence": s],
                               required: ["task_id", "proposal_id", "severity",

@@ -293,5 +293,11 @@ public enum Migrations {
             created_at TEXT NOT NULL
         );
         """)
-    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7, v8])
+    /// Schema v9: wakeup retry metadata — deferred re-queue (`not_before`)
+    /// and launch attempt counting (`attempt`) for bounded backoff retries.
+    public static let v9 = Migrator.Migration(version: 9, sql: """
+        ALTER TABLE wakeups ADD COLUMN not_before TEXT;
+        ALTER TABLE wakeups ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
+        """)
+    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7, v8, v9])
 }

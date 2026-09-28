@@ -211,6 +211,22 @@ public struct WakeupInfo: Codable, Equatable, Sendable {
     }
 }
 
+/// Latest structured result binding for a subtask (additive detail field).
+public struct SubtaskResultStatus: Codable, Equatable, Sendable {
+    public var latestResultMessageID: String?
+    public var resultRevision: Int
+
+    public init(latestResultMessageID: String? = nil, resultRevision: Int = 0) {
+        self.latestResultMessageID = latestResultMessageID
+        self.resultRevision = resultRevision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case latestResultMessageID = "latest_result_message_id"
+        case resultRevision = "result_revision"
+    }
+}
+
 /// Task detail returned by getTask.
 public struct TaskDetail: Codable, Equatable, Sendable {
     public var task: WorkshopTask
@@ -227,12 +243,15 @@ public struct TaskDetail: Codable, Equatable, Sendable {
     public var publishedProposalCount: Int
     public var ingress: TaskIngress?
     public var workspace: TaskWorkspace?
+    /// Per-subtask result binding, keyed by subtask id.
+    public var subtaskResults: [String: SubtaskResultStatus]?
 
     public init(task: WorkshopTask, participants: [Participant], subtasks: [Subtask],
                 usage: UsageSample? = nil, runningEngineers: [EngineerID] = [],
                 pendingWakeups: [WakeupInfo] = [], draftProposalCount: Int = 0,
                 publishedProposalCount: Int = 0, ingress: TaskIngress? = nil,
-                workspace: TaskWorkspace? = nil) {
+                workspace: TaskWorkspace? = nil,
+                subtaskResults: [String: SubtaskResultStatus]? = nil) {
         self.task = task
         self.participants = participants
         self.subtasks = subtasks
@@ -243,6 +262,7 @@ public struct TaskDetail: Codable, Equatable, Sendable {
         self.publishedProposalCount = publishedProposalCount
         self.ingress = ingress
         self.workspace = workspace
+        self.subtaskResults = subtaskResults
     }
 }
 

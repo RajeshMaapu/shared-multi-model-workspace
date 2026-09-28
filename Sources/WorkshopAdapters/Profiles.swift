@@ -39,11 +39,15 @@ public enum ProfileBuilder {
         public var mcpBridge: String     // workshop-mcp executable path
         /// Runtime dir holding service.sock; forwarded to the bridge env.
         public var runtimeDir: String?
+        /// Daemon Streamable HTTP MCP endpoint; forwarded to launch specs.
+        public var mcpURL: String?
         public init(home: String, devinBinary: String, kimiBinary: String,
-                    mcpBridge: String, runtimeDir: String? = nil) {
+                    mcpBridge: String, runtimeDir: String? = nil,
+                    mcpURL: String? = nil) {
             self.home = home; self.devinBinary = devinBinary
             self.kimiBinary = kimiBinary; self.mcpBridge = mcpBridge
             self.runtimeDir = runtimeDir
+            self.mcpURL = mcpURL
         }
     }
 
@@ -102,6 +106,10 @@ public enum ProfileBuilder {
                 "windsurf": .bool(false), "claude": .bool(false),
                 "copilot": .bool(false), "opencode": .bool(false),
                 "zed": .bool(false)]),
+            "permissions": .object(["allow": .array([
+                .string("read"), .string("grep"), .string("glob"),
+                .string("exec"), .string("edit"),
+                .string("mcp__workshop__*")])]),
         ]
         let data = try JSONEncoder().encode(JSONValue.object(config))
         try data.write(to: URL(fileURLWithPath: profile + "/config/devin/config.json"))
@@ -380,6 +388,7 @@ public enum ProfileBuilder {
         // underlying CLI so relay state cannot mask a healthy writer.
         spec.versionProbePath = NSHomeDirectory() + "/.local/bin/devin"
         spec.worktreeRoot = paths.home + "/worktrees"
+        spec.mcpURL = paths.mcpURL
         return (spec, sb)
     }
 
@@ -395,13 +404,14 @@ public enum ProfileBuilder {
         let sb = profile + "/isolation.sb"
         try devinSandboxProfile(workshopHome: paths.home, worktree: worktree, destination: sb)
         var spec = HarnessLaunchSpec(
-            engineer: .kimi, executable: "/usr/bin/sandbox-exec", args: ["-f", sb, paths.kimiBinary, "acp"],
+            engineer: .kimi, executable: "/usr/bin/sandbox-exec", args: ["-f", sb, paths.kimiBinary, "--auto", "acp"],
             env: env, cwd: worktree,
             mcpInjection: .acpSessionParam,
             qualifiedVersion: "0.42.0", modelSelection: "kimi-code/k3")
         spec.worktreeRoot = paths.home + "/worktrees"
         spec.versionProbePath = paths.kimiBinary
         spec.sandboxProfilePath = sb
+        spec.mcpURL = paths.mcpURL
         return spec
     }
 }

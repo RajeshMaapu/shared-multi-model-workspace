@@ -4,43 +4,60 @@ import XCTest
 @testable import WorkshopStore
 
 final class RevisionRecoveryTests: XCTestCase {
-    private struct StartupFailureAdapter: EngineerAdapter {
-        let engineer: EngineerID = .devin
-        let supportsIsolatedWorkspaceTurns = true
-        func probe() async -> AdapterProbe { await FakeAdapter(engineer: .devin).probe() }
-        func openTaskSession(binding: SessionBinding) async throws -> SessionRef {
-            throw WorkshopError.invalidRequest("startup unavailable")
+    private func waitFor(_ timeout: TimeInterval = 10,
+                         _ cond: @escaping () async throws -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if (try? await cond()) == true { return true }
+            try? await Task.sleep(for: .milliseconds(20))
         }
-        func sendTurn(ref: SessionRef, turnID: String, context: TurnContext,
-                      deadline: Date) -> AsyncThrowingStream<AdapterEvent, Error> {
-            AsyncThrowingStream { $0.finish() }
-        }
-        func cancelTurn(ref: SessionRef, turnID: String) async -> Bool { true }
+        return false
     }
 
-    func testFailedStartupBlocksImmediatelyWithoutLeaseExpiryOrReassignment() async throws {
+    /// A failed owner launch is retried with bounded backoff; at exhaustion
+    /// the owned subtask and the task block with the generation preserved,
+    /// and resumeTask re-dispatches once the adapter is healthy again.
+    func testExhaustedOwnerStartupBlocksAndResumeRedispatches() async throws {
         let root = "/private/tmp/startup-recovery-" + UUID().uuidString
         try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
-        let db = try Database(path: root + "/test.sqlite")
-        let service = try CollaborationService(database: db,
-            adapters: [StartupFailureAdapter()], dispatcherEnabled: false)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let devin = FakeAdapter(engineer: .devin, delayPerDelta: .zero)
+        devin.openSessionError = WorkshopError.invalidRequest("startup unavailable")
+        let service = try CollaborationService(databasePath: root + "/test.sqlite",
+            adapters: [devin], dispatcherEnabled: true, homeDir: root,
+            wakeupCoalescence: .zero,
+            wakeupRetryBackoff: [.milliseconds(20), .milliseconds(20),
+                                 .milliseconds(20)])
         let receipt = try await service.createTask(CreateTaskRequest(
             idempotencyKey: UUID().uuidString, title: "Startup", objective: "Test",
             phase: .execution, participants: [.devin]))
+        await service.start()
+        // Wait for the dispatch claim before capturing the generation.
+        _ = await waitFor {
+            try await service.getTask(receipt.taskID).subtasks[0].ownerID != nil }
         let before = try await service.getTask(receipt.taskID)
-        _ = try await service.claimForTest(subtaskID: before.subtasks[0].id,
-            owner: .devin, expectedGeneration: before.subtasks[0].generation)
-        await service.runTurnForTest(engineer: .devin, taskID: receipt.taskID)
+        let blocked = await waitFor {
+            try await service.getTask(receipt.taskID).task.state == .blocked }
+        XCTAssertTrue(blocked)
         let after = try await service.getTask(receipt.taskID)
         XCTAssertEqual(after.subtasks[0].state, .blocked)
         XCTAssertEqual(after.subtasks[0].ownerID, .devin)
-        XCTAssertEqual(after.subtasks[0].generation, before.subtasks[0].generation + 1)
-        await service.sweepExpiredLeases()
-        let messages = try await service.readMessages(receipt.taskID)
-        XCTAssertTrue(messages.contains { $0.body.contains("startup failed before execution") })
+        XCTAssertEqual(after.subtasks[0].generation, before.subtasks[0].generation)
+        var messages = try await service.readMessages(receipt.taskID)
+        XCTAssertTrue(messages.contains {
+            $0.body.contains("Owner startup failed before execution") })
         XCTAssertFalse(messages.contains { $0.body.contains("Lease for") })
         let wakeups = try await service.wakeupsForTest(receipt.taskID)
-        XCTAssertTrue(wakeups.isEmpty)
+        XCTAssertTrue(wakeups.contains { $0.state == "launch_failed" })
+
+        // A healthy adapter plus a resume re-dispatches the owner.
+        devin.openSessionError = nil
+        try await service.resumeTask(taskID: receipt.taskID, principal: .user)
+        let ran = await waitFor { devin.turnCount >= 1 }
+        XCTAssertTrue(ran)
+        messages = try await service.readMessages(receipt.taskID)
+        XCTAssertFalse(messages.contains {
+            $0.body.contains("Lease for") && $0.seq > 0 })
         await service.shutdown()
     }
 

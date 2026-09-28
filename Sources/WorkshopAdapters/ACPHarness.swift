@@ -30,6 +30,9 @@ public struct HarnessLaunchSpec: Sendable {
     /// Per-task worktree root (<home>/worktrees); when set the session cwd is
     /// <worktreeRoot>/<task_id>, created on demand.
     public var worktreeRoot: String?
+    /// Daemon-hosted Streamable HTTP MCP endpoint; when set (and a token is
+    /// readable) the harness connects over HTTP instead of the stdio shim.
+    public var mcpURL: String?
 
     /// argv for spawning: [executable] + args.
     public var argv: [String] { [executable] + args }
@@ -49,6 +52,7 @@ public struct HarnessLaunchSpec: Sendable {
         self.modelSelection = modelSelection
         self.versionProbePath = nil
         self.worktreeRoot = nil
+        self.mcpURL = nil
     }
 }
 
@@ -134,9 +138,15 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                                 health: .unavailable("binary not found: \(probePath)"),
                                 tested: false)
         }
+        // The version probe is advisory: a timeout or empty reply means the
+        // binary may still work, so the adapter stays available and the wakeup
+        // path retries launches instead of dropping work (G-D5).
         guard let version = versionProbe(probePath) else {
             return AdapterProbe(engineer: engineer,
-                                health: .unavailable("version probe failed"),
+                                health: .available("version unknown (probe failed); auth unverified until first turn"),
+                                versions: [:],
+                                effectiveModel: spec.modelSelection,
+                                capabilities: ["acp", "session_load"],
                                 tested: false)
         }
         let qualified = version == spec.qualifiedVersion
@@ -280,23 +290,38 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
             homeDir: home, taskID: binding.taskID, workspaceRef: nil).path
     }
 
+    /// Token file for this engineer: the generation-scoped token
+    /// `<cwd>/../token` when the session runs under writer-runs, else
+    /// `WORKSHOP_TOKEN_<ENGINEER>` from the spec env or the process env.
+    private func effectiveTokenPath() -> String? {
+        if let cwd = activeWorkspacePath, cwd.contains("/writer-runs/") {
+            return (cwd as NSString).deletingLastPathComponent + "/token"
+        }
+        let tokenKey = "WORKSHOP_TOKEN_\(engineer.rawValue.uppercased())"
+        return spec.env[tokenKey]
+            ?? ProcessInfo.processInfo.environment[tokenKey]
+    }
+
+    /// Trimmed token file contents, or nil when unreadable/empty.
+    private func readToken() -> String? {
+        guard let path = effectiveTokenPath(),
+              let token = try? String(contentsOfFile: path, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty else { return nil }
+        return token
+    }
+
     /// Bridge path + token file: the launch spec's env first (set by
     /// ProfileBuilder), then the process env (tests / manual runs).
     private func bridgeArgs() -> [JSONValue] {
         let env = spec.env
-        let tokenKey = "WORKSHOP_TOKEN_\(engineer.rawValue.uppercased())"
         guard let bridge = env["WORKSHOP_MCP_PATH"]
                 ?? ProcessInfo.processInfo.environment["WORKSHOP_MCP_PATH"],
-              let tokenFile = env[tokenKey]
-                ?? ProcessInfo.processInfo.environment[tokenKey] else {
+              let tokenFile = effectiveTokenPath() else {
             return []
         }
-        let effectiveToken: String
-        if let cwd = activeWorkspacePath, cwd.contains("/writer-runs/") {
-            effectiveToken = (cwd as NSString).deletingLastPathComponent + "/token"
-        } else { effectiveToken = tokenFile }
         return [.string("--engineer"), .string(engineer.rawValue),
-                .string("--token-file"), .string(effectiveToken)]
+                .string("--token-file"), .string(tokenFile)]
     }
 
     private func bridgeCommand() -> String? {
@@ -305,10 +330,21 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
     }
 
     /// mcpServers param for session/new (empty for Devin; populated for Kimi).
+    /// With a daemon HTTP endpoint and a readable token, send the Streamable
+    /// HTTP variant probed against kimi 2.1.1; otherwise the stdio shim.
     private func mcpServersParam() -> [JSONValue] {
-        guard spec.mcpInjection == .acpSessionParam,
-              let bridge = bridgeCommand(),
-              !bridgeArgs().isEmpty else {
+        guard spec.mcpInjection == .acpSessionParam else { return [] }
+        if let url = spec.mcpURL, let token = readToken() {
+            return [.object([
+                "type": .string("http"),
+                "name": .string("workshop"),
+                "url": .string(url),
+                "headers": .array([.object([
+                    "name": .string("Authorization"),
+                    "value": .string("Bearer \(token)")])]),
+            ])]
+        }
+        guard let bridge = bridgeCommand(), !bridgeArgs().isEmpty else {
             return []
         }
         return [.object([
@@ -321,20 +357,31 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
 
     /// Devin resolves MCP tools only from `<cwd>/.devin/mcp_config.local.json`.
     private func writeDevinMCPConfig(cwd: String) throws {
-        guard let bridge = bridgeCommand(), !bridgeArgs().isEmpty else {
+        var server: JSONValue?
+        if let url = spec.mcpURL, let token = readToken() {
+            server = .object([
+                "url": .string(url),
+                "transport": .string("http"),
+                "headers": .object([
+                    "Authorization": .string("Bearer \(token)")]),
+            ])
+        } else if let bridge = bridgeCommand(), !bridgeArgs().isEmpty {
+            server = .object([
+                "command": .string(bridge),
+                "args": .array(bridgeArgs()),
+                "transport": .string("stdio"),
+            ])
+        }
+        guard let server else {
             throw WorkshopError.invalidRequest("Devin MCP bridge or token unavailable")
         }
         let dir = cwd + "/.devin"
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let config: [String: JSONValue] = ["mcpServers": .object([
-            "workshop": .object([
-                "command": .string(bridge),
-                "args": .array(bridgeArgs()),
-                "transport": .string("stdio"),
-            ]),
-        ])]
+        let config: [String: JSONValue] = ["mcpServers": .object(["workshop": server])]
         let data = try JSONEncoder().encode(JSONValue.object(config))
-        try data.write(to: URL(fileURLWithPath: dir + "/mcp_config.local.json"))
+        let configPath = dir + "/mcp_config.local.json"
+        try data.write(to: URL(fileURLWithPath: configPath))
+        chmod(configPath, 0o600)
         // Keep the file out of git status when the worktree is a repo.
         let exclude = cwd + "/.git/info/exclude"
         if FileManager.default.fileExists(atPath: exclude),
@@ -395,9 +442,7 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
             }
         }
         let transport = try transportFactory(launch, cwd)
-        let c = ACPClient(transport: transport,
-            approvedValidationWorkspace: taskID == "task_f8b61a4f-6a95-41af-aaee-fae1a34803c2"
-                ? cwd : nil)
+        let c = ACPClient(transport: transport)
         do {
             _ = try await c.call("initialize", params: .object([
                 "protocolVersion": .number(1),
@@ -488,6 +533,7 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
                     Task { await client.setEventSink(nil) }
                 }
                 do {
+                    await client.setCapabilities(context.capabilities)
                     let result = try await client.call("session/prompt", params: .object([
                         "sessionId": .string(sid),
                         "prompt": .array([.object([
@@ -553,6 +599,12 @@ public final class ACPHarnessAdapter: EngineerAdapter, @unchecked Sendable {
 
     private func touchActivity() {
         lock.lock(); lastActivity = Date(); lock.unlock()
+    }
+
+    /// The live client's capability manifest — exposed for adapter tests.
+    public func currentCapabilities() async -> TurnCapabilityManifest? {
+        lock.lock(); let c = client; lock.unlock()
+        return await c?.currentCapabilities
     }
 
     /// ACP v1 cancellation is a notification. Bound the wait for the original

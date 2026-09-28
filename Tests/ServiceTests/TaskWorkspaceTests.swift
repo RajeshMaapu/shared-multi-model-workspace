@@ -173,6 +173,18 @@ final class TaskWorkspaceTests: XCTestCase {
         let adapter = FakeAdapter(engineer: .devin, delayPerDelta: .zero)
         let service = try CollaborationService(databasePath: home + "/retry.sqlite",
             adapters: [adapter], homeDir: home, wakeupCoalescence: .zero)
+        adapter.toolRunner = { [weak service] name, args, principal in
+            guard let service else { return .null }
+            return try await service.callTool(name, args: args, principal: principal)
+        }
+        adapter.script = { context in
+            guard let sub = context.subtask else { return [.text("ok")] }
+            return [.toolCall("workshop_report_result", .object([
+                "task_id": .string(context.task.id.rawValue),
+                "subtask_id": .string(sub.id.rawValue),
+                "summary": .string("done"),
+                "generation": .number(Double(sub.generation))]))]
+        }
         let receipt = try await service.createTask(CreateTaskRequest(
             schemaVersion: 2, idempotencyKey: "retry-workspace", title: "Workspace",
             objective: "Test workspace", phase: .execution, participants: [],

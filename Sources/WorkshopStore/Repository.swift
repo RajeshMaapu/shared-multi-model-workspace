@@ -370,25 +370,38 @@ public final class WorkshopRepository {
             """, [.text(WorkshopTime.string(now))]).map(subtaskFrom)
     }
 
-    /// The original result message for (subtask, generation) — T06 idempotency.
-    public func resultMessage(taskID: TaskID, subtaskID: SubtaskID,
-                              generation: Int) throws -> Message? {
+    /// Every structured result message for a subtask, all generations,
+    /// seq ascending. Revision i+1 is results[i].
+    public func resultMessages(taskID: TaskID, subtaskID: SubtaskID) throws -> [Message] {
         let rows = try db.query("""
             SELECT * FROM messages
             WHERE task_id=? AND structured IS NOT NULL
-            ORDER BY seq DESC
+            ORDER BY seq ASC
             """, [.text(taskID.rawValue)])
+        var out: [Message] = []
         for r in rows {
             let m = messageFrom(r)
             guard let text = m.structured,
                   let s = try? JSONDecoder().decode(JSONValue.self,
                                                     from: Data(text.utf8)),
                   s["type"]?.stringValue == "result",
-                  s["subtask_id"]?.stringValue == subtaskID.rawValue,
-                  s["generation"]?.intValue == Int64(generation) else { continue }
-            return m
+                  s["subtask_id"]?.stringValue == subtaskID.rawValue else { continue }
+            out.append(m)
         }
-        return nil
+        return out
+    }
+
+    /// The latest result message for (subtask, generation) — T06 idempotency.
+    public func resultMessage(taskID: TaskID, subtaskID: SubtaskID,
+                              generation: Int) throws -> Message? {
+        try resultMessages(taskID: taskID, subtaskID: subtaskID)
+            .last {
+                guard let text = $0.structured,
+                      let s = try? JSONDecoder().decode(JSONValue.self,
+                                                        from: Data(text.utf8))
+                else { return false }
+                return s["generation"]?.intValue == Int64(generation)
+            }
     }
 
     /// Wakeup rows currently marked running (wake/restart reconcile, T29).
@@ -682,27 +695,80 @@ public final class WorkshopRepository {
         public let reason: String
         public let triggerSeq: Int64?
         public let state: String
+        public let createdAt: Date
+        public let notBefore: Date?
+        public let attempt: Int
+
+        public init(id: Int64, taskID: TaskID, engineerID: EngineerID,
+                    reason: String, triggerSeq: Int64?, state: String,
+                    createdAt: Date, notBefore: Date?, attempt: Int) {
+            self.id = id
+            self.taskID = taskID
+            self.engineerID = engineerID
+            self.reason = reason
+            self.triggerSeq = triggerSeq
+            self.state = state
+            self.createdAt = createdAt
+            self.notBefore = notBefore
+            self.attempt = attempt
+        }
     }
 
     @discardableResult
     public func insertWakeup(taskID: TaskID, engineerID: EngineerID, reason: String,
-                             triggerSeq: Int64?, state: String = "pending", at now: Date) throws -> Int64 {
+                             triggerSeq: Int64?, state: String = "pending",
+                             notBefore: Date? = nil, attempt: Int = 0,
+                             at now: Date) throws -> Int64 {
         try db.execute("""
             INSERT INTO wakeups(task_id, engineer_id, reason, trigger_seq, state,
-                                created_at, updated_at)
-            VALUES(?,?,?,?,?,?,?)
+                                not_before, attempt, created_at, updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
             """, [.text(taskID.rawValue), .text(engineerID.rawValue), .text(reason),
                   triggerSeq.map(SQLiteValue.integer) ?? nil, .text(state),
+                  notBefore.map { .text(WorkshopTime.string($0)) } ?? nil,
+                  .integer(Int64(attempt)),
                   .text(WorkshopTime.string(now)), .text(WorkshopTime.string(now))])
         return db.lastInsertRowID()
     }
 
-    public func pendingWakeups(taskID: TaskID? = nil) throws -> [Wakeup] {
+    /// Pending rows that are due now (deferred retries stay hidden until
+    /// `not_before` passes).
+    public func pendingWakeups(taskID: TaskID? = nil, at now: Date = Date()) throws -> [Wakeup] {
         let sql = taskID == nil
-            ? "SELECT * FROM wakeups WHERE state='pending' ORDER BY id"
-            : "SELECT * FROM wakeups WHERE state='pending' AND task_id=? ORDER BY id"
-        let args: [SQLiteValue?] = taskID.map { [.text($0.rawValue)] } ?? []
+            ? """
+            SELECT * FROM wakeups
+            WHERE state='pending' AND (not_before IS NULL OR not_before <= ?)
+            ORDER BY id
+            """
+            : """
+            SELECT * FROM wakeups
+            WHERE state='pending' AND task_id=?
+              AND (not_before IS NULL OR not_before <= ?)
+            ORDER BY id
+            """
+        var args: [SQLiteValue?] = [.text(WorkshopTime.string(now))]
+        if let taskID { args.insert(.text(taskID.rawValue), at: 0) }
         return try db.query(sql, args).map(wakeupFrom)
+    }
+
+    /// Earliest `not_before` among pending deferred rows — the next instant
+    /// the coalescer must wake up for.
+    public func earliestDeferredWakeup(at now: Date) throws -> Date? {
+        let r = try db.query("""
+            SELECT MIN(not_before) AS nb FROM wakeups
+            WHERE state='pending' AND not_before > ?
+            """, [.text(WorkshopTime.string(now))]).first
+        return r?["nb"]?.text.map(WorkshopTime.date)
+    }
+
+    /// Re-queue a wakeup for a later attempt (bounded launch backoff).
+    public func deferWakeup(_ id: Int64, attempt: Int, notBefore: Date,
+                            at now: Date) throws {
+        try db.execute("""
+            UPDATE wakeups SET state='pending', attempt=?, not_before=?,
+                               updated_at=? WHERE id=?
+            """, [.integer(Int64(attempt)), .text(WorkshopTime.string(notBefore)),
+                  .text(WorkshopTime.string(now)), .integer(id)])
     }
 
     /// All wakeup rows for a task, any state, oldest first.
@@ -715,7 +781,10 @@ public final class WorkshopRepository {
         Wakeup(id: r["id"]!.int ?? 0, taskID: TaskID(r["task_id"]!.text!),
                engineerID: EngineerID(rawValue: r["engineer_id"]!.text!) ?? .devin,
                reason: r["reason"]!.text!, triggerSeq: r["trigger_seq"]?.int,
-               state: r["state"]!.text ?? "pending")
+               state: r["state"]!.text ?? "pending",
+               createdAt: WorkshopTime.date(r["created_at"]?.text ?? ""),
+               notBefore: r["not_before"]?.text.map(WorkshopTime.date),
+               attempt: Int(r["attempt"]?.int ?? 0))
     }
 
     public func setWakeupState(_ id: Int64, _ state: String, at now: Date) throws {
@@ -724,14 +793,16 @@ public final class WorkshopRepository {
         ])
     }
 
-    /// Consecutive engineer-triggered wakeups in a task with no intervening user
-    /// message (loop bound, T11).
+    /// Consecutive engineer-triggered wakeups that ran a substantive turn,
+    /// counted since the last user message/mention (loop bound, T11). Silent
+    /// turns, failed launches and suppressed rows do not count.
     public func engineerWakeupsSinceLastUserMessage(_ taskID: TaskID) throws -> Int {
         let r = try db.query("""
             SELECT COUNT(*) AS n FROM wakeups
-            WHERE task_id=? AND state != 'suppressed'
+            WHERE task_id=? AND state = 'done'
               AND id > COALESCE((SELECT MAX(id) FROM wakeups w2
-                                 WHERE w2.task_id=? AND w2.reason='user_message'), 0)
+                                 WHERE w2.task_id=?
+                                   AND w2.reason IN ('user_message','user_mention')), 0)
             """, [.text(taskID.rawValue), .text(taskID.rawValue)]).first
         return Int(r?["n"]?.int ?? 0)
     }

@@ -183,10 +183,12 @@ final class AdapterContractTests: XCTestCase {
         await client.close()
     }
 
-    func testPermissionRejectedForShellTool() async throws {
+    func testPermissionDeniedWhenExecuteCapabilityRemoved() async throws {
         let transport = FakeACPTransport(responder: happyResponder())
         let client = ACPClient(transport: transport)
-        transport.inject(#"{"jsonrpc":"2.0","id":98,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"t2","title":"Bash rm -rf /","rawInput":{},"_meta":{"cognition.ai/toolName":"shell"}},"options":[{"optionId":"a1","name":"Allow","kind":"allow_once"},{"optionId":"r1","name":"Reject","kind":"reject_once"}]}}"#)
+        await client.setCapabilities(TurnCapabilityManifest(
+            edit: true, execute: false, fetch: true))
+        transport.inject(#"{"jsonrpc":"2.0","id":98,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"t2","title":"Bash rm -rf /","kind":"execute","rawInput":{}},"options":[{"optionId":"a1","name":"Allow","kind":"allow_once"},{"optionId":"r1","name":"Reject","kind":"reject_once"}]}}"#)
         try await Task.sleep(for: .milliseconds(100))
         let reply = transport.sentLines.compactMap { l -> JSONValue? in
             let j = self.json(l)
@@ -196,11 +198,10 @@ final class AdapterContractTests: XCTestCase {
         await client.close()
     }
 
-    func testApprovedTaskValidationExecIsExactAndWorkspaceScoped() async throws {
+    func testExecutePermissionAllowedByKindUnderWriterManifest() async throws {
         let transport = FakeACPTransport(responder: happyResponder())
         let workspace = "/private/tmp/workshop/writer-runs/one/workspace"
-        let client = ACPClient(transport: transport,
-                               approvedValidationWorkspace: workspace)
+        let client = ACPClient(transport: transport)
         func request(_ id: Int, command: String, cwd: String) -> String {
             let payload: JSONValue = .object([
                 "jsonrpc": .string("2.0"), "id": .number(Double(id)),
@@ -208,6 +209,7 @@ final class AdapterContractTests: XCTestCase {
                 "params": .object([
                     "toolCall": .object([
                         "title": .string("exec"),
+                        "kind": .string("execute"),
                         "rawInput": .object(["command": .string(command),
                                               "workdir": .string(cwd)]),
                         "_meta": .object(["cognition.ai/toolName": .string("exec")]),
@@ -220,15 +222,12 @@ final class AdapterContractTests: XCTestCase {
             ])
             return String(decoding: try! JSONEncoder().encode(payload), as: UTF8.self)
         }
-        let approved = NSHomeDirectory()
-            + "/thenaliAI/.venv/bin/python -m pytest tests/test_spy_debit_spread_decision.py -q"
-        transport.inject(request(201, command: approved, cwd: workspace))
-        transport.inject(request(202, command: approved + " ; rm -rf .", cwd: workspace))
-        transport.inject(request(203, command: approved,
-                                 cwd: NSHomeDirectory() + "/thenaliAI"))
-        transport.inject(request(205, command: "cd '\(workspace)' && \(approved)"
-            + " && /usr/bin/make ci PYTHON=\(NSHomeDirectory())/thenaliAI/.venv/bin/python",
-            cwd: workspace))
+        // The sandbox, not the prompt, is the boundary: execute tools are
+        // allowed by kind regardless of command text or cwd.
+        transport.inject(request(201, command: "pytest -q", cwd: workspace))
+        transport.inject(request(202, command: "rm -rf .", cwd: workspace))
+        transport.inject(request(203, command: "pytest -q",
+                                 cwd: "/private/tmp/elsewhere"))
         try await Task.sleep(for: .milliseconds(100))
         let replies = Dictionary(uniqueKeysWithValues: transport.sentLines.compactMap { line -> (Int64, String)? in
             let value = self.json(line)
@@ -237,35 +236,108 @@ final class AdapterContractTests: XCTestCase {
             return (id, selected)
         })
         XCTAssertEqual(replies[201], "a")
-        XCTAssertEqual(replies[202], "r")
-        XCTAssertEqual(replies[203], "r")
-        XCTAssertEqual(replies[205], "a")
+        XCTAssertEqual(replies[202], "a")
+        XCTAssertEqual(replies[203], "a")
         await client.close()
     }
 
-    func testValidationPermissionUsesPriorToolCallWhenRequestHasOnlyID() async throws {
+    func testPermissionKindComesFromPriorToolCallWhenRequestHasOnlyID() async throws {
         let transport = FakeACPTransport(responder: happyResponder())
-        let workspace = "/private/tmp/workshop/writer-runs/one/workspace"
-        let client = ACPClient(transport: transport,
-                               approvedValidationWorkspace: workspace)
-        let command = NSHomeDirectory()
-            + "/thenaliAI/.venv/bin/python -m pytest tests/test_spy_debit_spread_decision.py -q"
+        let client = ACPClient(transport: transport)
+        await client.setCapabilities(TurnCapabilityManifest(
+            edit: true, execute: false, fetch: true))
         let update: JSONValue = .object([
             "jsonrpc": .string("2.0"), "method": .string("session/update"),
             "params": .object(["update": .object([
                 "sessionUpdate": .string("tool_call"), "toolCallId": .string("exec-1"),
-                "title": .string("Ran python"),
-                "_meta": .object(["cognition.ai/inferenceToolName": .string("exec")]),
-                "rawInput": .object(["command": .string(command),
-                                      "workdir": .string(workspace)]),
+                "title": .string("exec"), "kind": .string("execute"),
+                "rawInput": .object(["command": .string("pytest -q")]),
             ])]),
         ])
         transport.inject(String(decoding: try JSONEncoder().encode(update), as: UTF8.self))
         transport.inject(#"{"jsonrpc":"2.0","id":204,"method":"session/request_permission","params":{"toolCall":{"toolCallId":"exec-1"},"options":[{"optionId":"a","kind":"allow_once"},{"optionId":"r","kind":"reject_once"}]}}"#)
         try await Task.sleep(for: .milliseconds(100))
         let reply = transport.sentLines.map(json).first { $0["id"]?.intValue == 204 }
-        XCTAssertEqual(reply?["result"]?["outcome"]?["optionId"]?.stringValue, "a")
+        // execute is denied by the manifest → the reject option wins.
+        XCTAssertEqual(reply?["result"]?["outcome"]?["optionId"]?.stringValue, "r")
         await client.close()
+    }
+
+    // MARK: - ACPPermissionPolicy.decide
+
+    private func jreq(_ s: String) -> JSONValue {
+        try! JSONDecoder().decode(JSONValue.self, from: Data(s.utf8))
+    }
+
+    func testDecideDevinStyleExecuteAllowsAllowOnce() {
+        let request = jreq(#"{"toolCall":{"toolCallId":"c1"},"options":[{"optionId":"a","kind":"allow_once","name":"Allow"},{"optionId":"r","kind":"reject_once","name":"Reject"}]}"#)
+        let prior = jreq(#"{"toolCallId":"c1","kind":"execute","title":"pytest -q"}"#)
+        XCTAssertEqual(
+            ACPPermissionPolicy.decide(request: request, priorToolCall: prior,
+                                       capabilities: .writer),
+            .allow(optionID: .string("a")))
+    }
+
+    func testDecideKimiStylePrefersAllowOnceOverAllowAlways() {
+        let request = jreq(#"{"toolCall":{"toolCallId":"c2","title":"Bash"},"options":[{"optionId":"approve_always","kind":"allow_always"},{"optionId":"approve_once","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]}"#)
+        let prior = jreq(#"{"toolCallId":"c2","kind":"execute"}"#)
+        XCTAssertEqual(
+            ACPPermissionPolicy.decide(request: request, priorToolCall: prior,
+                                       capabilities: .writer),
+            .allow(optionID: .string("approve_once")))
+    }
+
+    func testDecideUnknownKindAllows() {
+        let request = jreq(#"{"toolCall":{"toolCallId":"c3","title":"FooBarTool"},"options":[{"optionId":"a","kind":"allow_once"},{"optionId":"r","kind":"reject_once"}]}"#)
+        XCTAssertEqual(
+            ACPPermissionPolicy.decide(request: request, priorToolCall: nil,
+                                       capabilities: .writer),
+            .allow(optionID: .string("a")))
+    }
+
+    func testDecideRejectsScopeExpansion() {
+        let request = jreq(#"{"toolCall":{"toolCallId":"c4","_meta":{"cognition.ai/toolName":"request_scope"}},"options":[{"optionId":"a","kind":"allow_once"},{"optionId":"r","kind":"reject_once"}]}"#)
+        XCTAssertEqual(
+            ACPPermissionPolicy.decide(request: request, priorToolCall: nil,
+                                       capabilities: .writer),
+            .reject(optionID: .string("r")))
+    }
+
+    func testDecideCapabilityGatedKinds() {
+        let options = #","options":[{"optionId":"a","kind":"allow_once"},{"optionId":"r","kind":"reject_once"}]}"#
+        for (kind, deniedManifest) in [
+            ("edit", TurnCapabilityManifest(edit: false, execute: true, fetch: true)),
+            ("execute", TurnCapabilityManifest(edit: true, execute: false, fetch: true)),
+            ("fetch", TurnCapabilityManifest(edit: true, execute: true, fetch: false)),
+        ] {
+            let request = jreq(#"{"toolCall":{"kind":""# + kind + #""}"# + options)
+            XCTAssertEqual(
+                ACPPermissionPolicy.decide(request: request, priorToolCall: nil,
+                                           capabilities: deniedManifest),
+                .reject(optionID: .string("r")), kind)
+            XCTAssertEqual(
+                ACPPermissionPolicy.decide(request: request, priorToolCall: nil,
+                                           capabilities: .writer),
+                .allow(optionID: .string("a")), kind)
+        }
+    }
+
+    func testDecideReadsInferenceToolName() {
+        // Devin's native servers report the tool under
+        // cognition.ai/inferenceToolName rather than toolName.
+        let request = jreq(#"{"toolCall":{"toolCallId":"c5","_meta":{"cognition.ai/inferenceToolName":"request_scope"}},"options":[{"optionId":"a","kind":"allow_once"},{"optionId":"r","kind":"reject_once"}]}"#)
+        XCTAssertEqual(
+            ACPPermissionPolicy.decide(request: request, priorToolCall: nil,
+                                       capabilities: .writer),
+            .reject(optionID: .string("r")))
+    }
+
+    func testDecideNoAllowOption() {
+        let request = jreq(#"{"toolCall":{"toolCallId":"c6"},"options":[{"optionId":"r","kind":"reject_once"}]}"#)
+        XCTAssertEqual(
+            ACPPermissionPolicy.decide(request: request, priorToolCall: nil,
+                                       capabilities: .writer),
+            .noOption)
     }
 
     // MARK: - ACPHarnessAdapter
@@ -405,6 +477,20 @@ final class AdapterContractTests: XCTestCase {
         XCTAssertEqual(probe.health.kind, .unavailable)
     }
 
+    /// The version probe is advisory (G-D5): an executable whose --version
+    /// fails still reports available so wakeups retry rather than drop.
+    func testVersionProbeFailureIsAdvisory() async throws {
+        var s = spec()
+        s.executable = "/bin/echo"
+        let adapter = ACPHarnessAdapter(spec: s) { _, _ in
+            FakeACPTransport(responder: self.happyResponder())
+        } versionProbe: { _ in nil }
+        let probe = await adapter.probe()
+        XCTAssertEqual(probe.health.kind, .available)
+        XCTAssertTrue(probe.health.detail.contains("version unknown"))
+        XCTAssertFalse(probe.tested)
+    }
+
     func testProbeUntestedVersionReported() async throws {
         let adapter = ACPHarnessAdapter(spec: spec()) { _, _ in
             FakeACPTransport(responder: self.happyResponder())
@@ -414,6 +500,50 @@ final class AdapterContractTests: XCTestCase {
         XCTAssertFalse(probe.tested)
         XCTAssertTrue(probe.health.detail.contains("UNTESTED"))
         XCTAssertTrue(probe.health.detail.contains("auth unverified"))
+    }
+
+    func testDiscussionTurnSetsDiscussionCapabilities() async throws {
+        let transport = FakeACPTransport(responder: happyResponder())
+        let adapter = ACPHarnessAdapter(
+            spec: spec(), transportFactory: { _, _ in transport })
+        let ref = try await adapter.openTaskSession(binding: binding())
+        let task = WorkshopTask(id: TaskID("task_x"), channel: "main", title: "T",
+                                brief: "b", phase: .execution, state: .working,
+                                budgetPolicyRef: nil, createdAt: Date(), updatedAt: Date())
+        let workspace = TaskWorkspace(taskID: task.id, path: dir + "/ws",
+                                      state: "discussion")
+        let context = TurnContext(task: task, subtask: nil, recentMessages: [],
+                                  workspace: workspace, capabilities: .discussion)
+        for try await _ in adapter.sendTurn(ref: ref, turnID: "t1", context: context,
+                                            deadline: Date().addingTimeInterval(5)) {}
+        let manifest = await adapter.currentCapabilities()
+        XCTAssertEqual(manifest, .discussion)
+    }
+
+    func testDevinConfigAllowsRoutineTools() throws {
+        let paths = ProfileBuilder.Paths(home: dir + "/home",
+                                         devinBinary: "/bin/echo",
+                                         kimiBinary: "/bin/echo",
+                                         mcpBridge: dir + "/workshop-mcp")
+        _ = try ProfileBuilder.devinSpec(paths: paths, worktree: dir + "/wt",
+                                         model: "test-model")
+        let data = try Data(contentsOf: URL(fileURLWithPath:
+            dir + "/home/profiles/clean-v2/devin/config/devin/config.json"))
+        let config = try JSONDecoder().decode(JSONValue.self, from: data)
+        let allow = config["permissions"]?["allow"]?.arrayValue?
+            .compactMap { $0.stringValue } ?? []
+        XCTAssertEqual(Set(allow),
+                       ["read", "grep", "glob", "exec", "edit", "mcp__workshop__*"])
+        XCTAssertEqual(config["agent"]?["model"]?.stringValue, "test-model")
+    }
+
+    func testKimiRunsNeverAsk() throws {
+        let paths = ProfileBuilder.Paths(home: dir + "/home",
+                                         devinBinary: "/bin/echo",
+                                         kimiBinary: "/bin/echo",
+                                         mcpBridge: dir + "/workshop-mcp")
+        let spec = try ProfileBuilder.kimiSpec(paths: paths, worktree: dir + "/wt")
+        XCTAssertEqual(Array(spec.args.suffix(2)), ["--auto", "acp"])
     }
 
     func testSandboxProfileContainsWorktreeAllow() throws {
@@ -938,5 +1068,65 @@ final class AdapterContractTests: XCTestCase {
         XCTAssertTrue(events.contains(.uncertain(
             "DeepSeek served model \"deepseek-flash\" for configured \"deepseek-chat\"")))
         XCTAssertEqual(adapter.modelSelection, "deepseek-flash")
+    }
+
+    // MARK: - MCP over Streamable HTTP (Phase 1a)
+
+    /// Kimi: with spec.mcpURL set and a readable token, session/new carries the
+    /// HTTP mcpServers variant with a Bearer Authorization header.
+    func testKimiSessionNewUsesHTTPMCPWhenURLSet() async throws {
+        var seenSessionNew: JSONValue?
+        let adapter = ACPHarnessAdapter(
+            spec: {
+                var s = spec()
+                s.mcpURL = "http://127.0.0.1:1/mcp"
+                return s
+            }(),
+            transportFactory: { _, _ in
+                FakeACPTransport(responder: { line in
+                    let msg = self.json(line)
+                    if msg["method"]?.stringValue == "session/new" {
+                        seenSessionNew = msg["params"]
+                    }
+                    return self.happyResponder()(line)
+                })
+            })
+        _ = try await adapter.openTaskSession(binding: binding())
+        let servers = seenSessionNew?["mcpServers"]?.arrayValue
+        XCTAssertEqual(servers?.count, 1)
+        let w = servers?.first
+        XCTAssertEqual(w?["type"]?.stringValue, "http")
+        XCTAssertEqual(w?["name"]?.stringValue, "workshop")
+        XCTAssertEqual(w?["url"]?.stringValue, "http://127.0.0.1:1/mcp")
+        let header = w?["headers"]?.arrayValue?.first
+        XCTAssertEqual(header?["name"]?.stringValue, "Authorization")
+        XCTAssertEqual(header?["value"]?.stringValue, "Bearer tok")
+        XCTAssertNil(w?["command"])
+    }
+
+    /// Devin: with spec.mcpURL set, openTaskSession writes the HTTP transport
+    /// config into <cwd>/.devin/mcp_config.local.json (mode 0600).
+    func testDevinProjectConfigUsesHTTPMCPWhenURLSet() async throws {
+        var s = spec(injection: .devinProjectConfigFile, engineer: .devin)
+        s.mcpURL = "http://127.0.0.1:1/mcp"
+        let adapter = ACPHarnessAdapter(
+            spec: s, transportFactory: { _, _ in
+                FakeACPTransport(responder: self.happyResponder())
+            })
+        let devinBinding = SessionBinding(taskID: TaskID("task_x"),
+                                          engineerID: .devin, role: "owner",
+                                          workerID: "main")
+        _ = try await adapter.openTaskSession(binding: devinBinding)
+        let path = dir! + "/.devin/mcp_config.local.json"
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let cfg = try JSONDecoder().decode(JSONValue.self, from: data)
+        let w = cfg["mcpServers"]?["workshop"]
+        XCTAssertEqual(w?["url"]?.stringValue, "http://127.0.0.1:1/mcp")
+        XCTAssertEqual(w?["transport"]?.stringValue, "http")
+        XCTAssertEqual(w?["headers"]?["Authorization"]?.stringValue, "Bearer tok")
+        XCTAssertNil(w?["command"])
+        let mode = try FileManager.default
+            .attributesOfItem(atPath: path)[.posixPermissions] as? Int
+        XCTAssertEqual(mode, 0o600)
     }
 }

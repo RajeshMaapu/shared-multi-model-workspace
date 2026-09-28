@@ -19,7 +19,13 @@ if lockFD >= 0 {
     }
 }
 
-let runtime = try DaemonRuntime(home: home, runtimeDir: runtimeDir)
+let runtime: DaemonRuntime
+do {
+    runtime = try DaemonRuntime(home: home, runtimeDir: runtimeDir)
+} catch {
+    log("startup failed: \(error.localizedDescription)")
+    exit(1)
+}
 try await runtime.start()
 
 let sigSrc = DispatchSource.makeSignalSource(signal: SIGTERM,

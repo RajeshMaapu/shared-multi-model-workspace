@@ -132,33 +132,46 @@ final class Phase2ServiceTests: XCTestCase {
         let original = try await report("original")
         let retry = try await report("original")
         XCTAssertEqual(retry.id, original.id)
-        do {
-            _ = try await report("unreviewed replacement")
-            XCTFail("replacement needs a changes-requested review")
-        } catch WorkshopError.invalidRequest {}
+        // A changed result while the subtask is still in review creates the
+        // next revision rather than failing (revisions, not gating).
+        let replaced = try await report("unreviewed replacement")
+        XCTAssertNotEqual(replaced.id, original.id)
+        let replacedPayload = try JSONDecoder().decode(
+            JSONValue.self, from: Data(replaced.structured!.utf8))
+        XCTAssertEqual(replacedPayload["revision"]?.intValue, 2)
+        XCTAssertEqual(replacedPayload["supersedes"]?.stringValue,
+                       original.id.rawValue)
         do {
             _ = try await svc.toolReportResult(taskID: taskID, subtaskID: subID,
                 summary: "original", artifactIDs: [], validation: [], generation: 1,
                 principal: .engineer(.kimi))
             XCTFail("even an idempotent retry requires ownership")
         } catch WorkshopError.notOwner {}
+        // The superseded revision is no longer a valid review target.
+        do {
+            _ = try await svc.toolSubmitReview(taskID: taskID,
+                proposalID: original.id.rawValue, severity: "low",
+                disposition: "agree", body: "stale approval", evidence: nil,
+                principal: .engineer(.kimi))
+            XCTFail("reviewing a superseded revision is stale")
+        } catch WorkshopError.staleResult {}
         _ = try await svc.toolSubmitReview(taskID: taskID,
-            proposalID: original.id.rawValue, severity: "medium",
+            proposalID: replaced.id.rawValue, severity: "medium",
             disposition: "needs_changes", body: "revise", evidence: nil,
             principal: .engineer(.kimi))
         let revised = try await report("revised with evidence")
-        XCTAssertNotEqual(revised.id, original.id)
+        XCTAssertNotEqual(revised.id, replaced.id)
         let revisedRetry = try await report("revised with evidence")
         XCTAssertEqual(revisedRetry.id, revised.id)
         let pending = try await svc.getTask(taskID)
         XCTAssertEqual(pending.subtasks[0].verification, "pending")
         do {
             _ = try await svc.toolSubmitReview(taskID: taskID,
-                proposalID: original.id.rawValue, severity: "low",
+                proposalID: replaced.id.rawValue, severity: "low",
                 disposition: "agree", body: "stale approval", evidence: nil,
                 principal: .engineer(.kimi))
             XCTFail("stale approval cannot accept a revised result")
-        } catch WorkshopError.invalidRequest {}
+        } catch WorkshopError.staleResult {}
         _ = try await svc.toolSubmitReview(taskID: taskID,
             proposalID: revised.id.rawValue, severity: "low",
             disposition: "agree", body: "verified revision", evidence: nil,
@@ -283,12 +296,11 @@ final class Phase2ServiceTests: XCTestCase {
             phase: .execution, participants: [.devin]))
         await svc.start()
         await svc.awaitIdle()
-        let seqs = (try await svc.readMessages(receipt.taskID)).map(\.seq)
-        let maxSeq = seqs.max() ?? 0
-        _ = try await svc.postMessage(taskID: receipt.taskID, body: "user followup",
-                                      principal: .user)
+        let followup = try await svc.postMessage(taskID: receipt.taskID,
+                                                 body: "user followup",
+                                                 principal: .user)
         let reply = await waitForEngineerReply(svc, taskID: receipt.taskID,
-                                               engineer: .devin, minSeq: maxSeq)
+                                               engineer: .devin, minSeq: followup.seq)
         XCTAssertNotNil(reply, "user reply should wake the owner")
         await svc.shutdown()
     }
@@ -354,12 +366,17 @@ final class Phase2ServiceTests: XCTestCase {
         await svc.shutdown()
     }
 
-    /// Loop bound: after N engineer wakeups without a user message, further
-    /// wakeups are suppressed and a system event is posted once (T11).
+    /// Loop bound: after N completed substantive engineer turns without a
+    /// user message, further wakeups are suppressed and a system event is
+    /// posted once (T11). Only `done` wakeups count — wait for the first
+    /// turn to finish before posting the second.
     func testWakeupLoopBoundSuppresses() async throws {
         let (svc, taskID) = try await service(participants: [.devin, .kimi], loopBound: 1)
         _ = try await svc.postMessage(taskID: taskID, body: "@kimi one",
                                       principal: .engineer(.devin))
+        let replied = await waitForEngineerReply(svc, taskID: taskID,
+                                                 engineer: .kimi, minSeq: 0)
+        XCTAssertNotNil(replied)
         _ = try await svc.postMessage(taskID: taskID, body: "@kimi two",
                                       principal: .engineer(.devin))
         let messages = try await svc.readMessages(taskID)

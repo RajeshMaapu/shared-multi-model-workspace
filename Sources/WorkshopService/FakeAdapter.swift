@@ -31,6 +31,8 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
     public var failAfterDeltas: Int?
     /// When set, the turn runs these scripted actions instead of the default reply.
     public var script: (@Sendable (TurnContext) async -> [ScriptedAction])?
+    /// When set, openTaskSession throws this instead of opening (launch-retry tests).
+    public var openSessionError: Error?
     /// How scripted tool calls reach the service (set by tests/daemon).
     public var toolRunner: (@Sendable (String, JSONValue, Principal) async throws -> JSONValue)?
     private var scriptedHealth: EngineerHealth
@@ -72,7 +74,8 @@ public final class FakeAdapter: EngineerAdapter, @unchecked Sendable {
     }
 
     public func openTaskSession(binding: SessionBinding) async throws -> SessionRef {
-        SessionRef(engineer: engineer, nativeSessionID: "fake-session-\(binding.taskID.rawValue)")
+        if let openSessionError { throw openSessionError }
+        return SessionRef(engineer: engineer, nativeSessionID: "fake-session-\(binding.taskID.rawValue)")
     }
 
     public func sendTurn(ref: SessionRef, turnID: String, context: TurnContext,

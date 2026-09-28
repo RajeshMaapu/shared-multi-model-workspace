@@ -261,6 +261,10 @@ public enum SafeTree {
             guard names.count <= maximumFiles else { throw failure() }
         }
         for name in names.sorted() {
+            // The Workshop-written MCP config carries the bearer token; it must
+            // never enter a sealed snapshot or perturb the digest. Top-level
+            // only — nested .devin dirs and .devin/config.json are legitimate.
+            if prefix == ".devin/", name == "mcp_config.local.json" { continue }
             budget.files += 1
             guard budget.files <= maximumFiles, prefix.count < 4096 else { throw failure() }
             let fd = openat(src, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)

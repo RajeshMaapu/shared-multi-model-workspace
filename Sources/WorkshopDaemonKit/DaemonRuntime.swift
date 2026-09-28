@@ -4,6 +4,7 @@ import Security
 import WorkshopAdapters
 import WorkshopCore
 import WorkshopIPC
+import WorkshopMCP
 import WorkshopService
 import WorkshopStore
 
@@ -16,6 +17,10 @@ public final class DaemonRuntime: @unchecked Sendable {
     public let socketPath: String
     public let service: CollaborationService
     public let server: IPCServer
+    /// Streamable HTTP MCP endpoint on 127.0.0.1; bound in init, started in
+    /// `start()`. Sessions are in-memory — a restart forces re-initialization.
+    public let mcpServer: MCPHTTPServer
+    public var mcpURL: String { mcpServer.url }
     public let adapters: [EngineerAdapter]
     private var broadcastTask: Task<Void, Never>?
 
@@ -125,7 +130,16 @@ public final class DaemonRuntime: @unchecked Sendable {
             .flatMap { try? JSONDecoder().decode(EngineersFile.self, from: $0) }
             ?? EngineersFile()
 
-        let adaptersMode = env["WORKSHOP_ADAPTERS"] ?? "fake"
+        // Adapter mode: live for the installed home, fake elsewhere. Fake
+        // adapters must never run against the installed home — a daemon
+        // restarted there with fakes would inject scripted replies into live
+        // tasks (G-D8).
+        let installedHome = ProfileBuilder.canonicalPath(
+            env["WORKSHOP_INSTALLED_HOME_OVERRIDE"]
+                ?? NSHomeDirectory() + "/Library/Application Support/Workshop")
+        let canonicalHome = ProfileBuilder.canonicalPath(home)
+        let adaptersMode = env["WORKSHOP_ADAPTERS"]
+            ?? (canonicalHome == installedHome ? "live" : "fake")
         func isFake(_ engineer: EngineerID) -> Bool {
             if adaptersMode == "live" { return false }
             if adaptersMode == "fake" { return true }
@@ -141,6 +155,16 @@ public final class DaemonRuntime: @unchecked Sendable {
             return false
         }
 
+        if EngineerID.allCases.contains(where: isFake),
+           canonicalHome == installedHome,
+           env["WORKSHOP_ALLOW_FAKE_ON_INSTALLED_HOME"] != "1" {
+            Self.log("Refusing fake adapters against the installed Workshop home")
+            throw WorkshopError.invalidRequest(
+                "Refusing fake adapters against the installed Workshop home; "
+                + "set WORKSHOP_ADAPTERS=live or "
+                + "WORKSHOP_ALLOW_FAKE_ON_INSTALLED_HOME=1 for a deliberate test")
+        }
+
         // Bridge copy failed or was unavailable: live adapters fail visibly.
         if bridgePath == nil, adaptersMode != "fake" {
             Self.log("workshop-mcp not found: set WORKSHOP_MCP_PATH or place "
@@ -153,6 +177,42 @@ public final class DaemonRuntime: @unchecked Sendable {
             return path
         }
 
+        // MCP over Streamable HTTP (127.0.0.1). Bound here — before adapters
+        // are built — so the launch specs can carry the concrete URL. The
+        // service is installed into `serviceBox` once it exists below; auth
+        // closures run per request so revocations take effect immediately.
+        let mcpPort: UInt16 = env["WORKSHOP_MCP_PORT"].flatMap(UInt16.init)
+            ?? (canonicalHome == installedHome ? 47831 : 0)
+        var mcpConfig = MCPHTTPServer.Config()
+        mcpConfig.port = mcpPort
+        let serviceBox = ServiceBox()
+        let mcpServer = MCPHTTPServer(
+            config: mcpConfig, serverVersion: "0",
+            authenticate: { token in
+                guard let service = serviceBox.service else {
+                    throw WorkshopError.invalidRequest("service not ready")
+                }
+                return try await service.authenticate(token: token)
+            },
+            authorize: { token, method, params in
+                guard let service = serviceBox.service else {
+                    throw WorkshopError.invalidRequest("service not ready")
+                }
+                try await service.authorizeWriterRequest(token: token,
+                                                         method: method,
+                                                         params: params)
+            },
+            callTool: { method, args, principal in
+                guard let service = serviceBox.service else {
+                    throw WorkshopError.invalidRequest("service not ready")
+                }
+                return try await service.callTool(method, args: args,
+                                                  principal: principal)
+            })
+        try mcpServer.bind()
+        self.mcpServer = mcpServer
+        Self.log("mcp endpoint bound at \(mcpServer.url)")
+
         let paths = ProfileBuilder.Paths(
             home: home,
             devinBinary: expandHome(engineersConfig.engineer(.devin)?.executable)
@@ -160,7 +220,7 @@ public final class DaemonRuntime: @unchecked Sendable {
             kimiBinary: expandHome(engineersConfig.engineer(.kimi)?.executable)
                 ?? NSHomeDirectory() + "/.kimi-code/bin/kimi",
             mcpBridge: bridgePath ?? "<missing workshop-mcp>",
-            runtimeDir: runtime)
+            runtimeDir: runtime, mcpURL: mcpServer.url)
 
         func liveAdapter(_ engineer: EngineerID,
                          worktreeHint: String) -> EngineerAdapter? {
@@ -219,6 +279,7 @@ public final class DaemonRuntime: @unchecked Sendable {
                                                adapters: built, homeDir: home,
                                                capacityPolicies: policies)
         self.service = service
+        serviceBox.service = service
         Self.log("opened database at \(dbPath)")
         service.deepLinkHandlerVerified = Self.deepLinkRegistered()
         self.buildID = Self.buildID(executable: ownExecutable)
@@ -585,6 +646,17 @@ public final class DaemonRuntime: @unchecked Sendable {
             await service.refreshDeepSeekBalance()
         }
         try server.start()
+        try mcpServer.start()
+        let mcpInfo = String(decoding: try JSONEncoder().encode(JSONValue.object([
+            "url": .string(mcpServer.url),
+            "catalog_version": .number(Double(WorkshopToolCatalog.catalogVersion)),
+            "pid": .number(Double(ProcessInfo.processInfo.processIdentifier)),
+            "started_at": .string(WorkshopTime.string(Date())),
+        ])), as: UTF8.self)
+        let mcpInfoPath = runtimeDir + "/mcp.json"
+        try mcpInfo.write(toFile: mcpInfoPath, atomically: true, encoding: .utf8)
+        chmod(mcpInfoPath, 0o600)
+        Self.log("mcp endpoint \(mcpServer.url)")
         Self.log("listening on \(socketPath)")
         broadcastTask = Task.detached { [service, server] in
             for await event in await service.makeEventStream() {
@@ -598,5 +670,14 @@ public final class DaemonRuntime: @unchecked Sendable {
         broadcastTask?.cancel()
         await service.shutdown()
         server.stop()
+        mcpServer.stop()
+        try? FileManager.default.removeItem(atPath: runtimeDir + "/mcp.json")
     }
+}
+
+/// Late binding for the CollaborationService: the MCP HTTP server must bind
+/// before adapters are built (they embed its URL), but its auth closures call
+/// the service, which exists only after the adapters. Resolved per request.
+final class ServiceBox: @unchecked Sendable {
+    var service: CollaborationService?
 }

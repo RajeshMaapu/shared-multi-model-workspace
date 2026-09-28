@@ -64,10 +64,15 @@ params. Engineer principals may only read/post on tasks where they are
 participants → `-32003 notAParticipant`; `workshop_report_result` additionally
 requires current ownership → `-32004 notOwner`.
 
-**workshop-mcp bridge.** A stdio MCP server (pinned protocolVersion
-2025-06-18) that forwards `tools/call` to the daemon over the UDS with the
-engineer's token. Devin finds it via `<worktree>/.devin/mcp_config.local.json`
-(ADR 0006); Kimi via ACP `session/new.mcpServers`.
+**MCP endpoint.** The daemon hosts a Streamable HTTP MCP server on 127.0.0.1
+(port 47831 for the installed home, ephemeral otherwise; `<runtime>/mcp.json`
+records the URL). Every request carries `Authorization: Bearer <token>`; the
+token is authenticated per request so revocation takes effect immediately.
+Sessions are in-memory only — a daemon restart invalidates them, so clients
+re-initialize. Devin finds the URL via `<worktree>/.devin/mcp_config.local.json`
+(ADR 0006); Kimi via ACP `session/new.mcpServers` (`type: "http"`). The
+`workshop-mcp` executable is retained as a stateless stdio shim (token file
+re-read per call) for clients that only speak stdio.
 
 **Adapters** (`WorkshopAdapters`): `ACPClient` + `ACPHarnessAdapter` shared by
 Devin and Kimi (per-harness `HarnessLaunchSpec`, `MCPInjection` mode, warm
@@ -85,9 +90,14 @@ Adapter registration is `WORKSHOP_ADAPTERS=fake|live|mixed:<eng>=fake,…`;
 messages — the current owner. A coalescer (500 ms, 0 in tests) batches pending
 rows per (task, engineer) into one turn carrying a "you were mentioned"
 context. Engineer↔engineer messages with no mention wake nobody; system
-events never wake. Loop bound: 6 consecutive engineer wakeups without a user
-message → further rows `suppressed` + one "Discussion round limit reached"
-system event.
+events never wake. User @mentions wake the mentioned participants
+(`user_mention`); an unaddressed user message wakes the owner. Launch failures
+and unavailable probes re-queue the wakeup with 30 s / 2 min / 10 min backoff
+(3 attempts, visible as "Waiting for …" events) instead of dropping it; the
+version probe is advisory. Loop bound: 6 completed substantive engineer turns
+without an intervening user message → further rows `suppressed` + one
+"Discussion round limit reached" event; silent turns and failed launches do
+not count.
 
 **Consumed cursor.** `participants.last_read_seq` bounds the turn context to
 unseen messages (≤60, oldest truncated with a note) and advances only when a
@@ -99,13 +109,17 @@ turn completes — never on send.
 setup, capability-token generation, `engineers.json` loading, adapter
 registration, the IPC server, event forwarding, and service lifecycle — so the
 `workshop-daemon` executable is a thin shell (start + SIGTERM + park) and live
-tests run the identical wiring in-process. `workshop-mcp` resolves via
+tests run the identical wiring in-process. Adapter mode defaults to live for
+the installed home and fake elsewhere; fake adapters refuse to start against
+the installed home unless `WORKSHOP_ALLOW_FAKE_ON_INSTALLED_HOME=1`.
+`workshop-mcp` resolves via
 `WORKSHOP_MCP_PATH` then a sibling of the daemon executable; a missing bridge
 probes as `unavailable: workshop-mcp not found`.
 
 **Live findings baked in.** Devin's `session/request_permission` carries only
-`toolCallId` — the tool name appears in option labels, so the permission
-policy falls back to scanning option names for the workshop marker.
+`toolCallId`. Permission prompts are decided by the ACP tool `kind` against
+the turn's capability manifest; the per-generation sandbox is the enforcement
+boundary, and Devin/Kimi are launched so routine tools do not prompt at all.
 `workshop-mcp`'s tool-call closure is built nonisolated (top-level `main.swift`
 is `@MainActor`; awaiting a main-actor closure would deadlock against the
 blocking stdio loop). The turn packet states the literal `task_id` for tool
@@ -179,7 +193,11 @@ wakes Devin.
 or any substantial task picks a verifier ≠ owner (preferring Devin) via a
 `verify_result` wakeup; `agree` marks the subtask done/`verification=passed`,
 `needs_changes` returns it to the owner. Task-level completion waits for the
-user's `workshop.acceptTask`.
+user's `workshop.acceptTask`. Results are revisioned per subtask: re-reporting
+after changes creates revision N+1 (an identical retry returns the existing
+revision); reviews must target the latest revision (-32008 otherwise); a turn
+that ends without `workshop_report_result` leaves the task working and nudges
+the owner once with `report_requested`.
 
 **Task actions.** Pause cancels the in-flight turn and suppresses pending
 wakeups (requested/acknowledged system events); resume re-dispatches; cancel

@@ -260,7 +260,22 @@ final class ServiceTests: XCTestCase {
     }
 
     func testUsageSampleKeepsUnknownCache() async throws {
-        let svc = try service(adapters: fakes())
+        let adapters = fakes()
+        let svc = try service(adapters: adapters)
+        // A state_changed row is only emitted when the task actually
+        // transitions — script the owner turn to report a result.
+        adapters[0].toolRunner = { [weak svc] name, args, principal in
+            guard let svc else { return .null }
+            return try await svc.callTool(name, args: args, principal: principal)
+        }
+        adapters[0].script = { context in
+            guard let sub = context.subtask else { return [.text("ok")] }
+            return [.toolCall("workshop_report_result", .object([
+                "task_id": .string(context.task.id.rawValue),
+                "subtask_id": .string(sub.id.rawValue),
+                "summary": .string("done"),
+                "generation": .number(Double(sub.generation))]))]
+        }
         _ = try await svc.createTask(request(key: "usage"))
         await svc.start()
         await svc.awaitIdle()
@@ -295,7 +310,23 @@ final class ServiceTests: XCTestCase {
     }
 
     func testPoisonedDispatchRowFailsAndLoopContinues() async throws {
-        let svc = try service(adapters: fakes())
+        let adapters = fakes()
+        let svc = try service(adapters: adapters)
+        for adapter in adapters {
+            adapter.toolRunner = { [weak svc] name, args, principal in
+                guard let svc else { return .null }
+                return try await svc.callTool(name, args: args, principal: principal)
+            }
+            adapter.script = { context in
+                guard let sub = context.subtask,
+                      sub.ownerID == adapter.engineer else { return [.text("ok")] }
+                return [.toolCall("workshop_report_result", .object([
+                    "task_id": .string(context.task.id.rawValue),
+                    "subtask_id": .string(sub.id.rawValue),
+                    "summary": .string("done"),
+                    "generation": .number(Double(sub.generation))]))]
+            }
+        }
         // A dispatch.requested row with no subtask_id can never be handled.
         try await svc.insertOutboxForTest(eventType: CollaborationService.dispatchRequested,
                                         taskID: nil, payload: #"{"task_id":"task_missing"}"#)
