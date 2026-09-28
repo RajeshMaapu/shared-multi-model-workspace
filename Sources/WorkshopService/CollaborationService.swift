@@ -20,6 +20,22 @@ public actor CollaborationService {
     private var dispatcherScheduled = false
     private var inflightTurns = 0
     private var eventContinuations: [UUID: AsyncStream<OutboxEvent>.Continuation] = [:]
+    /// Bounded long-poll waiters for workshop_wait_for_events; keyed by waiter
+    /// id, grouped by call so the deadline task can expire a whole poll.
+    private struct EventWaiter {
+        let group: UUID
+        let taskID: TaskID
+        let principalKind: String
+        let continuation: CheckedContinuation<Void, Never>
+    }
+    private var eventWaiters: [UUID: EventWaiter] = [:]
+    private static let maxWaitersPerPrincipalKind = 32
+    /// Engineers whose recorded qualification binary hash differs from the
+    /// resolved binary (advisory; one system event per daemon lifetime).
+    private var binaryDrifted: Set<EngineerID> = []
+    private var driftAnnounced: Set<EngineerID> = []
+    /// Latest credential-canary result per engineer (G-D1).
+    private var credentialStatus: [EngineerID: (state: String, detail: String)] = [:]
     private var lastPublishedSeq: Int64 = 0
     private var isShutdown = false
 
@@ -29,6 +45,9 @@ public actor CollaborationService {
     private let wakeupCoalescence: Duration
     /// Max consecutive engineer-triggered wakeups without a user message (T11).
     private let wakeupLoopBound: Int
+    /// Backoff schedule between wakeup launch retries (attempt i sleeps
+    /// `wakeupRetryBackoff[i-1]`); injectable so tests use milliseconds.
+    private let wakeupRetryBackoff: [Duration]
     private var wakeupScheduled = false
     /// (task, engineer) pairs with a turn currently running.
     private var runningTurns: Set<String> = []
@@ -67,6 +86,13 @@ public actor CollaborationService {
     private var harnessAliveProbes: [EngineerID: @Sendable () -> Bool] = [:]
     /// Checkpoint JSON carried into the next resume_from_checkpoint packet.
     private var pendingCheckpointDetail: [EngineerID: String] = [:]
+    /// Most recent classified turn-startup failure per engineer (G-D2);
+    /// merged into listEngineers for ~30 min, cleared on a successful open.
+    private var lastStartupFailure:
+        [EngineerID: (klass: StartupFailureClass, detail: String, at: Date)] = [:]
+    /// Last lane each (task, engineer) turn resolved to ("native"|"managed"),
+    /// recorded by the lane-selecting adapter's observer (Phase 3, D-b).
+    private var activeLane: [String: String] = [:]
     private var lastWalCheckpoint: Date?
     /// Research-phase deadlines in seconds; <= 0 disables the timer (tests).
     private let researchDeadline: TimeInterval
@@ -76,6 +102,12 @@ public actor CollaborationService {
 
     /// Test hook: called with the rendered context packet before each sendTurn.
     public var packetInspector: (@Sendable (EngineerID, String) -> Void)?
+
+    /// Called after a successful openTaskSession; DaemonRuntime uses it to
+    /// refresh that engineer's credential canary without waiting 30 min.
+    /// Set once at wiring time, before the service starts processing turns.
+    public nonisolated(unsafe) var sessionOpenedHook:
+        (@Sendable (EngineerID) async -> Void)?
 
     public func setPacketInspector(_ f: (@Sendable (EngineerID, String) -> Void)?) {
         packetInspector = f
@@ -96,6 +128,8 @@ public actor CollaborationService {
                 homeDir: String? = nil,
                 wakeupCoalescence: Duration = .milliseconds(500),
                 wakeupLoopBound: Int = 6,
+                wakeupRetryBackoff: [Duration] = [.seconds(30), .seconds(120),
+                                                 .seconds(600)],
                 researchDeadline: TimeInterval = 1200,
                 reviewDeadline: TimeInterval = 900,
                 capacityPolicies: [EngineerID: CapacityPolicy] = [:],
@@ -109,6 +143,7 @@ public actor CollaborationService {
         self.homeDir = homeDir
         self.wakeupCoalescence = wakeupCoalescence
         self.wakeupLoopBound = wakeupLoopBound
+        self.wakeupRetryBackoff = wakeupRetryBackoff
         self.researchDeadline = researchDeadline
         self.reviewDeadline = reviewDeadline
         self.capacityPolicies = capacityPolicies
@@ -122,6 +157,8 @@ public actor CollaborationService {
                             homeDir: String? = nil,
                             wakeupCoalescence: Duration = .milliseconds(500),
                             wakeupLoopBound: Int = 6,
+                            wakeupRetryBackoff: [Duration] = [.seconds(30), .seconds(120),
+                                                             .seconds(600)],
                             researchDeadline: TimeInterval = 1200,
                             reviewDeadline: TimeInterval = 900,
                             capacityPolicies: [EngineerID: CapacityPolicy] = [:],
@@ -132,6 +169,7 @@ public actor CollaborationService {
                       dispatcherEnabled: dispatcherEnabled, homeDir: homeDir,
                       wakeupCoalescence: wakeupCoalescence,
                       wakeupLoopBound: wakeupLoopBound,
+                      wakeupRetryBackoff: wakeupRetryBackoff,
                       researchDeadline: researchDeadline,
                       reviewDeadline: reviewDeadline,
                       capacityPolicies: capacityPolicies,
@@ -200,22 +238,222 @@ public actor CollaborationService {
             .init(lease: lease, path: snapshot, digest: digest), verifiedDigest: verifiedDigest)
     }
 
+    public func selectReviewSeed(taskID: TaskID, engineer: EngineerID,
+                                 generationID: String, verifiedDigest: String,
+                                 principal: Principal) throws {
+        if principal != .user {
+            guard principal == .codex,
+                  try repo.taskIngress(taskID)?.source == "codex" else {
+                throw WorkshopError.userAuthorityRequired("select review seed")
+            }
+        }
+        guard let homeDir else {
+            throw WorkshopError.invalidRequest("no writer store configured")
+        }
+        guard try repo.subtasks(taskID).contains(where: { $0.ownerID == engineer }) else {
+            throw WorkshopError.invalidRequest("review seed engineer is not the task owner")
+        }
+        try WriterGenerations(db: repo.db, home: homeDir).pinReviewSeed(
+            taskID: taskID, engineer: engineer,
+            generationID: generationID, verifiedDigest: verifiedDigest)
+        let timestamp = now()
+        try repo.insertMessage(Message(id: MessageID(newID("msg")), taskID: taskID,
+            seq: try repo.nextMessageSeq(taskID), author: .system,
+            kind: .systemEvent,
+            body: "Digest-verified owner discussion snapshot selected as fenced review seed"
+                + (principal == .codex ? " via Codex" : "")
+                + "; snapshot remains unpromoted",
+            deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
+        publishCommitted()
+    }
+
+    /// Expose a bounded file from the selected immutable proposal to peers
+    /// whose adapters have no filesystem. This is review access, not promotion.
+    public func readReviewFile(taskID: TaskID, path: String,
+                               principal: Principal) throws -> JSONValue {
+        if let engineer = principal.engineerID {
+            try requireParticipant(engineer, taskID: taskID)
+        } else if principal == .codex {
+            guard try repo.taskIngress(taskID)?.source == "codex" else {
+                throw WorkshopError.userAuthorityRequired("read review file")
+            }
+        }
+        guard !path.isEmpty, !path.hasPrefix("/"),
+              !path.split(separator: "/").contains("..") else {
+            throw WorkshopError.workspaceEscape(path)
+        }
+        guard homeDir != nil else {
+            throw WorkshopError.invalidRequest("Verified review seed unavailable")
+        }
+        guard let seed = try reviewSeedForTask(taskID, announce: true) else {
+            throw WorkshopError.invalidRequest("Verified review seed unavailable")
+        }
+        let snapshot = seed.snapshotPath
+        let digest = seed.digest
+        let generationID = seed.generationID
+        let source = try WorkspaceManager.resolveInsideWorkspace(snapshot, path)
+        guard source != snapshot else { throw WorkshopError.workspaceEscape(path) }
+        let attributes = try FileManager.default.attributesOfItem(atPath: source)
+        guard attributes[.type] as? FileAttributeType == .typeRegular,
+              ((attributes[.size] as? NSNumber)?.intValue ?? Int.max) <= 64 * 1024 else {
+            throw WorkshopError.invalidRequest("Review file is not a regular UTF-8 file under 64 KiB")
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: source))
+        guard data.count <= 64 * 1024, let content = String(data: data, encoding: .utf8) else {
+            throw WorkshopError.invalidRequest("Review file is not a regular UTF-8 file under 64 KiB")
+        }
+        // A review capability exposes proposal changes, not arbitrary files
+        // copied from the user's repository into the writer snapshot.
+        guard let accepted = try repo.taskWorkspace(taskID)?.path else {
+            throw WorkshopError.invalidRequest("Task workspace unavailable")
+        }
+        let acceptedFile = try WorkspaceManager.resolveInsideWorkspace(accepted, path)
+        if FileManager.default.fileExists(atPath: acceptedFile) {
+            let acceptedAttributes = try FileManager.default.attributesOfItem(atPath: acceptedFile)
+            guard acceptedAttributes[.type] as? FileAttributeType == .typeRegular,
+                  ((acceptedAttributes[.size] as? NSNumber)?.intValue ?? Int.max) <= 64 * 1024,
+                  try Data(contentsOf: URL(fileURLWithPath: acceptedFile)) != data else {
+                throw WorkshopError.invalidRequest("Review file is not a bounded proposal change")
+            }
+        }
+        return .object(["task_id": .string(taskID.rawValue),
+                        "generation_id": .string(generationID),
+                        "snapshot_digest": .string(digest),
+                        "path": .string(path), "content": .string(content)])
+    }
+
+    /// The effective fenced review seed for this task, resolved by the same
+    /// rule `WriterGenerations.begin` applies: the stored pin unless a newer
+    /// authoritative snapshot exists, else the newest snapshot across
+    /// authoritative and review-only owner rows. When `announce` is set and
+    /// the resolved seed differs from the last announced one, a single
+    /// system event is committed so reviewers can cite the change.
+    @discardableResult
+    private func reviewSeedForTask(_ taskID: TaskID,
+                                   announce: Bool = false)
+        throws -> WriterGenerations.ReviewSeed? {
+        guard let homeDir else { return nil }
+        let ownerRaw = try repo.db.query(
+            "SELECT engineer FROM writer_seed_pins WHERE task_id=?",
+            [.text(taskID.rawValue)]).first?["engineer"]?.text
+            ?? repo.subtasks(taskID).first?.ownerID?.rawValue
+        guard let owner = ownerRaw.flatMap(EngineerID.init(rawValue:)) else {
+            return nil
+        }
+        guard let seed = try WriterGenerations(db: repo.db, home: homeDir)
+            .currentReviewSeed(taskID: taskID, requester: owner,
+                               seedEngineer: owner) else { return nil }
+        if announce { try announceReviewSeedIfChanged(taskID: taskID, seed: seed) }
+        return seed
+    }
+
+    /// Post exactly one system event per effective-seed change:
+    /// "Review seed is now sealed revision <id8> (digest <d12>);
+    ///  <pin <id8> superseded | no pin>".
+    private func announceReviewSeedIfChanged(
+        taskID: TaskID, seed: WriterGenerations.ReviewSeed) throws {
+        let prefix = "Review seed is now sealed revision "
+        let last = try repo.db.query("""
+            SELECT body FROM messages WHERE task_id=? AND kind='system_event'
+              AND body LIKE ? ORDER BY seq DESC LIMIT 1
+            """, [.text(taskID.rawValue), .text(prefix + "%")])
+            .first?["body"]?.text
+        let id8 = String(seed.generationID.prefix(8))
+        if let last, last.contains(id8) { return }
+        let d12 = String(seed.digest.prefix(12))
+        let pinned = seed.source == .pin ? nil : try repo.db.query(
+            "SELECT generation_id FROM writer_seed_pins WHERE task_id=?",
+            [.text(taskID.rawValue)]).first?["generation_id"]?.text
+        let suffix = pinned.map { "pin " + String($0.prefix(8)) + " superseded" }
+            ?? (seed.source == .pin ? "pinned review seed" : "no pin")
+        let timestamp = now()
+        try repo.insertMessage(Message(
+            id: MessageID(newID("msg")), taskID: taskID,
+            seq: try repo.nextMessageSeq(taskID), author: .system,
+            kind: .systemEvent,
+            body: prefix + id8 + " (digest " + d12 + "); " + suffix,
+            deliveryState: .committed, createdAt: timestamp,
+            updatedAt: timestamp))
+        publishCommitted()
+    }
+
     /// Recovery, then process any pending dispatch rows exactly once (T03).
     public func start() async {
         reconcileOnStart()
         recoverInterruptedStreams()
+        if let pruned = attempt("pruneAllWorkActivity", {
+            try repo.pruneAllWorkActivity(keep: 200)
+        }), pruned > 0 {
+            log.notice("pruned \(pruned) delivered work.activity rows at startup")
+        }
         if let homeDir {
             _ = attempt("recoverWriters") { try WriterGenerations(db: repo.db, home: homeDir).recover() }
         }
+        recoverUnstartedChangeRequests()
         scheduleDispatch()
+        scheduleWakeupCoalescer()
         scheduleLeaseSweeper()
         scheduleWalMonitor()
+    }
+
+    /// Generation retention sweep (decision D-e): deletes non-essential
+    /// generation run/snapshot directories. Invoked by the daemon runtime at
+    /// start (after recovery) and every ten minutes; test-invokable.
+    @discardableResult
+    public func pruneGenerations() -> (deletedDirs: Int, bytes: Int64)? {
+        guard let homeDir else { return nil }
+        return try? WriterGenerations(db: repo.db, home: homeDir).prune(
+            log: { [log] line in log.notice("\(line)") })
     }
 
     /// Replace an adapter after init (e.g. binding a live adapter's tool
     /// executor to this service). Used at daemon startup.
     public func registerAdapter(_ adapter: EngineerAdapter) {
         adapters[adapter.engineer] = adapter
+    }
+
+    /// Record the lane a (task, engineer) turn resolved to; called from the
+    /// lane-selecting adapter's observer at session open (D-b).
+    public func recordLane(taskID: TaskID, engineer: EngineerID, lane: String) {
+        activeLane[taskID.rawValue + ":" + engineer.rawValue] = lane
+    }
+
+    /// Mark that the engineer's qualification record was written for a
+    /// different binary (G-E5 advisory; surfaced once as a system event).
+    public func markBinaryDrifted(_ engineer: EngineerID) {
+        binaryDrifted.insert(engineer)
+    }
+
+    /// Latest credential canary result; surfaced on the engineer card (G-D1).
+    public func recordCredentialStatus(engineer: EngineerID, state: String,
+                                       detail: String) {
+        credentialStatus[engineer] = (state, detail)
+    }
+
+    /// Merge `"lane":"managed"` into a message/proposal structured object
+    /// when the author's recorded lane is managed; nil-safe for old messages.
+    private func laneFields(_ fields: [String: JSONValue], taskID: TaskID,
+                            engineer: EngineerID?) -> [String: JSONValue] {
+        guard let engineer,
+              activeLane[taskID.rawValue + ":" + engineer.rawValue] == "managed"
+        else { return fields }
+        var merged = fields
+        merged["lane"] = .string("managed")
+        return merged
+    }
+
+    /// String form of laneFields for callers building `Message.structured`.
+    private func laneStructured(_ structured: String?, taskID: TaskID,
+                                engineer: EngineerID?) -> String? {
+        guard let engineer else { return structured }
+        var fields = structured.flatMap {
+            try? JSONDecoder().decode([String: JSONValue].self,
+                                      from: Data($0.utf8))
+        } ?? [:]
+        fields = laneFields(fields, taskID: taskID, engineer: engineer)
+        guard !fields.isEmpty else { return structured }
+        return String(decoding: (try? JSONEncoder().encode(fields)) ?? Data(),
+                      as: UTF8.self)
     }
 
     public func shutdown() {
@@ -257,6 +495,89 @@ public actor CollaborationService {
         eventContinuations.removeValue(forKey: id)
     }
 
+    /// Expire every waiter of one wait_for_events call (deadline path).
+    private func resumeWaiterGroup(_ group: UUID) {
+        for (id, waiter) in eventWaiters where waiter.group == group {
+            eventWaiters.removeValue(forKey: id)
+            waiter.continuation.resume()
+        }
+    }
+
+    /// Test-only: outstanding wait_for_events waiters (leak detection).
+    var waiterCount: Int { eventWaiters.count }
+
+    /// Bounded long-poll for committed task events after `afterSeq`. Returns
+    /// immediately when events exist, otherwise waits up to `timeoutSeconds`
+    /// (clamped 1...120, default 50). Codex callers advance the task's
+    /// acknowledged cursor to the last returned seq (G-A3).
+    public func waitForEvents(taskID: TaskID, afterSeq: Int64,
+                              timeoutSeconds: Int? = nil,
+                              principal: Principal) async throws -> JSONValue {
+        guard try repo.task(taskID) != nil else { throw WorkshopError.taskNotFound(taskID) }
+        if let engineer = principal.engineerID {
+            try requireParticipant(engineer, taskID: taskID)
+        }
+        let timeout = TimeInterval(min(max(timeoutSeconds ?? 50, 1), 120))
+        let deadline = now().addingTimeInterval(timeout)
+        let group = UUID()
+        let expirer = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            await self?.resumeWaiterGroup(group)
+        }
+        defer {
+            expirer.cancel()
+            for (id, waiter) in eventWaiters where waiter.group == group {
+                eventWaiters.removeValue(forKey: id)
+                waiter.continuation.resume()
+            }
+        }
+        var events: [JSONValue] = []
+        var lastSeq = afterSeq
+        while true {
+            let found = try repo.messages(taskID, afterSeq: afterSeq, limit: 500)
+                .filter { $0.deliveryState == .committed }
+            events = found.map { m -> JSONValue in
+                var object: [String: JSONValue] = [
+                    "seq": .number(Double(m.seq)),
+                    "type": .string(m.kind == .systemEvent ? "system_event" : "message"),
+                    "author": .string(m.author.displayName),
+                    "kind": .string(m.kind.rawValue),
+                    "body": .string(String(m.body.prefix(500))),
+                    "created_at": .string(WorkshopTime.string(m.createdAt)),
+                ]
+                if let structured = m.structured,
+                   let card = try? JSONDecoder().decode([String: JSONValue].self,
+                                                        from: Data(structured.utf8)),
+                   let lane = card["lane"] {
+                    object["lane"] = lane
+                }
+                return .object(object)
+            }
+            if let last = found.last { lastSeq = max(lastSeq, last.seq) }
+            if !events.isEmpty || now() >= deadline { break }
+            guard eventWaiters.values.filter({
+                $0.principalKind == principal.kind
+            }).count < Self.maxWaitersPerPrincipalKind else {
+                throw WorkshopError.tooManyWaiters
+            }
+            await withCheckedContinuation { continuation in
+                eventWaiters[UUID()] = EventWaiter(group: group, taskID: taskID,
+                                                   principalKind: principal.kind,
+                                                   continuation: continuation)
+            }
+        }
+        if principal == .codex, try repo.taskIngress(taskID) != nil {
+            try repo.acknowledgeIngressSeq(taskID, seq: lastSeq)
+        }
+        return .object([
+            "task_id": .string(taskID.rawValue),
+            "task_state": .string((try repo.task(taskID))?.state.rawValue ?? "unknown"),
+            "events": .array(events),
+            "last_seq": .number(Double(lastSeq)),
+            "timed_out": .bool(events.isEmpty),
+        ])
+    }
+
     private func publishCommitted() {
         guard let rows = attempt("outboxEvents", { try repo.outboxEvents(afterSeq: lastPublishedSeq) }) else { return }
         let timestamp = now()
@@ -264,6 +585,14 @@ public actor CollaborationService {
             lastPublishedSeq = max(lastPublishedSeq, row.seq)
             for continuation in eventContinuations.values {
                 continuation.yield(row)
+            }
+            if let taskID = row.taskID,
+               row.eventType == "message.committed"
+                    || row.eventType == "task.state_changed" {
+                for (id, waiter) in eventWaiters where waiter.taskID == taskID {
+                    eventWaiters.removeValue(forKey: id)
+                    waiter.continuation.resume()
+                }
             }
             // §8.5: once yielded to in-process subscribers the row is
             // delivered and the service cursor advances — nothing stays
@@ -312,16 +641,36 @@ public actor CollaborationService {
             .map { WakeupInfo(engineer: $0.engineerID, reason: $0.reason,
                               state: $0.state) }
         let proposals = try repo.proposals(id)
+        let subtasks = try repo.subtasks(id)
+        var subtaskResults: [String: SubtaskResultStatus] = [:]
+        for sub in subtasks {
+            let results = try repo.resultMessages(taskID: id, subtaskID: sub.id)
+            subtaskResults[sub.id.rawValue] = SubtaskResultStatus(
+                latestResultMessageID: results.last?.id.rawValue,
+                resultRevision: results.count)
+        }
+        let participants = try repo.participants(id).map { p -> Participant in
+            var p = p
+            p.lane = activeLane[id.rawValue + ":" + p.engineerID.rawValue]
+            return p
+        }
+        let ingress = try repo.taskIngress(id)
+        let reviewSeed = try? reviewSeedForTask(id).map {
+            ReviewSeedInfo(generationID: $0.generationID, digest: $0.digest,
+                           source: $0.source.rawValue) }
         return TaskDetail(task: task,
-                          participants: try repo.participants(id),
-                          subtasks: try repo.subtasks(id),
+                          participants: participants,
+                          subtasks: subtasks,
                           usage: usage,
                           runningEngineers: running,
                           pendingWakeups: wakeups,
                           draftProposalCount: proposals.filter { $0.visibility == "draft" }.count,
                           publishedProposalCount: proposals.filter { $0.visibility == "published" }.count,
-                          ingress: try repo.taskIngress(id),
-                          workspace: try repo.taskWorkspace(id))
+                          ingress: ingress,
+                          workspace: try repo.taskWorkspace(id),
+                          subtaskResults: subtaskResults,
+                          acknowledgedSeq: ingress?.lastAcknowledgedSeq,
+                          reviewSeed: reviewSeed)
     }
 
     /// Artifact rows for a task (workshop.listArtifacts).
@@ -334,28 +683,67 @@ public actor CollaborationService {
         try repo.usageSamples(taskID)
     }
 
-    public func readMessages(_ taskID: TaskID, afterSeq: Int64 = 0, limit: Int = 500) throws -> [Message] {
-        try repo.messages(taskID, afterSeq: afterSeq, limit: min(limit, 500))
+    public func readMessages(_ taskID: TaskID, afterSeq: Int64 = 0, limit: Int = 500,
+                             includeSummaries: Bool = false) throws -> [Message] {
+        try repo.messages(taskID, afterSeq: afterSeq, limit: min(limit, 500),
+                          includeSummaries: includeSummaries)
     }
 
     /// T31 paging: newest page when beforeSeq is nil, else the window before it.
     public func readMessagePage(_ taskID: TaskID, beforeSeq: Int64? = nil,
-                                limit: Int = 500) throws -> [Message] {
-        try repo.messagePage(taskID, beforeSeq: beforeSeq, limit: limit)
+                                limit: Int = 500,
+                                includeSummaries: Bool = false) throws -> [Message] {
+        try repo.messagePage(taskID, beforeSeq: beforeSeq, limit: limit,
+                             includeSummaries: includeSummaries)
     }
 
     public func listEngineers() async -> [AdapterProbe] {
         var probes: [AdapterProbe] = []
         for engineer in EngineerID.allCases {
+            var probe: AdapterProbe
             if let adapter = adapters[engineer] {
-                probes.append(await adapter.probe())
+                probe = await adapter.probe()
             } else {
-                probes.append(AdapterProbe(engineer: engineer,
-                                           health: .unavailable("adapter not configured")))
+                probe = AdapterProbe(engineer: engineer,
+                                     health: .unavailable("adapter not configured"))
             }
+            // G-D1: credential canary state prefixes the card; expired or
+            // missing credentials surface as loginRequired with the remedy.
+            if let canary = credentialStatus[engineer] {
+                if canary.state == "expired" || canary.state == "missing" {
+                    probe.health = .loginRequired(
+                        "credentials: \(canary.state) — "
+                            + StartupFailureClass.loginRemedy(for: engineer))
+                } else {
+                    probe.health = EngineerHealth(
+                        probe.health.kind,
+                        detail: "credentials: \(canary.state) — "
+                            + probe.health.detail)
+                }
+            }
+            // G-D2: surface a recent startup failure on the engineer card;
+            // auth failures read as unavailable with a login remedy.
+            if let failure = lastStartupFailure[engineer],
+               now().timeIntervalSince(failure.at) < 1800 {
+                let time = Self.clockTime.string(from: failure.at)
+                if failure.klass == .auth {
+                    probe.health = .unavailable("Login required: \(failure.detail)")
+                } else {
+                    probe.health = EngineerHealth(probe.health.kind,
+                        detail: "\(probe.health.detail) — last start failed "
+                            + "(\(failure.klass.rawValue)) at \(time)")
+                }
+            }
+            probes.append(probe)
         }
         return probes
     }
+
+    private static let clockTime: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     public func outboxEvents(afterSeq: Int64) throws -> [OutboxEvent] {
         try repo.outboxEvents(afterSeq: afterSeq)
@@ -571,10 +959,44 @@ public actor CollaborationService {
     @discardableResult
     public func postMessage(taskID: TaskID, body: String, principal: Principal = .user,
                             kind: MessageKind = .text, replyTo: MessageID? = nil,
-                            structured: String? = nil) throws -> Message {
+                            structured: String? = nil,
+                            idempotencyKey: String? = nil) throws -> Message {
         guard try repo.task(taskID) != nil else { throw WorkshopError.taskNotFound(taskID) }
         if let engineer = principal.engineerID {
             try requireParticipant(engineer, taskID: taskID)
+        }
+        // G-A4: server-side idempotency. Keys are scoped per principal; the
+        // operations row lands in the same transaction as the message.
+        struct AppendPayload: Codable {
+            let task_id: String
+            let body: String
+            let kind: String
+            let reply_to: String?
+        }
+        var operationKey: String?
+        var operationScope: String?
+        var payloadHash: String?
+        if let key = idempotencyKey,
+           !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let scope = principal.engineerID.map { "engineer:" + $0.rawValue }
+                ?? principal.kind
+            let opKey = scope + ":" + key
+            payloadHash = try canonicalJSONHash(of: AppendPayload(
+                task_id: taskID.rawValue, body: body, kind: kind.rawValue,
+                reply_to: replyTo?.rawValue))
+            if let existing = try repo.operation(opKey) {
+                guard existing.principal == scope,
+                      existing.payloadHash == payloadHash!,
+                      let stored = try? JSONDecoder().decode(
+                        [String: String].self, from: Data(existing.resultJSON.utf8)),
+                      let storedID = stored["message_id"],
+                      let storedMessage = try repo.message(MessageID(storedID)) else {
+                    throw WorkshopError.idempotencyConflict
+                }
+                return storedMessage
+            }
+            operationKey = opKey
+            operationScope = scope
         }
         // Codex posts read as the user's entry point: author stays `user` and
         // the channel is recorded in structured (§9.3: display "You (via Codex)").
@@ -590,6 +1012,9 @@ public actor CollaborationService {
             structured = String(decoding: (try? JSONEncoder().encode(fields))
                                     ?? Data(), as: UTF8.self)
         }
+        // D-b: messages posted on the managed lane carry lane provenance.
+        structured = laneStructured(structured, taskID: taskID,
+                                    engineer: principal.engineerID)
         let timestamp = now()
         let messageID = MessageID(newID("msg"))
         var committed: Message?
@@ -604,6 +1029,15 @@ public actor CollaborationService {
                                   payload: #"{"message_id":""# + m.id.rawValue
                                       + #"","task_id":""# + taskID.rawValue + #""}"#,
                                   deliveryState: "pending", at: timestamp)
+            if let operationKey, let operationScope, let payloadHash {
+                let result = String(
+                    decoding: try JSONEncoder().encode(
+                        ["message_id": messageID.rawValue]), as: UTF8.self)
+                try repo.insertOperation(key: operationKey,
+                                         principal: operationScope,
+                                         payloadHash: payloadHash,
+                                         resultJSON: result, at: timestamp)
+            }
             try enqueueWakeups(for: m, at: timestamp)
         }
         publishCommitted()
@@ -629,19 +1063,29 @@ public actor CollaborationService {
 
     /// workshop_read_messages for an engineer principal.
     public func toolReadMessages(taskID: TaskID, afterSeq: Int64, limit: Int,
+                                 includeSummaries: Bool = false,
                                  principal: Principal) throws -> [Message] {
         if let engineer = principal.engineerID {
             try requireParticipant(engineer, taskID: taskID)
         }
         // Provisional-seq rows are still streaming; engineers never see them.
-        return try repo.messages(taskID, afterSeq: afterSeq, limit: limit)
+        let found = try repo.messages(taskID, afterSeq: afterSeq, limit: limit,
+                                      includeSummaries: includeSummaries)
             .filter { $0.deliveryState == .committed }
+        // G-A3: every Codex read advances the task's acknowledged cursor.
+        if principal == .codex, let maxSeq = found.last?.seq,
+           try repo.taskIngress(taskID) != nil {
+            try repo.acknowledgeIngressSeq(taskID, seq: maxSeq)
+        }
+        return found
     }
 
     /// workshop_post_message: kind text|proposal|review|help_request|decision;
     /// help_request posts as text with a structured flag.
     public func toolPostMessage(taskID: TaskID, body: String, kind: String,
-                                replyTo: MessageID?, principal: Principal) throws -> Message {
+                                replyTo: MessageID?,
+                                idempotencyKey: String? = nil,
+                                principal: Principal) throws -> Message {
         let messageKind: MessageKind
         var structured: String?
         switch kind {
@@ -649,17 +1093,21 @@ public actor CollaborationService {
             messageKind = .text
             structured = #"{"help_request":true}"#
         case let raw:
-            guard let parsed = MessageKind(rawValue: raw), parsed != .systemEvent else {
+            guard let parsed = MessageKind(rawValue: raw),
+                  parsed != .systemEvent, parsed != .turnSummary else {
                 throw WorkshopError.invalidRequest("unsupported kind: \(raw)")
             }
             messageKind = parsed
         }
         return try postMessage(taskID: taskID, body: body, principal: principal,
-                               kind: messageKind, replyTo: replyTo, structured: structured)
+                               kind: messageKind, replyTo: replyTo,
+                               structured: structured,
+                               idempotencyKey: idempotencyKey)
     }
 
     /// workshop_request_review: posts a review-request message and wakes the target.
     public func toolRequestReview(taskID: TaskID, reviewer: EngineerID, message: String,
+                                  idempotencyKey: String? = nil,
                                   principal: Principal) throws -> Message {
         if let engineer = principal.engineerID {
             try requireParticipant(engineer, taskID: taskID)
@@ -672,7 +1120,8 @@ public actor CollaborationService {
             as: UTF8.self)
         return try postMessage(taskID: taskID,
                                body: "@\(reviewer.rawValue) \(message)",
-                               principal: principal, kind: .review, structured: structured)
+                               principal: principal, kind: .review, structured: structured,
+                               idempotencyKey: idempotencyKey)
     }
 
     /// workshop_get_capacity: real per-bucket snapshots (§10, T14).
@@ -764,11 +1213,24 @@ public actor CollaborationService {
             throw WorkshopError.invalidRequest(
                 "generation required (ownership_generation from the packet)")
         }
-        // T06: idempotent retry returns the original structured message.
-        if let existing = try repo.resultMessage(taskID: taskID,
-                                                 subtaskID: subtaskID,
-                                                 generation: generation) {
-            return existing
+        // T06: a byte-identical retry while the subtask is still in review
+        // returns the existing revision; anything else creates revision N+1.
+        let results = try repo.resultMessages(taskID: taskID, subtaskID: subtaskID)
+        if let latestForGeneration = results.last(where: {
+            guard let text = $0.structured,
+                  let s = try? JSONDecoder().decode(JSONValue.self,
+                                                    from: Data(text.utf8))
+            else { return false }
+            return s["generation"]?.intValue == Int64(generation)
+        }), try repo.subtask(subtaskID)?.state == .review {
+            let s = try? JSONDecoder().decode(
+                JSONValue.self, from: Data(latestForGeneration.structured?.utf8 ?? "".utf8))
+            let sameArtifacts = s?["artifact_ids"]?.arrayValue?
+                .compactMap { $0.stringValue } == artifactIDs
+            let sameValidation = s?["validation"]?.arrayValue == validation
+            if latestForGeneration.body == summary && sameArtifacts && sameValidation {
+                return latestForGeneration
+            }
         }
         guard let subtask = try repo.subtask(subtaskID), subtask.taskID == taskID,
               subtask.ownerID == engineer else {
@@ -784,14 +1246,18 @@ public actor CollaborationService {
                                                 current: subtask.generation)
         }
         let timestamp = now()
+        let revision = results.count + 1
+        let superseded = results.last
         let structured = String(
-            decoding: try JSONEncoder().encode(JSONValue.object([
+            decoding: try JSONEncoder().encode(JSONValue.object(laneFields([
                 "type": .string("result"),
                 "subtask_id": .string(subtaskID.rawValue),
                 "generation": .number(Double(subtask.generation)),
                 "artifact_ids": .array(artifactIDs.map { .string($0) }),
                 "validation": .array(validation),
-            ])), as: UTF8.self)
+                "revision": .number(Double(revision)),
+                "supersedes": superseded.map { .string($0.id.rawValue) } ?? .null,
+            ], taskID: taskID, engineer: engineer))), as: UTF8.self)
         var committed: Message?
         try repo.db.transaction {
             let m = Message(id: MessageID(newID("msg")), taskID: taskID,
@@ -801,13 +1267,17 @@ public actor CollaborationService {
             try repo.insertMessage(m)
             committed = m
             try repo.updateSubtaskState(subtaskID, .review, at: timestamp)
+            try repo.updateSubtaskVerification(subtaskID, "pending", at: timestamp)
             if let task = try repo.task(taskID), task.state == .working {
                 try transition(taskID, from: .working, to: .verifying, at: timestamp)
             }
             try repo.insertMessage(Message(
                 id: MessageID(newID("msg")), taskID: taskID,
                 seq: try repo.nextMessageSeq(taskID), author: .system,
-                kind: .systemEvent, body: "Owner reported complete; verification pending",
+                kind: .systemEvent,
+                body: revision == 1
+                    ? "Owner reported complete; verification pending"
+                    : "Owner reported result revision \(revision); verification pending",
                 deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
             try repo.insertOutbox(taskID: taskID, eventType: "message.committed",
                                   payload: #"{"message_id":""# + m.id.rawValue
@@ -816,6 +1286,7 @@ public actor CollaborationService {
         }
         publishCommitted()
 
+        var woken = Set<EngineerID>()
         // Proportional review (§5.5): high-risk or research tasks get a
         // verifier ≠ owner; prefer Devin when it isn't the owner.
         if subtask.risk == "high" || task.phase == .researchProposal,
@@ -839,8 +1310,33 @@ public actor CollaborationService {
                     taskID: taskID, engineerID: verifier,
                     reason: "verify_result:" + resultMessage.id.rawValue,
                     triggerSeq: resultMessage.seq, at: now())
+                woken.insert(verifier)
                 scheduleWakeupCoalescer()
             }
+        }
+        // A re-report supersedes a result that earned needs_changes: every
+        // reviewer who requested changes on the superseded message is asked
+        // to verify the new revision.
+        if revision > 1, let resultMessage = committed, let superseded {
+            var reviewers = Set<EngineerID>()
+            for m in try repo.messages(taskID) where m.kind == .review {
+                guard let author = m.author.engineerID, author != engineer,
+                      let s = m.structured,
+                      let value = try? JSONDecoder().decode(JSONValue.self,
+                                                            from: Data(s.utf8)),
+                      value["type"]?.stringValue == "review",
+                      value["proposal_id"]?.stringValue == superseded.id.rawValue,
+                      ["needs_changes", "disagree"]
+                          .contains(value["disposition"]?.stringValue) else { continue }
+                reviewers.insert(author)
+            }
+            for reviewer in reviewers.subtracting(woken) {
+                _ = try repo.insertWakeup(
+                    taskID: taskID, engineerID: reviewer,
+                    reason: "verify_result:" + resultMessage.id.rawValue,
+                    triggerSeq: resultMessage.seq, at: now())
+            }
+            if !reviewers.subtracting(woken).isEmpty { scheduleWakeupCoalescer() }
         }
         return committed!
     }
@@ -937,11 +1433,16 @@ public actor CollaborationService {
     /// Unified entry point for the §8.3 collaboration tools — used by the IPC
     /// daemon, the workshop-mcp bridge, and the DeepSeek tool loop. Author
     /// identity always comes from `principal`, never from args.
-    /// Tools the Codex principal may call (§9.3, ADR 0015): task entry and
-    /// read/follow-up only — approvals, allocation, acceptance stay user-only.
-    private static let codexTools: Set<String> = [
+    /// Codex may also select and read a digest-verified review seed for a task
+    /// it originated. This never promotes files or accepts work.
+    // Any change here requires an ADR 0015 revision
+    // (docs/adr/0015-codex-principal-authority.md); pinned by
+    // CodexBridgeTests.testCodexAllowlistMatchesADR0015.
+    static let codexTools: Set<String> = [
         "workshop_create_task", "workshop_list_tasks", "workshop_get_task",
         "workshop_read_messages", "workshop_post_message",
+        "workshop_select_review_seed", "workshop_read_review_file",
+        "workshop_wait_for_events",
     ]
 
     /// Set by the daemon after verifying `workshop://` is registered to
@@ -1001,7 +1502,12 @@ public actor CollaborationService {
             let id = TaskID(args["task_id"]?.stringValue ?? "")
             return try .from(try toolReadMessages(
                 taskID: id, afterSeq: args["after_seq"]?.intValue ?? 0,
-                limit: Int(args["limit"]?.intValue ?? 200), principal: principal))
+                limit: Int(args["limit"]?.intValue ?? 200),
+                includeSummaries: args["include_summaries"].flatMap {
+                    if case .bool(let b) = $0 { return b }
+                    return nil
+                } ?? false,
+                principal: principal))
         case "workshop_post_message":
             let id = TaskID(args["task_id"]?.stringValue ?? "")
             guard let body = args["body"]?.stringValue else {
@@ -1010,7 +1516,14 @@ public actor CollaborationService {
             return try .from(try toolPostMessage(
                 taskID: id, body: body, kind: args["kind"]?.stringValue ?? "text",
                 replyTo: args["reply_to"]?.stringValue.map { MessageID($0) },
+                idempotencyKey: args["idempotency_key"]?.stringValue,
                 principal: principal))
+        case "workshop_wait_for_events":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            return try await waitForEvents(
+                taskID: id, afterSeq: args["after_seq"]?.intValue ?? 0,
+                timeoutSeconds: args["timeout_seconds"]?.intValue.map { Int($0) },
+                principal: principal)
         case "workshop_request_review":
             let id = TaskID(args["task_id"]?.stringValue ?? "")
             guard let reviewerRaw = args["reviewer"]?.stringValue,
@@ -1018,8 +1531,28 @@ public actor CollaborationService {
                   let message = args["message"]?.stringValue else {
                 throw WorkshopError.invalidRequest("reviewer and message required")
             }
-            return try .from(try toolRequestReview(taskID: id, reviewer: reviewer,
-                                                   message: message, principal: principal))
+            return try .from(try toolRequestReview(
+                taskID: id, reviewer: reviewer, message: message,
+                idempotencyKey: args["idempotency_key"]?.stringValue,
+                principal: principal))
+        case "workshop_select_review_seed":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            guard let engineerRaw = args["engineer"]?.stringValue,
+                  let engineer = EngineerID(rawValue: engineerRaw),
+                  let generationID = args["generation_id"]?.stringValue,
+                  let digest = args["verified_digest"]?.stringValue else {
+                throw WorkshopError.invalidRequest("engineer, generation_id and verified_digest required")
+            }
+            try selectReviewSeed(taskID: id, engineer: engineer,
+                                 generationID: generationID,
+                                 verifiedDigest: digest, principal: principal)
+            return .object(["selected": .bool(true)])
+        case "workshop_read_review_file":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            guard let path = args["path"]?.stringValue else {
+                throw WorkshopError.invalidRequest("path required")
+            }
+            return try readReviewFile(taskID: id, path: path, principal: principal)
         case "workshop_publish_artifact":
             let id = TaskID(args["task_id"]?.stringValue ?? "")
             guard let path = args["path"]?.stringValue else {
@@ -1136,6 +1669,9 @@ public actor CollaborationService {
     /// Compute wakeup targets for a committed message and insert pending rows.
     /// Must be called inside the committing transaction.
     private func enqueueWakeups(for message: Message, at timestamp: Date) throws {
+        // Turn summaries never wake — even a "@kimi" inside one is output
+        // recap, not a call to act.
+        if message.kind == .turnSummary { return }
         let participants = try repo.participants(message.taskID)
         let participantIDs = Set(participants.map(\.engineerID))
         var targets: [(EngineerID, String)] = []
@@ -1146,19 +1682,18 @@ public actor CollaborationService {
         case .codex:
             return // stored as .user with via=codex; never a row author
         case .user:
-            // A user reply wakes the current owner (T10).
-            if let owner = try repo.subtasks(message.taskID).lazy
+            // @mentions in a user message wake the mentioned participants
+            // directly; an unaddressed user message wakes the owner (T10).
+            let mentioned = participants.map(\.engineerID).filter {
+                message.body.contains("@\($0.rawValue)")
+            }
+            if !mentioned.isEmpty {
+                for engineer in mentioned {
+                    targets.append((engineer, "user_mention"))
+                }
+            } else if let owner = try repo.subtasks(message.taskID).lazy
                 .compactMap(\.ownerID).first, participantIDs.contains(owner) {
                 targets.append((owner, "user_message"))
-            }
-            // Explicit @mentions of participants wake them too — the compose UI
-            // advertises "@mention an engineer" and the mentioned turn runs as
-            // read-only discussion, so this cannot grant write reach.
-            for engineer in EngineerID.allCases
-            where message.body.contains("@\(engineer.rawValue)")
-                && participantIDs.contains(engineer)
-                && !targets.contains(where: { $0.0 == engineer }) {
-                targets.append((engineer, "mention"))
             }
         case .engineer(let author):
             // Explicit @mentions of other participants.
@@ -1181,9 +1716,9 @@ public actor CollaborationService {
         }
 
         for (engineer, reason) in targets {
-            // Loop bound (T11): suppress after N consecutive engineer-triggered
-            // wakeups without an intervening user message. User messages always go.
-            if reason != "user_message",
+            // Loop bound (T11): suppress after N substantive engineer turns
+            // without an intervening user message. User messages always go.
+            if !["user_message", "user_mention"].contains(reason),
                try repo.engineerWakeupsSinceLastUserMessage(message.taskID) >= wakeupLoopBound {
                 try repo.insertWakeup(taskID: message.taskID, engineerID: engineer,
                                       reason: reason, triggerSeq: message.seq,
@@ -1194,7 +1729,7 @@ public actor CollaborationService {
                                   reason: reason, triggerSeq: message.seq, at: timestamp)
         }
         // One system event per task when suppression kicks in.
-        if targets.contains(where: { $0.1 != "user_message" }),
+        if targets.contains(where: { !["user_message", "user_mention"].contains($0.1) }),
            try repo.engineerWakeupsSinceLastUserMessage(message.taskID) >= wakeupLoopBound,
            !(try repo.messages(message.taskID).contains {
                $0.body == "Discussion round limit reached; waiting for user" }) {
@@ -1221,10 +1756,32 @@ public actor CollaborationService {
         }
         defer { wakeupScheduled = false }
         while !isShutdown {
-            guard let pending = attempt("pendingWakeups", { try repo.pendingWakeups() }),
-                  !pending.isEmpty else { break }
+            let pending = attempt("pendingWakeups", { try repo.pendingWakeups() }) ?? []
+            if pending.isEmpty {
+                // Only deferred retries may remain: sleep until the earliest
+                // is due — in slices so newly inserted work is still picked
+                // up promptly — instead of exiting.
+                guard var next = attempt("earliestDeferredWakeup", {
+                    try repo.earliestDeferredWakeup(at: now())
+                }) ?? nil else { break }
+                let sliceMs = max(20, Int64(
+                    Self.durationSeconds(wakeupCoalescence) * 1000))
+                while !isShutdown, next > now() {
+                    let waitMs = max(20, Int64(
+                        next.timeIntervalSince(now()) * 1000))
+                    try? await Task.sleep(for: .milliseconds(min(waitMs, sliceMs)))
+                    guard (attempt("pendingWakeups", {
+                        try repo.pendingWakeups() }) ?? []).isEmpty else { break }
+                    guard let later = attempt("earliestDeferredWakeup", {
+                        try repo.earliestDeferredWakeup(at: now())
+                    }) ?? nil else { break }
+                    next = later
+                }
+                continue
+            }
             var groups: [String: (taskID: TaskID, engineer: EngineerID,
-                                 reasons: [String], rows: [Int64])] = [:]
+                                 reasons: [String],
+                                 rows: [WorkshopRepository.Wakeup])] = [:]
             var order: [String] = []
             for row in pending {
                 let key = row.taskID.rawValue + ":" + row.engineerID.rawValue
@@ -1232,7 +1789,7 @@ public actor CollaborationService {
                     groups[key] = (row.taskID, row.engineerID, [], [])
                     order.append(key)
                 }
-                groups[key]!.rows.append(row.id)
+                groups[key]!.rows.append(row)
                 groups[key]!.reasons.append(row.reason)
             }
             var anyPending = false
@@ -1241,45 +1798,39 @@ public actor CollaborationService {
                 if runningTurns.contains(key) { anyPending = true; continue }
                 let task: WorkshopTask? = attempt("wakeupTask",
                                                   { try repo.task(group.taskID) }) ?? nil
-                guard let adapter = adapters[group.engineer], let task else {
-                    for id in group.rows {
+                guard let task else {
+                    for row in group.rows {
                         _ = attempt("wakeupSuppressed",
-                                    { try repo.setWakeupState(id, "suppressed",
+                                    { try repo.setWakeupState(row.id, "suppressed",
                                                               at: now()) })
                     }
                     continue
                 }
+                guard let adapter = adapters[group.engineer] else {
+                    deferWakeups(rows: group.rows, taskID: task.id,
+                                 engineer: group.engineer,
+                                 detail: "adapter not configured",
+                                 reasons: group.reasons)
+                    continue
+                }
+                // The probe is advisory: an unavailable engineer is retried
+                // with bounded backoff rather than dropped.
                 let probe = await adapter.probe()
                 guard probe.health.kind == .available else {
-                    for id in group.rows {
-                        _ = attempt("wakeupSuppressed",
-                                    { try repo.setWakeupState(id, "suppressed",
-                                                              at: now()) })
-                    }
-                    let timestamp = now()
-                    let unavailableBody: String
-                    if group.reasons.contains("consolidate") {
-                        // §5.3: no other engineer is promoted to arbiter.
-                        unavailableBody = "Consolidated report waits for "
-                            + "\(group.engineer.displayName) (unavailable: "
-                            + "\(probe.health.detail)) or a user override"
-                    } else {
-                        unavailableBody = "\(group.engineer.rawValue.capitalized) was "
-                            + "mentioned but is \(probe.health.detail); not woken"
-                    }
-                    _ = attempt("wakeupUnavailableEvent") {
-                        try repo.insertMessage(Message(
-                            id: MessageID(newID("msg")), taskID: task.id,
-                            seq: try repo.nextMessageSeq(task.id), author: .system,
-                            kind: .systemEvent, body: unavailableBody,
-                            deliveryState: .committed, createdAt: timestamp,
-                            updatedAt: timestamp))
-                    }
+                    // §5.3: no other engineer is promoted to arbiter — the
+                    // consolidated report keeps waiting on its owner.
+                    let prefix = group.reasons.contains("consolidate")
+                        ? "Consolidated report waits for \(group.engineer.displayName) (unavailable: \(probe.health.detail)) or a user override"
+                        : nil
+                    deferWakeups(rows: group.rows, taskID: task.id,
+                                 engineer: group.engineer,
+                                 detail: probe.health.detail,
+                                 reasons: group.reasons, eventPrefix: prefix)
                     continue
                 }
-                for id in group.rows {
+                for row in group.rows {
                     _ = attempt("wakeupRunning",
-                                { try repo.setWakeupState(id, "running", at: now()) })
+                                { try repo.setWakeupState(row.id, "running", at: now()) })
                 }
                 let owned: Subtask? = attempt("wakeupSubtask", {
                     try repo.latestOwnedSubtask(taskID: task.id, owner: group.engineer)
@@ -1287,22 +1838,188 @@ public actor CollaborationService {
                 let fallback: Subtask? = attempt("wakeupFallbackSubtask", {
                     try repo.subtasks(task.id).first
                 }) ?? nil
-                await runTurn(adapter: adapter, engineer: group.engineer, task: task,
-                              subtask: owned ?? fallback,
-                              wakeReason: group.reasons.last)
-                for id in group.rows {
-                    _ = attempt("wakeupDone",
-                                { try repo.setWakeupState(id, "done", at: now()) })
+                // G-C4: while the owner's revision is open (claimed/working),
+                // a discussion-shaped reason in the group is coalesced into
+                // the authoritative writer turn — prefer it over unrelated
+                // trailing reasons so the turn isn't run as read-only.
+                let ownedOpenRevision = owned.map {
+                    $0.ownerID == group.engineer
+                        && ($0.state == .claimed || $0.state == .working)
+                } ?? false
+                let outcome = await runTurn(adapter: adapter, engineer: group.engineer,
+                                            task: task,
+                                            subtask: owned ?? fallback,
+                                            wakeReason: group.reasons.first {
+                                                ["assigned", "resumed", "changes_requested",
+                                                 "changes_requested_retry",
+                                                 "report_requested"].contains($0)
+                                            } ?? (ownedOpenRevision ? group.reasons.first {
+                                                ["mention", "user_message", "user_mention",
+                                                 "review_request"].contains(
+                                                    $0.split(separator: ":").first
+                                                        .map(String.init) ?? $0)
+                                            } : nil) ?? group.reasons.last)
+                switch outcome {
+                case .completed(let substantive):
+                    for row in group.rows {
+                        _ = attempt("wakeupDone",
+                                    { try repo.setWakeupState(
+                                        row.id, substantive ? "done" : "silent",
+                                        at: now()) })
+                    }
+                    if !substantive {
+                        let timestamp = now()
+                        _ = attempt("silentTurnEvent") {
+                            try repo.insertMessage(Message(
+                                id: MessageID(newID("msg")), taskID: task.id,
+                                seq: try repo.nextMessageSeq(task.id),
+                                author: .system, kind: .systemEvent,
+                                body: "\(group.engineer.displayName) turn ended "
+                                    + "without a message or tool call (silent)",
+                                deliveryState: .committed, createdAt: timestamp,
+                                updatedAt: timestamp))
+                        }
+                        publishCommitted()
+                    }
+                case .failedToStart(let detail):
+                    lastStartupFailure[group.engineer] =
+                        (StartupFailureClass.classify(detail), detail, now())
+                    deferWakeups(rows: group.rows, taskID: task.id,
+                                 engineer: group.engineer, detail: detail,
+                                 reasons: group.reasons,
+                                 eventPrefix: "Turn could not start for "
+                                     + "\(group.engineer.displayName): \(detail)")
+                case .failed:
+                    for row in group.rows {
+                        _ = attempt("wakeupFailed",
+                                    { try repo.setWakeupState(row.id, "failed",
+                                                              at: now()) })
+                    }
                 }
             }
-            // Another batch may have arrived while we ran turns; loop if so, else exit.
+            // Another batch may have arrived while we ran turns; loop if so.
             if !anyPending {
                 let more = attempt("pendingWakeups", { try repo.pendingWakeups() }) ?? []
-                if more.isEmpty { break }
+                if more.isEmpty {
+                    // Deferred retries are handled by the top-of-loop wait.
+                    if (attempt("earliestDeferredWakeup", {
+                        try repo.earliestDeferredWakeup(at: now())
+                    }) ?? nil) == nil { break }
+                    continue
+                }
             }
             // In-flight turn groups stay pending; don't busy-poll them.
             try? await Task.sleep(for: max(wakeupCoalescence, .milliseconds(20)))
         }
+    }
+
+    /// Bounded launch retry: re-queue the group's wakeup rows with backoff
+    /// and narrate the wait; after the schedule is exhausted mark them
+    /// `launch_failed` once. The event text is `eventPrefix` + retry suffix,
+    /// or the default "Waiting for …" form.
+    private func deferWakeups(rows: [WorkshopRepository.Wakeup], taskID: TaskID,
+                              engineer: EngineerID, detail: String,
+                              reasons: [String] = [],
+                              eventPrefix: String? = nil) {
+        let timestamp = now()
+        let attempt = (rows.map(\.attempt).max() ?? 0) + 1
+        // G-D2: classify the failure; authentication failures cannot be cured
+        // by retrying, so they get a single deferred retry only.
+        let klass = StartupFailureClass.classify(detail)
+        let shortDetail = String(detail.prefix(200))
+        let maxAttempts = klass == .auth ? 1 : wakeupRetryBackoff.count
+        if attempt <= maxAttempts {
+            let delay = wakeupRetryBackoff[attempt - 1]
+            let notBefore = timestamp.addingTimeInterval(Self.durationSeconds(delay))
+            for row in rows {
+                _ = self.attempt("wakeupDefer", {
+                    try repo.deferWakeup(row.id, attempt: attempt,
+                                         notBefore: notBefore, at: timestamp) })
+            }
+            let prefix = eventPrefix
+                ?? "Waiting for \(engineer.displayName) (\(klass.rawValue): "
+                    + "\(shortDetail))"
+            _ = self.attempt("wakeupDeferEvent") {
+                try repo.insertMessage(Message(
+                    id: MessageID(newID("msg")), taskID: taskID,
+                    seq: try repo.nextMessageSeq(taskID), author: .system,
+                    kind: .systemEvent,
+                    body: "\(prefix); retry \(attempt)/\(maxAttempts) in "
+                        + Self.humanDuration(delay),
+                    deliveryState: .committed, createdAt: timestamp,
+                    updatedAt: timestamp))
+            }
+        } else {
+            // The startup never reached a prompt on any attempt. For an
+            // execution/owner wakeup, preserve the candidate and expose
+            // recovery immediately instead of leaving the task working.
+            let ownerReasons: Set<String> = ["assigned", "resumed",
+                "changes_requested", "changes_requested_retry",
+                "report_requested", "user_message", "user_mention"]
+            let ownerSubtask: Subtask? = reasons.contains(where: ownerReasons.contains)
+                ? (self.attempt("deferOwnedSubtask", {
+                    try repo.latestOwnedSubtask(taskID: taskID, owner: engineer)
+                }) ?? nil)
+                : nil
+            for row in rows {
+                _ = self.attempt("wakeupLaunchFailed", {
+                    try repo.setWakeupState(row.id, "launch_failed",
+                                            at: timestamp) })
+            }
+            _ = self.attempt("wakeupLaunchFailedEvent") {
+                try repo.db.transaction {
+                    var body: String
+                    if klass == .auth {
+                        body = "Login required for \(engineer.displayName): "
+                            + "\(shortDetail). Fix: "
+                            + StartupFailureClass.loginRemedy(for: engineer)
+                            + "; then mention the engineer again."
+                    } else {
+                        body = "Could not start \(engineer.displayName) after "
+                            + "\(maxAttempts) attempts: \(shortDetail); will "
+                            + "retry on the next message or resume"
+                    }
+                    if let subtask = ownerSubtask {
+                        try repo.updateSubtaskState(subtask.id, .blocked,
+                                                    at: timestamp)
+                        if let current = try repo.task(taskID),
+                           current.state.canTransition(to: .blocked) {
+                            try transition(taskID, from: current.state,
+                                           to: .blocked, at: timestamp)
+                        }
+                        body += ". Owner startup failed before execution; "
+                            + "generation \(subtask.generation) and proposal "
+                            + "preserved for recovery"
+                    }
+                    try repo.insertMessage(Message(
+                        id: MessageID(newID("msg")), taskID: taskID,
+                        seq: try repo.nextMessageSeq(taskID), author: .system,
+                        kind: .systemEvent, body: body,
+                        deliveryState: .committed, createdAt: timestamp,
+                        updatedAt: timestamp))
+                }
+            }
+        }
+        publishCommitted()
+        scheduleWakeupCoalescer()
+    }
+
+    private static func durationSeconds(_ d: Duration) -> TimeInterval {
+        TimeInterval(d.components.seconds)
+            + TimeInterval(d.components.attoseconds) / 1e18
+    }
+
+    /// Human-readable delay for retry events: "30 s", "2 min", "50 ms".
+    private static func humanDuration(_ d: Duration) -> String {
+        let s = durationSeconds(d)
+        if s >= 60, s.truncatingRemainder(dividingBy: 60) == 0 {
+            return "\(Int(s / 60)) min"
+        }
+        if s >= 1 {
+            return s.rounded() == s ? "\(Int(s)) s"
+                : String(format: "%.1f s", s)
+        }
+        return "\(Int((s * 1000).rounded())) ms"
     }
 
     // MARK: - Recovery
@@ -1354,6 +2071,32 @@ public actor CollaborationService {
             }
         }
         publishCommitted()
+    }
+
+    /// A process can fail before a revision turn row is created. The wakeup
+    /// was consumed, but the reviewed subtask still needs its writer turn.
+    private func recoverUnstartedChangeRequests() {
+        let timestamp = now()
+        _ = attempt("recoverUnstartedChangeRequests") {
+            let rows = try repo.db.query("""
+                SELECT s.task_id,s.owner_id FROM subtasks s
+                JOIN tasks t ON t.id=s.task_id
+                WHERE s.verification='changes_requested' AND s.state='working'
+                  AND t.state='working' AND s.owner_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM wakeups w WHERE w.task_id=s.task_id
+                      AND w.engineer_id=s.owner_id AND w.state IN ('pending','running')
+                      AND w.reason IN ('changes_requested','changes_requested_retry'))
+                """)
+            for row in rows {
+                guard let task = row["task_id"]?.text,
+                      let owner = row["owner_id"]?.text,
+                      let engineer = EngineerID(rawValue: owner) else { continue }
+                try repo.insertWakeup(taskID: TaskID(task), engineerID: engineer,
+                                      reason: "changes_requested", triggerSeq: nil,
+                                      at: timestamp)
+            }
+        }
     }
 
     // MARK: - Dispatcher
@@ -1509,20 +2252,52 @@ public actor CollaborationService {
         try repo.updateTaskState(taskID, state, at: now())
     }
 
+    /// Test hook: this engineer's task-memory turn records (oldest first).
+    public func taskMemoryForTest(taskID: TaskID,
+                                  engineer: EngineerID) throws -> [TurnRecord] {
+        try repo.taskMemory(taskID: taskID, engineerID: engineer)
+    }
+
+    /// Qualification hook: newest sealed/review_only snapshot path for
+    /// (task, engineer), nil while the turn is still writing. `sealedOnly`
+    /// requires an authoritative writer generation (not a review copy).
+    public func writerSnapshotPath(taskID: TaskID, engineer: EngineerID,
+                                   sealedOnly: Bool = false) throws -> String? {
+        let states = sealedOnly ? "('sealed')" : "('sealed','review_only')"
+        return try repo.db.query("""
+            SELECT snapshot_path FROM writer_generations
+            WHERE task_id=? AND engineer=?
+              AND state IN \(states) AND snapshot_path IS NOT NULL
+            ORDER BY rowid DESC LIMIT 1
+            """, [.text(taskID.rawValue), .text(engineer.rawValue)])
+            .first?["snapshot_path"]?.text
+    }
+
+    /// Test hook: the newest writer-generation state for (task, engineer).
+    public func writerGenerationStateForTest(taskID: TaskID,
+                                             engineer: EngineerID) throws -> String? {
+        try repo.db.query("""
+            SELECT state FROM writer_generations
+            WHERE task_id=? AND engineer=? ORDER BY rowid DESC LIMIT 1
+            """, [.text(taskID.rawValue), .text(engineer.rawValue)])
+            .first?["state"]?.text
+    }
+
     /// Run a turn directly (no dispatch); concurrent=true detaches it.
     public func runTurnForTest(engineer: EngineerID, taskID: TaskID,
-                               concurrent: Bool = false) async {
+                               concurrent: Bool = false,
+                               wakeReason: String = "assigned") async {
         guard let adapter = adapters[engineer],
               let task = try? repo.task(taskID) else { return }
         let sub = try? repo.latestOwnedSubtask(taskID: taskID, owner: engineer)
         if concurrent {
             Task {
                 await self.runTurn(adapter: adapter, engineer: engineer,
-                                   task: task, subtask: sub, wakeReason: "assigned")
+                                   task: task, subtask: sub, wakeReason: wakeReason)
             }
         } else {
             await runTurn(adapter: adapter, engineer: engineer, task: task,
-                          subtask: sub, wakeReason: "assigned")
+                          subtask: sub, wakeReason: wakeReason)
         }
     }
 
@@ -1683,11 +2458,26 @@ public actor CollaborationService {
             subtask = reloaded
         }
 
-        // Run the turn outside the claim transaction.
+        // Run the turn outside the claim transaction. A launch failure
+        // re-queues through the wakeup path so it gets the bounded backoff.
         inflightTurns += 1
         defer { inflightTurns -= 1 }
-        await runTurn(adapter: adapter, engineer: winner, task: task, subtask: subtask,
-                      wakeReason: nil)
+        let outcome = await runTurn(adapter: adapter, engineer: winner,
+                                    task: task, subtask: subtask, wakeReason: nil)
+        if case .failedToStart(let detail) = outcome,
+           let rowID = attempt("dispatchRetryWakeup", {
+               try repo.insertWakeup(taskID: taskID, engineerID: winner,
+                                     reason: "assigned", triggerSeq: nil,
+                                     at: now())
+           }) {
+            deferWakeups(rows: [WorkshopRepository.Wakeup(
+                id: rowID, taskID: taskID, engineerID: winner,
+                reason: "assigned", triggerSeq: nil, state: "pending",
+                createdAt: now(), notBefore: nil, attempt: 0)],
+                taskID: taskID, engineer: winner, detail: detail,
+                reasons: ["assigned"],
+                eventPrefix: "Turn could not start for \(winner.displayName): \(detail)")
+        }
         return nil
     }
 
@@ -1695,10 +2485,15 @@ public actor CollaborationService {
         guard let homeDir else { return nil }
         let stored = try repo.taskWorkspace(taskID)
         if let stored, stored.state == "snapshot" {
-            guard let row = try repo.db.query("SELECT digest FROM writer_generations WHERE task_id=? AND snapshot_path=? AND state='accepted'", [.text(taskID.rawValue), .text(stored.path)]).first,
-                  try SafeTree.digest(stored.path) == row["digest"]?.text else {
+            guard let row = try repo.db.query("SELECT id,digest FROM writer_generations WHERE task_id=? AND snapshot_path=? AND state='accepted'", [.text(taskID.rawValue), .text(stored.path)]).first,
+                  let storedDigest = row["digest"]?.text,
+                  let generationID = row["id"]?.text else {
                 throw WorkshopError.invalidRequest("Accepted snapshot changed or is unavailable")
             }
+            _ = try WriterGenerations(db: repo.db, home: homeDir)
+                .verifyOrUpgradeDigest(snapshotPath: stored.path,
+                                       storedDigest: storedDigest,
+                                       generationID: generationID)
             return stored
         }
         if let stored {
@@ -1756,16 +2551,25 @@ public actor CollaborationService {
         var usage: UsageSample?
     }
 
-    /// Run one adapter turn. `wakeReason == nil` is the owner-execution turn
-    /// (subtask → review, task → verifying on success); non-nil is a discussion
-    /// wakeup turn which only commits a reply message.
+    /// Result of one adapter turn, consumed by the wakeup coalescer to
+    /// classify its wakeup rows: substantive turns count as discussion
+    /// rounds; silent turns and failed launches do not.
+    enum TurnOutcome: Sendable {
+        case completed(substantive: Bool)
+        case failedToStart(String)
+        case failed(String)
+    }
+
+    /// Run one adapter turn. Assigned/resumed/change-requested owner turns are
+    /// execution turns; user-message and peer wakeups are discussion turns.
+    @discardableResult
     private func runTurn(adapter: EngineerAdapter, engineer: EngineerID,
                          task: WorkshopTask, subtask: Subtask?,
-                         wakeReason: String?) async {
+                         wakeReason: String?) async -> TurnOutcome {
         let ingress: TaskIngress?
         do { ingress = try repo.taskIngress(task.id) } catch {
             blockInvalidIngress(task.id)
-            return
+            return .failed("task ingress could not be decoded")
         }
         let schemaV2 = ingress?.request.schemaVersion == 2
         // Execution turns (owner dispatch: nil/assigned/resumed/changes_requested)
@@ -1774,8 +2578,24 @@ public actor CollaborationService {
         // (mentions, research, reviews, reports) run on an explicitly read-only
         // footing: a fenced non-authoritative generation that seals to
         // review_only and can never be promoted.
+        // G-C4: while the owner has an open revision (subtask claimed/working),
+        // a discussion-shaped wake coalesces into its authoritative writer
+        // turn — the owner can apply the requested change and reply from the
+        // same turn instead of a read-only discussion copy. Once the subtask
+        // is in review there is nothing to edit and mentions stay discussion.
+        let reasonHead = wakeReason?.split(separator: ":").first.map(String.init)
+        let ownerHasOpenRevision = subtask?.ownerID == engineer
+            && (subtask?.state == .claimed || subtask?.state == .working)
+        let coalescedOwnerTurn = ownerHasOpenRevision
+            && (!schemaV2 || adapter.supportsIsolatedWorkspaceTurns)
+            && reasonHead.map({
+                ["mention", "user_message", "user_mention", "review_request"].contains($0)
+            }) == true
         let executionReason = wakeReason == nil || wakeReason == "assigned"
             || wakeReason == "resumed" || wakeReason == "changes_requested"
+            || wakeReason == "changes_requested_retry"
+            || wakeReason == "report_requested"
+            || coalescedOwnerTurn
         let authoritative = (executionReason && subtask?.ownerID == engineer)
             || (engineer == .devin && subtask == nil && wakeReason == nil)
         if schemaV2, authoritative, !adapter.supportsIsolatedWorkspaceTurns {
@@ -1793,7 +2613,24 @@ public actor CollaborationService {
                 }
             }
             publishCommitted()
-            return
+            return .failed("unqualified adapter for authoritative writer turn")
+        }
+        // G-E5: binary drift is advisory — qualified records stand, but the
+        // first authoritative turn per daemon lifetime notes the change.
+        if schemaV2, authoritative, binaryDrifted.contains(engineer),
+           driftAnnounced.insert(engineer).inserted {
+            let t = now()
+            _ = attempt("binaryDriftNote") {
+                try repo.insertMessage(Message(
+                    id: MessageID(newID("msg")), taskID: task.id,
+                    seq: try repo.nextMessageSeq(task.id), author: .system,
+                    kind: .systemEvent,
+                    body: "\(engineer.displayName) binary changed since its "
+                        + "writer qualification; proceeding on the recorded "
+                        + "qualification",
+                    deliveryState: .committed, createdAt: t, updatedAt: t))
+            }
+            publishCommitted()
         }
         var workspace: TaskWorkspace?
         var writerLease: WriterGenerations.Lease?
@@ -1801,8 +2638,14 @@ public actor CollaborationService {
             workspace = try ensureTaskWorkspace(taskID: task.id, ingress: ingress)
             if schemaV2, let homeDir, let base = workspace {
                 if adapter.usesWorkspaceFilesystem {
+                    // Announce an effective-seed change once per task — the
+                    // same resolution begin() performs just below.
+                    _ = try? reviewSeedForTask(task.id, announce: true)
                     let lease = try WriterGenerations(db: repo.db, home: homeDir).begin(
-                        task: base, engineer: engineer, authoritative: authoritative)
+                        task: base, engineer: engineer, authoritative: authoritative,
+                        seedEngineer: subtask?.ownerID,
+                        reviewSeedOwner: subtask?.ownerID == engineer
+                            || (subtask == nil && engineer == .devin))
                     writerLease = lease
                     workspace = TaskWorkspace(taskID: task.id, repositoryPath: base.repositoryPath,
                         path: lease.path, baseRevision: base.baseRevision,
@@ -1818,20 +2661,22 @@ public actor CollaborationService {
             }
         } catch {
             let timestamp = now()
+            let cause = workshopErrorDescription(error)
             _ = attempt("workspaceBlocked") {
                 try repo.db.transaction {
                     try repo.updateTaskState(task.id, .blocked, at: timestamp)
                     try repo.insertMessage(Message(
                         id: MessageID(newID("msg")), taskID: task.id,
                         seq: try repo.nextMessageSeq(task.id), author: .system, kind: .systemEvent,
-                        body: "Task workspace unavailable; existing files preserved for review",
+                        body: "Task workspace unavailable: \(cause); existing files preserved. Resume the task after the cause is fixed.",
                         createdAt: timestamp, updatedAt: timestamp))
                     try repo.insertOutbox(taskID: task.id, eventType: "task.state_changed",
                                           payload: "{}", deliveryState: "pending", at: timestamp)
                 }
             }
             publishCommitted()
-            return
+            // A hard workspace failure is not transient: no retry announce.
+            return .failed("task workspace unavailable: \(cause)")
         }
         let turnKey = task.id.rawValue + ":" + engineer.rawValue
         runningTurns.insert(turnKey)
@@ -1852,7 +2697,7 @@ public actor CollaborationService {
                 }
                 publishCommitted()
             }
-            return
+            return .failed(block)
         }
         let binding = SessionBinding(taskID: task.id, engineerID: engineer, role: "owner",
                                      workerID: "main", workspace: workspace)
@@ -1877,16 +2722,30 @@ public actor CollaborationService {
                         deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
                 }
                 publishCommitted()
-                return
+                return .failed("legacy instruction profile")
             }
             bound.nativeSessionID = stored.nativeSessionID
             bound.modelSelection = stored.modelSelection
             bound.recoveryState = stored.recoveryState
             storedModelSelection = stored.modelSelection
         }
+        if engineer == .kimi, bound.nativeSessionID != nil {
+            bound.allowedSessionWorkspaces =
+                (try? repo.db.query("SELECT path FROM writer_generations WHERE task_id=? AND engineer=?",
+                                    [.text(task.id.rawValue), .text(engineer.rawValue)]))?
+                    .compactMap { $0["path"]?.text } ?? []
+            // The read-only prior-workspace grant must serve the SAME seed
+            // begin() used — a stale session-index path served pre-edit
+            // bytes through eight verify rounds before this unification.
+            bound.reviewSeedPath = (try? reviewSeedForTask(task.id))?.snapshotPath
+        }
+        // The native session id the adapter was asked to resume (nil → fresh).
+        let requestedNativeSessionID = bound.nativeSessionID
         let ref: SessionRef
         do {
             ref = try await adapter.openTaskSession(binding: bound)
+            lastStartupFailure.removeValue(forKey: engineer)
+            if let sessionOpenedHook { await sessionOpenedHook(engineer) }
             if bound.modelSelection == nil {
                 bound.modelSelection = adapter.modelSelection
             }
@@ -1905,18 +2764,10 @@ public actor CollaborationService {
                 }
             }
         } catch {
+            // The coalescer owns the failure narration: it re-queues the
+            // wakeup rows with bounded backoff and posts the retry event.
             log.error("openTaskSession failed for \(engineer.rawValue, privacy: .public): \(workshopErrorDescription(error), privacy: .public)")
-            _ = attempt("openFailedEvent") {
-                try repo.insertMessage(Message(
-                    id: MessageID(newID("msg")), taskID: task.id,
-                    seq: try repo.nextMessageSeq(task.id), author: .system,
-                    kind: .systemEvent,
-                    body: "Turn could not start for \(engineer.displayName): "
-                        + workshopErrorDescription(error),
-                    deliveryState: .committed, createdAt: timestamp,
-                    updatedAt: timestamp))
-            }
-            return
+            return .failedToStart(workshopErrorDescription(error))
         }
 
         // Streaming placeholder gets a provisional seq (≥ provisionalSeqBase)
@@ -1928,7 +2779,10 @@ public actor CollaborationService {
                     id: messageID, taskID: task.id,
                     seq: try repo.nextProvisionalSeq(),
                     author: .engineer(engineer), kind: .text, body: "",
-                    deliveryState: .streaming, createdAt: timestamp, updatedAt: timestamp))
+                    deliveryState: .streaming,
+                    structured: laneStructured(nil, taskID: task.id,
+                                               engineer: engineer),
+                    createdAt: timestamp, updatedAt: timestamp))
             }
         }
 
@@ -1963,6 +2817,18 @@ public actor CollaborationService {
             truncatedNote = "\(recent.count - 60) older messages omitted"
             recent = Array(recent.suffix(60))
         }
+        // G-D6: also bound the conversation bytes — drop the oldest until the
+        // remaining bodies fit 24 KiB.
+        var droppedForSize = 0
+        while recent.count > 1,
+              recent.reduce(0, { $0 + $1.body.utf8.count }) > 24 * 1024 {
+            recent.removeFirst()
+            droppedForSize += 1
+        }
+        if droppedForSize > 0 {
+            truncatedNote = (truncatedNote.map { $0 + "; " } ?? "")
+                + "\(droppedForSize) older messages omitted for size"
+        }
         let maxSeq = recent.map(\.seq).max() ?? lastRead
 
         var body = ""
@@ -1970,9 +2836,14 @@ public actor CollaborationService {
         var failedReason: String?
         var sawCompletion = false
         var sawUncertain = false
+        var sawSessionNotLoaded = false
         // A pending stop request (pause/cancel/quota-stop) asks the turn to
         // end with a checkpoint — only while a turn is running (§6.3).
         let wantsCheckpoint = checkpointRequested.remove(engineer) != nil
+        // A resumed native session carries provider-side context; a fresh one
+        // relies on the Workshop-owned memory section below.
+        let sessionResumed = requestedNativeSessionID != nil
+            && requestedNativeSessionID == ref.nativeSessionID
         let context = TurnContext(task: task, subtask: subtask,
                                   recentMessages: recent,
                                   wakeReason: wakeReason,
@@ -1981,7 +2852,14 @@ public actor CollaborationService {
                                       engineer: engineer, subtask: subtask),
                                   truncatedNote: truncatedNote,
                                   checkpointRequest: wantsCheckpoint,
-                                  ingress: ingress, workspace: workspace)
+                                  ingress: ingress, workspace: workspace,
+                                  capabilities: workspace?.state == "discussion"
+                                      ? .discussion : .writer,
+                                  memory: taskMemoryPacket(
+                                      task: task, engineer: engineer,
+                                      subtask: subtask,
+                                      sessionResumed: sessionResumed),
+                                  authoritativeOwnerTurn: coalescedOwnerTurn)
         packetInspector?(engineer, context.packetText(for: engineer))
         let turnID = newID("turn")
         runningTurnRefs[turnKey] = (adapter, ref, turnID)
@@ -2046,12 +2924,6 @@ public actor CollaborationService {
                 case .permissionDenied:
                     recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
                                    kind: "permission", title: "Tool permission denied", status: "denied")
-                case .permissionDecision(let tool, let operation, let allowed, let reason, let callID):
-                    recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
-                                   kind: "permission",
-                                   title: "Permission " + (allowed ? "allowed" : "denied")
-                                       + " · " + operation + " · " + reason + " · " + tool,
-                                   status: allowed ? "completed" : "denied", callID: callID)
                 case .authRequired:
                     recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
                                    kind: "status", title: "Authentication required", status: "failed")
@@ -2084,6 +2956,9 @@ public actor CollaborationService {
                     recordActivity(taskID: task.id, turnID: turnID, engineer: engineer,
                                    kind: "status", title: "Provider reported an uncertain outcome", status: "uncertain")
                     sawUncertain = true
+                    if note.localizedCaseInsensitiveContains("could not be loaded") {
+                        sawSessionNotLoaded = true
+                    }
                     _ = attempt("uncertainNote") {
                         let t = now()
                         try repo.insertMessage(Message(
@@ -2108,6 +2983,13 @@ public actor CollaborationService {
                 let candidate = try WriterGenerations(db: repo.db, home: homeDir).seal(writerLease)
                 body += "\n\nWriter proposal sealed for independent verification. No changes promoted. Snapshot: "
                     + candidate.path + "\nSHA-256: " + candidate.digest
+                if writerLease.reviewSeedOwner,
+                   let selected = try repo.db.query(
+                    "SELECT generation_id FROM writer_seed_pins WHERE task_id=?",
+                    [.text(task.id.rawValue)]).first?["generation_id"]?.text,
+                   selected == writerLease.id {
+                    body += "\nThis revised proposal is automatically available in fenced peer review workspaces and through workshop_read_review_file. No user copy or promotion is needed for review."
+                }
             } catch {
                 failedReason = "Writer snapshot failed: " + workshopErrorDescription(error)
             }
@@ -2141,6 +3023,19 @@ public actor CollaborationService {
                     try repo.deleteMessage(messageID)
                 } else {
                     try repo.updateMessageBody(messageID, body: body, at: endTime)
+                    // E3: when the turn already posted through tools, the
+                    // streamed reply is a turn summary — committed with a
+                    // real seq but hidden from packets/cursors/default reads.
+                    let toolPosts = try repo.messages(
+                        task.id, afterSeq: maxSeq, includeSummaries: true)
+                        .filter { $0.author == .engineer(engineer)
+                            && $0.id != messageID
+                            && $0.deliveryState == .committed
+                            && $0.kind != .systemEvent }
+                    if !toolPosts.isEmpty,
+                       !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        try repo.updateMessageKind(messageID, .turnSummary, at: endTime)
+                    }
                     // F1: the placeholder takes its real seq now, so
                     // tool-posted messages from the same turn keep their
                     // earlier seqs.
@@ -2172,7 +3067,7 @@ public actor CollaborationService {
                         kind: .systemEvent, body: "Cancellation completed",
                         deliveryState: .committed, createdAt: endTime, updatedAt: endTime))
                 } else if let failedReason {
-                    if wakeReason == nil {
+                    if executionReason && authoritative {
                         if let subtask {
                             try repo.updateSubtaskState(subtask.id, .blocked, at: endTime)
                         }
@@ -2192,30 +3087,201 @@ public actor CollaborationService {
                                               payload: String(decoding: payload, as: UTF8.self),
                                               deliveryState: "pending", at: endTime)
                     }
-                } else if wakeReason == nil {
+                } else if executionReason && authoritative {
                     if let subtask {
-                        try repo.updateSubtaskState(subtask.id, .review, at: endTime)
+                        let results = try repo.resultMessages(taskID: task.id,
+                                                            subtaskID: subtask.id)
+                        let reportedThisTurn = results.contains { $0.seq > maxSeq }
+                        if reportedThisTurn {
+                            // toolReportResult already moved subtask → review
+                            // and task → verifying and posted its own event.
+                            if task.state != .verifying,
+                               let current = try repo.task(task.id),
+                               current.state == .verifying {
+                                let payload = try JSONEncoder().encode(StateChangedPayload(
+                                    task_id: task.id.rawValue, state: "verifying",
+                                    usage: usage))
+                                try repo.insertOutbox(
+                                    taskID: task.id, eventType: "task.state_changed",
+                                    payload: String(decoding: payload, as: UTF8.self),
+                                    deliveryState: "pending", at: endTime)
+                            }
+                        } else {
+                            // No structured result: nothing to verify. Leave
+                            // the task working and nudge the owner once.
+                            try repo.insertMessage(Message(
+                                id: MessageID(newID("msg")), taskID: task.id,
+                                seq: try repo.nextMessageSeq(task.id), author: .system,
+                                kind: .systemEvent,
+                                body: "Owner turn ended without workshop_report_result; task remains working",
+                                deliveryState: .committed, createdAt: endTime,
+                                updatedAt: endTime))
+                            let latestResultAt = results.last?.createdAt
+                            let nudged = try repo.wakeups(task.id).contains {
+                                $0.engineerID == engineer
+                                    && $0.reason == "report_requested"
+                                    && (latestResultAt == nil
+                                        || $0.createdAt >= latestResultAt!)
+                            }
+                            if !nudged {
+                                try repo.insertWakeup(
+                                    taskID: task.id, engineerID: engineer,
+                                    reason: "report_requested", triggerSeq: nil,
+                                    at: endTime)
+                                scheduleWakeupCoalescer()
+                            }
+                        }
                     }
-                    if let current = try repo.task(task.id),
-                       current.state.canTransition(to: .verifying) {
-                        try transition(task.id, from: current.state, to: .verifying,
-                                       at: endTime)
-                    }
-                    try repo.insertMessage(Message(
-                        id: MessageID(newID("msg")), taskID: task.id,
-                        seq: try repo.nextMessageSeq(task.id), author: .system,
-                        kind: .systemEvent,
-                        body: "Owner reported complete; verification pending",
-                        deliveryState: .committed, createdAt: endTime, updatedAt: endTime))
-                    let payload = try JSONEncoder().encode(StateChangedPayload(
-                        task_id: task.id.rawValue, state: "verifying", usage: usage))
-                    try repo.insertOutbox(taskID: task.id, eventType: "task.state_changed",
-                                          payload: String(decoding: payload, as: UTF8.self),
-                                          deliveryState: "pending", at: endTime)
                 }
             }
         }
         publishCommitted()
+        // Substantive = the engineer committed at least one message in this
+        // turn (the streamed reply or any tool-posted message with a seq
+        // beyond the turn-start boundary).
+        let turnMessages = (attempt("turnSubstantive", {
+            try repo.messages(task.id, includeSummaries: true)
+        }) ?? []).filter {
+            $0.author == .engineer(engineer) && $0.seq > maxSeq
+                && $0.deliveryState == .committed
+        }
+        let substantive = !turnMessages.isEmpty
+        // Phase 2 (G-D3): record the turn in Workshop-owned task memory so the
+        // next packet carries this engineer's own history even when the
+        // provider session was cold. Best-effort; never fails the turn.
+        do {
+            var resultRevision: Int?
+            var reviewedMessageID: String?
+            for m in turnMessages {
+                guard let s = m.structured,
+                      let v = try? JSONDecoder().decode(JSONValue.self,
+                                                        from: Data(s.utf8))
+                else { continue }
+                if v["type"]?.stringValue == "result" {
+                    resultRevision = v["revision"]?.intValue.map(Int.init)
+                } else if v["type"]?.stringValue == "review" {
+                    reviewedMessageID = v["proposal_id"]?.stringValue
+                }
+            }
+            let outcome = cancelled ? "cancelled"
+                : (failedReason != nil ? "failed"
+                   : (substantive ? "completed" : "silent"))
+            let record = TurnRecord(
+                turnID: turnID, endedAt: endTime, reason: wakeReason ?? "execution",
+                outcome: outcome, postedSeqs: turnMessages.map(\.seq),
+                resultRevision: resultRevision,
+                reviewedMessageID: reviewedMessageID,
+                filesTouched: authoritative ? filesTouched(at: writerLease?.path) : [],
+                nativeSessionID: ref.nativeSessionID,
+                sessionResumed: sessionResumed && !sawSessionNotLoaded)
+            _ = attempt("appendTurnRecord", {
+                try repo.appendTurnRecord(taskID: task.id, engineerID: engineer,
+                                          record)
+            })
+        }
+        // E4: bound the work.activity ring for this task (delivered rows only;
+        // pending/dispatch.requested rows are never touched).
+        if let pruned = attempt("pruneWorkActivity", {
+            try repo.pruneWorkActivity(taskID: task.id, keep: 200)
+        }), pruned > 0 {
+            log.notice("pruned \(pruned) delivered work.activity rows for task \(task.id.rawValue)")
+        }
+        if cancelled { return .failed("cancelled") }
+        if let failedReason { return .failed(failedReason) }
+        return .completed(substantive: substantive)
+    }
+
+    /// `git status --porcelain` paths for a writer lease directory (≤ 20),
+    /// empty on any error. Restricted env mirrors WriterGenerations.
+    private func filesTouched(at path: String?) -> [String] {
+        guard let path else { return [] }
+        do {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = ["status", "--porcelain"]
+            process.currentDirectoryURL = URL(fileURLWithPath: path)
+            process.environment = ["PATH": "/usr/bin:/bin", "HOME": path,
+                                   "GIT_CONFIG_NOSYSTEM": "1",
+                                   "GIT_CONFIG_GLOBAL": "/dev/null"]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            let deadline = DispatchWorkItem {
+                if process.isRunning { process.terminate() }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 30,
+                                              execute: deadline)
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            deadline.cancel()
+            guard process.terminationStatus == 0 else { return [] }
+            var paths: [String] = []
+            for line in String(decoding: data, as: UTF8.self)
+                .components(separatedBy: "\n") where line.count > 3 {
+                paths.append(String(line.suffix(line.count - 3)))
+                if paths.count >= 20 { break }
+            }
+            return paths
+        } catch { return [] }
+    }
+
+    /// Assemble the Workshop-owned memory section for this turn's packet
+    /// (G-D3): turn-record ring, latest valid checkpoint, the engineer's own
+    /// recent messages, and the latest result revision + peer dispositions.
+    private func taskMemoryPacket(task: WorkshopTask, engineer: EngineerID,
+                                  subtask: Subtask?, sessionResumed: Bool)
+        -> TaskMemoryPacket {
+        let records = attempt("taskMemory", {
+            try repo.taskMemory(taskID: task.id, engineerID: engineer)
+        }) ?? []
+        let checkpoint: JSONValue? = (attempt("latestCheckpoint", {
+            try repo.latestValidCheckpoint(taskID: task.id, engineerID: engineer)
+        }) ?? nil).flatMap {
+            try? JSONDecoder().decode(JSONValue.self, from: Data($0.content.utf8))
+        }
+        let committed = (attempt("memoryMessages", {
+            try repo.messages(task.id)
+        }) ?? []).filter { $0.deliveryState == .committed }
+        let own = committed.filter {
+            $0.author == .engineer(engineer) && $0.kind != .systemEvent
+                && $0.kind != .turnSummary
+                && ($0.structured.map {
+                    (try? JSONDecoder().decode(JSONValue.self,
+                        from: Data($0.utf8)))?["type"]?.stringValue != "result"
+                } ?? true)
+        }.suffix(3)
+        let target = subtask ?? (attempt("memorySubtask", {
+            try repo.subtasks(task.id).first
+        }) ?? nil)
+        var latestResult: (String, Int, String)?
+        var peerDispositions: [(EngineerID, String, Int64)] = []
+        if let target {
+            let results = attempt("memoryResults", {
+                try repo.resultMessages(taskID: task.id, subtaskID: target.id)
+            }) ?? []
+            if let latest = results.last {
+                latestResult = (latest.id.rawValue, results.count,
+                                target.id.rawValue)
+                for m in committed {
+                    guard let s = m.structured,
+                          let v = try? JSONDecoder().decode(
+                              JSONValue.self, from: Data(s.utf8)),
+                          v["type"]?.stringValue == "review",
+                          v["proposal_id"]?.stringValue == latest.id.rawValue,
+                          case .engineer(let peer) = m.author
+                    else { continue }
+                    peerDispositions.append(
+                        (peer, v["disposition"]?.stringValue ?? "unknown", m.seq))
+                }
+            }
+        }
+        return TaskMemoryPacket(turnRecords: records,
+                                latestCheckpoint: checkpoint,
+                                ownRecentMessages: Array(own),
+                                latestResult: latestResult,
+                                peerDispositions: peerDispositions,
+                                sessionResumed: sessionResumed)
     }
 
     // MARK: - Phase 3: collaboration policy (§5.1, §5.3, §5.5, §8.2)
@@ -2378,7 +3444,8 @@ public actor CollaborationService {
         var stripped = content
         if case .object(var obj) = stripped {
             obj.removeValue(forKey: "task_id")
-            stripped = .object(obj)
+            stripped = .object(laneFields(obj, taskID: taskID,
+                                          engineer: engineer))
         }
         let data = try JSONEncoder().encode(stripped)
         let timestamp = now()
@@ -2494,6 +3561,30 @@ public actor CollaborationService {
             throw WorkshopError.invalidRequest(
                 "disposition must be agree|disagree|needs_changes")
         }
+        // Resolve the target BEFORE posting: proposals and structured result
+        // messages only — a review bound to anything else is refused.
+        var targetResult: (message: Message, subtask: Subtask, revision: Int)?
+        if try repo.proposal(proposalID) == nil {
+            guard let resultMessage = try repo.message(MessageID(proposalID)),
+                  let s = resultMessage.structured,
+                  let value = try? JSONDecoder().decode(JSONValue.self,
+                                                        from: Data(s.utf8)),
+                  value["type"]?.stringValue == "result",
+                  let subtaskRaw = value["subtask_id"]?.stringValue,
+                  let subtask = try repo.subtask(SubtaskID(subtaskRaw)),
+                  subtask.taskID == taskID else {
+                throw WorkshopError.invalidRequest(
+                    "proposal_id must reference a proposal or a structured result message")
+            }
+            let results = try repo.resultMessages(taskID: taskID, subtaskID: subtask.id)
+            let revision = (results.lastIndex(where: {
+                $0.id == resultMessage.id }) ?? 0) + 1
+            if let latest = results.last, latest.id != resultMessage.id {
+                throw WorkshopError.staleResult(latestMessageID: latest.id.rawValue,
+                                                latestRevision: results.count)
+            }
+            targetResult = (resultMessage, subtask, revision)
+        }
         var structured: [String: JSONValue] = [
             "type": .string("review"),
             "proposal_id": .string(proposalID),
@@ -2501,6 +3592,9 @@ public actor CollaborationService {
             "disposition": .string(disposition),
         ]
         if let evidence { structured["evidence"] = .string(evidence) }
+        if let targetResult {
+            structured["result_revision"] = .number(Double(targetResult.revision))
+        }
         let structuredText = String(
             decoding: try JSONEncoder().encode(JSONValue.object(structured)),
             as: UTF8.self)
@@ -2530,13 +3624,7 @@ public actor CollaborationService {
                 if !reviewedBy.contains(participant) { allReviewed = false }
             }
             if allReviewed { requestConsolidation(taskID) }
-        } else if let resultMessage = try repo.message(MessageID(proposalID)),
-                  let s = resultMessage.structured,
-                  let value = try? JSONDecoder().decode(JSONValue.self,
-                                                        from: Data(s.utf8)),
-                  let subtaskRaw = value["subtask_id"]?.stringValue,
-                  let subtask = try repo.subtask(SubtaskID(subtaskRaw)),
-                  subtask.taskID == taskID {
+        } else if let (_, subtask, _) = targetResult {
             // Verification review of a report_result message (§5.5).
             let timestamp = now()
             try repo.db.transaction {
@@ -3072,14 +4160,43 @@ public actor CollaborationService {
         }
     }
 
-    /// Resume a paused task back to Ready (or Researching for research tasks)
+    /// Resume a paused task, or retry a workspace-blocked execution task whose
+    /// writer never started. Preserve its immutable ingress and owner.
     /// and re-wake the owner / participants.
     public func resumeTask(taskID: TaskID, principal: Principal) async throws {
         try requireUser(principal, "resume task")
         let task = try loadTask(taskID)
-        guard task.state == .paused else {
+        let workspaceRetry: Bool
+        if task.state == .blocked && task.phase == .execution {
+            // Recoverability is decided by the latest block-class system
+            // event: gate blocks and startup/workspace failures can retry;
+            // a retained legacy profile or undecodable ingress cannot.
+            let latestBlock = try repo.messages(taskID).last {
+                $0.kind == .systemEvent
+                    && ($0.body.hasPrefix("Task ingress could not be decoded")
+                        || $0.body.hasPrefix("Legacy instruction profile retained")
+                        || $0.body.hasPrefix("Task workspace unavailable")
+                        || $0.body.contains("Owner startup failed before execution")
+                        || $0.body.hasPrefix(
+                            "Native workspace writer isolation is not qualified"))
+            }?.body ?? ""
+            let unrecoverable = latestBlock.hasPrefix("Task ingress could not be decoded")
+                || latestBlock.hasPrefix("Legacy instruction profile retained")
+            let workspaceFailed = latestBlock.hasPrefix("Task workspace unavailable")
+            let startupFailed = latestBlock.contains("Owner startup failed before execution")
+            let gateFailed = latestBlock.hasPrefix(
+                "Native workspace writer isolation is not qualified")
+            // Workspace-unavailable blocks resume regardless of whether a
+            // workspace row exists: files are preserved and the seed check
+            // decides again on the next turn.
+            workspaceRetry = !unrecoverable
+                && (gateFailed || startupFailed || workspaceFailed)
+        } else {
+            workspaceRetry = false
+        }
+        guard task.state == .paused || workspaceRetry else {
             throw WorkshopError.invalidRequest(
-                "only a paused task can be resumed (state: \(task.state.rawValue))")
+                "only a paused task or workspace-blocked execution task can be resumed (state: \(task.state.rawValue))")
         }
         let timestamp = now()
         try repo.db.transaction {
@@ -3092,10 +4209,16 @@ public actor CollaborationService {
                                           triggerSeq: nil, at: timestamp)
                 }
             } else {
-                try transition(taskID, from: .paused, to: .ready, at: timestamp)
+                try transition(taskID, from: task.state, to: .ready, at: timestamp)
                 if let sub = try repo.subtasks(taskID)
                     .first(where: { $0.ownerID != nil }),
                    let owner = sub.ownerID {
+                    if workspaceRetry, sub.state == .blocked {
+                        try repo.reclaimBlockedSubtask(
+                            sub.id,
+                            leaseExpiresAt: timestamp.addingTimeInterval(300),
+                            at: timestamp)
+                    }
                     try repo.insertWakeup(taskID: taskID, engineerID: owner,
                                           reason: "resumed", triggerSeq: nil,
                                           at: timestamp)
@@ -3633,7 +4756,8 @@ extension CollaborationService {
     /// running turn first (adapter enforces the ≤10 s bound + process-group
     /// kill), then CAS-bumps the ownership generation.
     public func reassignSubtask(subtaskID: SubtaskID, newOwner: EngineerID,
-                                principal: Principal) async throws {
+                                principal: Principal,
+                                permitClosedHandover: Bool = false) async throws {
         if principal != .user, principal.engineerID != .devin {
             throw WorkshopError.userAuthorityRequired("reassign subtask")
         }
@@ -3642,7 +4766,21 @@ extension CollaborationService {
         }
         let taskID = sub.taskID
         if try repo.taskIngress(taskID)?.request.schemaVersion == 2 {
-            throw WorkshopError.invalidRequest("Safe writer handover is not qualified for community tasks")
+            guard permitClosedHandover, let owner = sub.ownerID else {
+                throw WorkshopError.invalidRequest(
+                    "Safe writer handover is not qualified for community tasks")
+            }
+            // Qualification handover: permitted only once the departing
+            // owner's writer generation is closed — a live 'writing'
+            // generation keeps the guard intact.
+            let writing = try repo.db.query("""
+                SELECT 1 FROM writer_generations
+                WHERE task_id=? AND engineer=? AND state='writing' LIMIT 1
+                """, [.text(taskID.rawValue), .text(owner.rawValue)]).first
+            if writing != nil {
+                throw WorkshopError.invalidRequest(
+                    "Safe writer handover is not qualified for community tasks")
+            }
         }
         if let owner = sub.ownerID {
             let key = taskID.rawValue + ":" + owner.rawValue
@@ -3917,7 +5055,8 @@ extension CollaborationService {
         let task = try loadTask(taskID)
         let fm = FileManager.default
         try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true)
-        let messages = try repo.messages(taskID, afterSeq: 0, limit: 10_000)
+        let messages = try repo.messages(taskID, afterSeq: 0, limit: 10_000,
+                                         includeSummaries: true)
             .filter { $0.deliveryState == .committed }
         let decisions = try repo.decisions(taskID)
         let proposals = try repo.proposals(taskID).filter { $0.visibility == "published" }

@@ -44,9 +44,31 @@ final class CommunityIngressTests: XCTestCase {
         TaskOrigin(sourceTaskID: "test-codex-thread", invocationID: invocation)
     }
 
+    /// An owner turn that reports a result — otherwise the no-result turn
+    /// ends with a report_requested nudge and a second turn (G-B4).
+    private func scriptReportingTurn(_ svc: CollaborationService,
+                                     _ adapters: [FakeAdapter]) {
+        for adapter in adapters {
+            adapter.toolRunner = { [weak svc] name, args, principal in
+                guard let svc else { return .null }
+                return try await svc.callTool(name, args: args, principal: principal)
+            }
+            adapter.script = { context in
+                guard let sub = context.subtask,
+                      sub.ownerID == adapter.engineer else { return [.text("ok")] }
+                return [.toolCall("workshop_report_result", .object([
+                    "task_id": .string(context.task.id.rawValue),
+                    "subtask_id": .string(sub.id.rawValue),
+                    "summary": .string("done"),
+                    "generation": .number(Double(sub.generation))]))]
+            }
+        }
+    }
+
     func testV2OwnerOnlyEmptyParticipantsDispatchesDevinOnly() async throws {
         let adapters = fakes()
         let svc = try service(adapters: adapters)
+        scriptReportingTurn(svc, adapters)
         let receipt = try await svc.createTask(v2Request(mode: .ownerOnly))
         await svc.start()
         await svc.awaitIdle()
@@ -61,6 +83,7 @@ final class CommunityIngressTests: XCTestCase {
     func testV2OmittedModeDefaultsOwnerOnly() async throws {
         let adapters = fakes()
         let svc = try service(adapters: adapters)
+        scriptReportingTurn(svc, adapters)
         let receipt = try await svc.createTask(v2Request(mode: nil, participants: []))
         await svc.start()
         await svc.awaitIdle()

@@ -29,6 +29,8 @@ Use Codex as the entry point to one durable Workshop conversation. This skill pr
 
 Include title/objective, phase, explicit collaboration intent, requested peers, context/constraints, source references, registered workspace reference when known, acceptance criteria, approvals, budget limits and unresolved decisions. Preserve relevant corrections and rejected approaches without forwarding raw conversation history, credentials, unrelated personal instructions, or hidden reasoning.
 
+For `workspace_ref`, prefer the registered project ID from Workshop's project registry. A Codex worktree path is a checkout reference, not automatically a registered project. If using one, first verify that it shares the registered repository's Git common directory; otherwise omit the reference and report that project registration is needed. Never silently substitute an unrelated checkout.
+
 For UI work include this approved Workshop constraint:
 
 > First build the intended behavior as a web app. Use computer-use tooling to compare it against approved visuals and exercise interactions. Record the reference, exact web revision, screenshots, findings and passed retest. Only then carry the same renderer into Electron. Subsequent UI changes invalidate that validation. If computer use is blocked, report it and do not claim validation or proceed with carry-over. Native packaging and lifecycle need separate checks.
@@ -61,7 +63,8 @@ These journals contain only the deliberately scoped brief/receipt. Do not place 
 
 - Resolve the known Workshop task ID from the saved receipt or an explicit verified user reference. A Codex thread can create multiple Workshop tasks; do not guess which one a follow-up targets. Ask when ambiguous.
 - Read committed messages using `after_seq` and preserve the observed cursor. Acknowledge only messages actually read. The current create receipt sequence is an event cursor, not necessarily a message cursor; do not interchange them.
-- Append the follow-up with `workshop_post_message` on the existing task ID. Never create a `follow_up` task. Do not blindly retry an uncertain message append: inspect recent messages and resolve delivery first because legacy append calls are not idempotent.
+- Append the follow-up with `workshop_post_message` on the existing task ID. Never create a `follow_up` task. Prepare the append with `python3 <skill-directory>/scripts/invocation.py append --journal <journal.json> --body <text-file>`: it persists `idempotency_key: codex-append-<random uuid>` in the journal before dispatch and returns the exact request to submit. An uncertain append may be retried only with the identical persisted key and payload; a `-32009` payload conflict is a blocker, not permission to post a duplicate.
+- To wait for engineer replies within a turn, call `workshop_wait_for_events {task_id, after_seq: <last seen>, timeout_seconds: 50}`; it returns new events or `timed_out: true`. Never claim a reply that was not returned.
 - Report actual title, task ID, returned verified link when available, phase, collaboration mode and selected peers. Distinguish created, queued, running, blocked, verifying and completed using current tool evidence. Task creation or a model saying it finished is not proof of verified completion.
 - Report fake adapters, unavailable peers, unqualified computer use, unknown telemetry and missing writer enforcement explicitly. A design mock or a synthetic test is not live integration evidence.
 - Monitor only as requested using durable reads and bounded waits. Do not fabricate unsolicited replies into the originating Codex conversation; the durable Workshop conversation is the return surface until a supported callback channel is qualified.

@@ -1,7 +1,8 @@
 # ADR 0003: Daemon over a Unix-domain socket
 
 ## Status
-Accepted
+Accepted — Revision 2026-09-28: the UDS remains the UI transport; MCP moved
+to a loopback TCP listener per ADR 0017.
 
 ## Context
 UI clients must never write SQLite; the service is the single writer. IPC needs a

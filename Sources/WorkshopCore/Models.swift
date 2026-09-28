@@ -83,6 +83,45 @@ public struct Message: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// One completed turn as recorded in Workshop-owned task memory (Phase 2,
+/// G-D3): what a cold native session needs to reconstruct its own history.
+public struct TurnRecord: Codable, Equatable, Sendable {
+    public var turnID: String
+    public var endedAt: Date
+    /// Wake reason for this turn, or "execution" for owner dispatch turns.
+    public var reason: String?
+    /// completed | silent | failed | cancelled
+    public var outcome: String
+    /// Engineer-authored messages committed this turn (tool posts + reply).
+    public var postedSeqs: [Int64]
+    /// Set when a structured result revision was created this turn.
+    public var resultRevision: Int?
+    /// Set when a review was submitted this turn (the reviewed message id).
+    public var reviewedMessageID: String?
+    /// ≤ 20 relative paths; authoritative writer turns only.
+    public var filesTouched: [String]
+    public var nativeSessionID: String?
+    /// false when the adapter reported a fresh native session this turn.
+    public var sessionResumed: Bool
+
+    public init(turnID: String, endedAt: Date, reason: String? = nil,
+                outcome: String, postedSeqs: [Int64] = [],
+                resultRevision: Int? = nil, reviewedMessageID: String? = nil,
+                filesTouched: [String] = [], nativeSessionID: String? = nil,
+                sessionResumed: Bool = false) {
+        self.turnID = turnID
+        self.endedAt = endedAt
+        self.reason = reason
+        self.outcome = outcome
+        self.postedSeqs = postedSeqs
+        self.resultRevision = resultRevision
+        self.reviewedMessageID = reviewedMessageID
+        self.filesTouched = filesTouched
+        self.nativeSessionID = nativeSessionID
+        self.sessionResumed = sessionResumed
+    }
+}
+
 public struct Participant: Codable, Equatable, Sendable {
     public var taskID: TaskID
     public var engineerID: EngineerID
@@ -91,14 +130,20 @@ public struct Participant: Codable, Equatable, Sendable {
     /// Highest message seq consumed by a completed turn (§8.5).
     public var lastReadSeq: Int64
     public var subscriptions: [String]
+    /// Last lane this participant's turns ran on ("native" | "managed");
+    /// nil until a lane is recorded (Phase 3, D-b). Service-populated,
+    /// not persisted.
+    public var lane: String?
 
     public init(taskID: TaskID, engineerID: EngineerID, membership: String = "member",
-                readCursor: Int64 = 0, lastReadSeq: Int64 = 0, subscriptions: [String] = []) {
+                readCursor: Int64 = 0, lastReadSeq: Int64 = 0, subscriptions: [String] = [],
+                lane: String? = nil) {
         self.taskID = taskID
         self.engineerID = engineerID
         self.membership = membership
         self.readCursor = readCursor
         self.lastReadSeq = lastReadSeq
+        self.lane = lane
         self.subscriptions = subscriptions
     }
 }
@@ -211,6 +256,43 @@ public struct WakeupInfo: Codable, Equatable, Sendable {
     }
 }
 
+/// Latest structured result binding for a subtask (additive detail field).
+public struct SubtaskResultStatus: Codable, Equatable, Sendable {
+    public var latestResultMessageID: String?
+    public var resultRevision: Int
+
+    public init(latestResultMessageID: String? = nil, resultRevision: Int = 0) {
+        self.latestResultMessageID = latestResultMessageID
+        self.resultRevision = resultRevision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case latestResultMessageID = "latest_result_message_id"
+        case resultRevision = "result_revision"
+    }
+}
+
+/// The effective fenced review seed reviewers are served for a task
+/// (generation id, verified digest, and which rule selected it).
+public struct ReviewSeedInfo: Codable, Equatable, Sendable {
+    public var generationID: String
+    public var digest: String
+    /// "pin" | "authoritative" | "review_only".
+    public var source: String
+
+    public init(generationID: String, digest: String, source: String) {
+        self.generationID = generationID
+        self.digest = digest
+        self.source = source
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case generationID = "generation_id"
+        case digest
+        case source
+    }
+}
+
 /// Task detail returned by getTask.
 public struct TaskDetail: Codable, Equatable, Sendable {
     public var task: WorkshopTask
@@ -227,12 +309,23 @@ public struct TaskDetail: Codable, Equatable, Sendable {
     public var publishedProposalCount: Int
     public var ingress: TaskIngress?
     public var workspace: TaskWorkspace?
+    /// Per-subtask result binding, keyed by subtask id.
+    public var subtaskResults: [String: SubtaskResultStatus]?
+    /// Codex acknowledged cursor (task_ingress.last_acknowledged_seq) when an
+    /// ingress row exists.
+    public var acknowledgedSeq: Int64?
+    /// The effective fenced review seed for this task, when writer
+    /// generations exist (encodes as `review_seed`).
+    public var reviewSeed: ReviewSeedInfo?
 
     public init(task: WorkshopTask, participants: [Participant], subtasks: [Subtask],
                 usage: UsageSample? = nil, runningEngineers: [EngineerID] = [],
                 pendingWakeups: [WakeupInfo] = [], draftProposalCount: Int = 0,
                 publishedProposalCount: Int = 0, ingress: TaskIngress? = nil,
-                workspace: TaskWorkspace? = nil) {
+                workspace: TaskWorkspace? = nil,
+                subtaskResults: [String: SubtaskResultStatus]? = nil,
+                acknowledgedSeq: Int64? = nil,
+                reviewSeed: ReviewSeedInfo? = nil) {
         self.task = task
         self.participants = participants
         self.subtasks = subtasks
@@ -243,6 +336,16 @@ public struct TaskDetail: Codable, Equatable, Sendable {
         self.publishedProposalCount = publishedProposalCount
         self.ingress = ingress
         self.workspace = workspace
+        self.subtaskResults = subtaskResults
+        self.acknowledgedSeq = acknowledgedSeq
+        self.reviewSeed = reviewSeed
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case task, participants, subtasks, usage, runningEngineers
+        case pendingWakeups, draftProposalCount, publishedProposalCount
+        case ingress, workspace, subtaskResults, acknowledgedSeq
+        case reviewSeed = "review_seed"
     }
 }
 
@@ -523,5 +626,88 @@ public struct Turn: Codable, Equatable, Sendable, Identifiable {
         self.endedAt = endedAt
         self.nativeSessionID = nativeSessionID
         self.requestIDs = requestIDs
+    }
+}
+
+/// Identity of one adapter lane for capability qualification (Phase 3c).
+public struct QualificationIdentity: Codable, Equatable, Hashable, Sendable {
+    public var engineer: EngineerID
+    /// "native" | "managed".
+    public var lane: String
+    public var model: String?
+
+    public init(engineer: EngineerID, lane: String, model: String? = nil) {
+        self.engineer = engineer
+        self.lane = lane
+        self.model = model
+    }
+}
+
+/// One row of config/capabilities.json: whether an identity passed the
+/// isolated-writer recipe, with advisory binary hash and evidence pointer.
+public struct CapabilityRecord: Codable, Equatable, Sendable {
+    public var engineer: EngineerID
+    public var lane: String
+    /// e.g. "isolated_writer".
+    public var capability: String
+    public var model: String?
+    /// SHA-256 of the binary probed at qualification time (advisory drift).
+    public var binarySHA256: String?
+    public var qualified: Bool
+    public var probedAt: Date
+    public var evidencePath: String?
+    public var notes: String?
+
+    public init(engineer: EngineerID, lane: String, capability: String,
+                model: String? = nil, binarySHA256: String? = nil,
+                qualified: Bool, probedAt: Date, evidencePath: String? = nil,
+                notes: String? = nil) {
+        self.engineer = engineer
+        self.lane = lane
+        self.capability = capability
+        self.model = model
+        self.binarySHA256 = binarySHA256
+        self.qualified = qualified
+        self.probedAt = probedAt
+        self.evidencePath = evidencePath
+        self.notes = notes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case engineer, lane, capability, model, binarySHA256
+        case qualified, probedAt, evidencePath, notes
+    }
+
+    /// ISO-8601 `probedAt` on write; legacy files with a raw Double
+    /// (seconds since reference date) still decode.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        engineer = try c.decode(EngineerID.self, forKey: .engineer)
+        lane = try c.decode(String.self, forKey: .lane)
+        capability = try c.decode(String.self, forKey: .capability)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        binarySHA256 = try c.decodeIfPresent(String.self, forKey: .binarySHA256)
+        qualified = try c.decode(Bool.self, forKey: .qualified)
+        if let iso = try? c.decode(String.self, forKey: .probedAt) {
+            probedAt = WorkshopTime.date(iso)
+        } else {
+            probedAt = Date(timeIntervalSinceReferenceDate:
+                try c.decode(Double.self, forKey: .probedAt))
+        }
+        evidencePath = try c.decodeIfPresent(String.self, forKey: .evidencePath)
+        notes = try c.decodeIfPresent(String.self, forKey: .notes)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(engineer, forKey: .engineer)
+        try c.encode(lane, forKey: .lane)
+        try c.encode(capability, forKey: .capability)
+        try c.encodeIfPresent(model, forKey: .model)
+        try c.encodeIfPresent(binarySHA256, forKey: .binarySHA256)
+        try c.encode(qualified, forKey: .qualified)
+        try c.encode(WorkshopTime.string(probedAt), forKey: .probedAt)
+        try c.encodeIfPresent(evidencePath, forKey: .evidencePath)
+        try c.encodeIfPresent(notes, forKey: .notes)
     }
 }

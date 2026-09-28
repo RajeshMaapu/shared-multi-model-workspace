@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { installedPaths, ensureDaemon } from '../lifecycle.mjs';
 test('installed paths use Workshop data and bundled daemon', () => {
- const p=installedPaths('/app/Resources','/private/tmp/user','/test-home');
- assert.equal(p.home,'/test-home/Library/Application Support/Workshop');
+ const p=installedPaths('/app/Resources','/private/tmp/user','/tmp/fakehome');
+ assert.equal(p.home,'/tmp/fakehome/Library/Application Support/Workshop');
  assert.equal(p.socket,'/private/tmp/user/workshop/service.sock');
  assert.equal(p.daemon,'/app/Resources/workshop-daemon');
  assert.throws(()=>installedPaths('relative','/tmp'));

@@ -4,6 +4,7 @@ import Security
 import WorkshopAdapters
 import WorkshopCore
 import WorkshopIPC
+import WorkshopMCP
 import WorkshopService
 import WorkshopStore
 
@@ -16,8 +17,16 @@ public final class DaemonRuntime: @unchecked Sendable {
     public let socketPath: String
     public let service: CollaborationService
     public let server: IPCServer
+    /// Streamable HTTP MCP endpoint on 127.0.0.1; bound in init, started in
+    /// `start()`. Sessions are in-memory — a restart forces re-initialization.
+    public let mcpServer: MCPHTTPServer
+    public var mcpURL: String { mcpServer.url }
     public let adapters: [EngineerAdapter]
+    /// config/capabilities.json (G-E5); injected into capability-aware lanes.
+    public let capabilityStore: CapabilityStore
     private var broadcastTask: Task<Void, Never>?
+    private var canaryTask: Task<Void, Never>?
+    private var pruneTask: Task<Void, Never>?
 
     public struct EngineerConfig: Codable {
         public var id: String
@@ -27,6 +36,12 @@ public final class DaemonRuntime: @unchecked Sendable {
         public var executable: String?
         /// §10 capacity policy (ADR 0012).
         public var budget: Budget?
+        /// Whether the managed runtime lane may take over when the native
+        /// lane fails startup (default true for kimi and deepseek; devin has
+        /// no managed lane).
+        public var managed_fallback: Bool?
+        /// Optional model override for the managed lane.
+        public var managed_model: String?
     }
     public struct Budget: Codable {
         public var daily_token_cap: Int?
@@ -60,11 +75,12 @@ public final class DaemonRuntime: @unchecked Sendable {
     /// and the IPC server (not yet listening — call `start()`).
     public init(home: String, runtimeDir: String? = nil,
                 env: [String: String] = ProcessInfo.processInfo.environment,
-                ownExecutable: String = CommandLine.arguments[0]) throws {
+                ownExecutable: String = CommandLine.arguments[0],
+                fakeConfigurator: (@Sendable (FakeAdapter) -> Void)? = nil) throws {
         self.home = home
         let fm = FileManager.default
 
-        for sub in ["db", "profiles", "sessions/deepseek", "worktrees",
+        for sub in ["db", "profiles", "sessions/deepseek", "sessions/kimi", "worktrees",
                     "artifacts", "diagnostics", "config"] {
             try fm.createDirectory(atPath: home + "/" + sub,
                                    withIntermediateDirectories: true)
@@ -101,16 +117,18 @@ public final class DaemonRuntime: @unchecked Sendable {
             chmod(codexTokenPath, 0o600)
         }
 
-        // Stable bridge path (§4.5): ~/.codex/config.toml points at
-        // <home>/bin/workshop-mcp; re-point it at every start so rebuilds
-        // never leave a stale path behind.
-        Self.installBridgeSymlink(home: home, ownExecutable: ownExecutable)
+        // Keep the bridge at a stable, executable path outside the app bundle.
+        // Launching a nested app resource can stall in dyld after a bundle swap.
+        let bridgePath = Self.installBridgeCopy(home: home, env: env,
+                                                ownExecutable: ownExecutable)
 
         let runtime = runtimeDir ?? IPCServer.defaultRuntimeDir()
         self.runtimeDir = runtime
         try fm.createDirectory(atPath: runtime, withIntermediateDirectories: true)
         chmod(runtime, 0o700)
         let socket = runtime + "/service.sock"
+        self.capabilityStore = CapabilityStore(path: home
+            + "/config/capabilities.json")
         precondition(socket.utf8.count < 100, "socket path too long: \(socket)")
         self.socketPath = socket
 
@@ -125,7 +143,16 @@ public final class DaemonRuntime: @unchecked Sendable {
             .flatMap { try? JSONDecoder().decode(EngineersFile.self, from: $0) }
             ?? EngineersFile()
 
-        let adaptersMode = env["WORKSHOP_ADAPTERS"] ?? "fake"
+        // Adapter mode: live for the installed home, fake elsewhere. Fake
+        // adapters must never run against the installed home — a daemon
+        // restarted there with fakes would inject scripted replies into live
+        // tasks (G-D8).
+        let installedHome = ProfileBuilder.canonicalPath(
+            env["WORKSHOP_INSTALLED_HOME_OVERRIDE"]
+                ?? NSHomeDirectory() + "/Library/Application Support/Workshop")
+        let canonicalHome = ProfileBuilder.canonicalPath(home)
+        let adaptersMode = env["WORKSHOP_ADAPTERS"]
+            ?? (canonicalHome == installedHome ? "live" : "fake")
         func isFake(_ engineer: EngineerID) -> Bool {
             if adaptersMode == "live" { return false }
             if adaptersMode == "fake" { return true }
@@ -141,9 +168,17 @@ public final class DaemonRuntime: @unchecked Sendable {
             return false
         }
 
-        // workshop-mcp discovery: WORKSHOP_MCP_PATH env, then a sibling
-        // `workshop-mcp` next to this executable; missing = fail loudly.
-        let bridgePath = Self.resolveMCPBridge(env: env, ownExecutable: ownExecutable)
+        if EngineerID.allCases.contains(where: isFake),
+           canonicalHome == installedHome,
+           env["WORKSHOP_ALLOW_FAKE_ON_INSTALLED_HOME"] != "1" {
+            Self.log("Refusing fake adapters against the installed Workshop home")
+            throw WorkshopError.invalidRequest(
+                "Refusing fake adapters against the installed Workshop home; "
+                + "set WORKSHOP_ADAPTERS=live or "
+                + "WORKSHOP_ALLOW_FAKE_ON_INSTALLED_HOME=1 for a deliberate test")
+        }
+
+        // Bridge copy failed or was unavailable: live adapters fail visibly.
         if bridgePath == nil, adaptersMode != "fake" {
             Self.log("workshop-mcp not found: set WORKSHOP_MCP_PATH or place "
                      + "workshop-mcp next to the daemon executable")
@@ -155,6 +190,43 @@ public final class DaemonRuntime: @unchecked Sendable {
             return path
         }
 
+        // MCP over Streamable HTTP (127.0.0.1). Bound here — before adapters
+        // are built — so the launch specs can carry the concrete URL. The
+        // service is installed into `serviceBox` once it exists below; auth
+        // closures run per request so revocations take effect immediately.
+        let mcpPort: UInt16 = env["WORKSHOP_MCP_PORT"].flatMap(UInt16.init)
+            ?? (canonicalHome == installedHome ? 47831 : 0)
+        var mcpConfig = MCPHTTPServer.Config()
+        mcpConfig.port = mcpPort
+        let serviceBox = ServiceBox()
+        let mcpServer = MCPHTTPServer(
+            config: mcpConfig, serverVersion: "0",
+            authenticate: { token in
+                guard let service = serviceBox.service else {
+                    throw WorkshopError.invalidRequest("service not ready")
+                }
+                return try await service.authenticate(token: token)
+            },
+            authorize: { token, method, params in
+                guard let service = serviceBox.service else {
+                    throw WorkshopError.invalidRequest("service not ready")
+                }
+                try await service.authorizeWriterRequest(token: token,
+                                                         method: method,
+                                                         params: params)
+            },
+            callTool: { method, args, principal in
+                guard let service = serviceBox.service else {
+                    throw WorkshopError.invalidRequest("service not ready")
+                }
+                return try await service.callTool(method, args: args,
+                                                  principal: principal)
+            })
+        mcpServer.logger = { Self.log($0) }
+        try mcpServer.bind()
+        self.mcpServer = mcpServer
+        Self.log("mcp endpoint bound at \(mcpServer.url)")
+
         let paths = ProfileBuilder.Paths(
             home: home,
             devinBinary: expandHome(engineersConfig.engineer(.devin)?.executable)
@@ -162,7 +234,91 @@ public final class DaemonRuntime: @unchecked Sendable {
             kimiBinary: expandHome(engineersConfig.engineer(.kimi)?.executable)
                 ?? NSHomeDirectory() + "/.kimi-code/bin/kimi",
             mcpBridge: bridgePath ?? "<missing workshop-mcp>",
-            runtimeDir: runtime)
+            runtimeDir: runtime, mcpURL: mcpServer.url)
+
+        // Managed-lane plumbing (D-b): tool execution and checkpoint
+        // summaries resolve the service per call through serviceBox, so
+        // managed adapters built before the service still bind correctly.
+        func managedToolExecutor(_ engineer: EngineerID)
+            -> @Sendable (String, JSONValue) async throws -> String {
+            { name, args in
+                if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
+                   let data = try? JSONEncoder().encode(
+                    JSONValue.object(["tool": .string(name), "args": args])) {
+                    let p = dir + "/tool-calls.log"
+                    let line = String(decoding: data, as: UTF8.self) + "\n"
+                    if let fh = FileHandle(forWritingAtPath: p) {
+                        fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
+                    } else {
+                        FileManager.default.createFile(atPath: p, contents: Data(line.utf8))
+                    }
+                }
+                guard WorkshopToolCatalog.method(for: name) != nil else {
+                    return #"{"error":"unknown tool"}"#
+                }
+                guard let service = serviceBox.service else {
+                    return #"{"error":"service not ready"}"#
+                }
+                do {
+                    let result = try await service.callTool(
+                        name, args: args, principal: .engineer(engineer))
+                    let data = try? JSONEncoder().encode(result)
+                    return data.map { String(decoding: $0, as: UTF8.self) } ?? "{}"
+                } catch let error as WorkshopRPCError {
+                    return #"{"error":"\#(error.message)"}"#
+                }
+            }
+        }
+        // Managed-history compaction summary comes from the latest valid
+        // checkpoint — no model call.
+        func managedCheckpointSummary(_ engineer: EngineerID)
+            -> @Sendable (TaskID) async -> String? {
+            { taskID in
+                guard let service = serviceBox.service,
+                      let cp = try? await service.loadValidCheckpoint(
+                        taskID: taskID, engineerID: engineer) else { return nil }
+                return cp.content
+            }
+        }
+        // The managed lane's exec tool runs under a per-generation sandbox
+        // profile written next to the fenced workspace.
+        let managedSandboxProfile: @Sendable (String) throws -> String = { ws in
+            let dest = (ws as NSString).deletingLastPathComponent + "/managed.sb"
+            try ProfileBuilder.managedSandboxProfile(workshopHome: home,
+                                                     worktree: ws,
+                                                     destination: dest)
+            return dest
+        }
+        let laneObserver: @Sendable (TaskID, EngineerID, String) async -> Void =
+            { taskID, engineer, lane in
+                await serviceBox.service?.recordLane(taskID: taskID,
+                                                     engineer: engineer,
+                                                     lane: lane)
+            }
+        // Kimi's access tokens expire ~15 min after the CLI refreshes them;
+        // the CLI owns the rotating refresh grant, so we only ever ask the
+        // CLI to refresh (one minimal prompt, managed lane only).
+        let kimiRefresher: @Sendable (String) async throws
+            -> KimiCLIRefresh.RefreshReport = { binary in
+            try await KimiCLIRefresh.run(kimiBinary: binary, paths: paths,
+                                         log: { Self.log($0) })
+        }
+        self.kimiRefreshHook = kimiRefresher
+        self.kimiBinaryPath = paths.kimiBinary
+        func managedAdapter(_ engineer: EngineerID,
+                            keyReader: @escaping @Sendable () async throws -> String,
+                            provider: ManagedProvider) -> ManagedRuntimeAdapter {
+            let adapter = ManagedRuntimeAdapter(
+                engineer: engineer, provider: provider,
+                transport: URLSessionHTTPTransport(),
+                sessionsDir: home + "/sessions/" + engineer.rawValue,
+                keyReader: keyReader,
+                workshopToolExecutor: managedToolExecutor(engineer),
+                sandboxProfileProvider: managedSandboxProfile,
+                localTools: true)
+            adapter.checkpointSummary = managedCheckpointSummary(engineer)
+            return adapter
+        }
 
         func liveAdapter(_ engineer: EngineerID,
                          worktreeHint: String) -> EngineerAdapter? {
@@ -174,22 +330,40 @@ public final class DaemonRuntime: @unchecked Sendable {
             do {
                 switch engineer {
                 case .devin:
+                    // No managed lane: the Fusion relay exposes no
+                    // completions route.
                     let model = engineersConfig.engineer(.devin)?.model_selection
                         ?? "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium"
                     let (spec, _) = try ProfileBuilder.devinSpec(
                         paths: paths, worktree: worktreeHint, model: model)
                     return ACPHarnessAdapter(spec: spec)
                 case .kimi:
+                    let cfg = engineersConfig.engineer(.kimi)
                     let spec = try ProfileBuilder.kimiSpec(paths: paths,
                                                            worktree: worktreeHint)
-                    return ACPHarnessAdapter(spec: spec)
+                    let native: EngineerAdapter = ACPHarnessAdapter(spec: spec)
+                    guard cfg?.managed_fallback ?? true else { return native }
+                    let managed = managedAdapter(
+                        .kimi,
+                        keyReader: { [kimiRefresher] in
+                            try await KimiOAuthCredential.readAccessToken(
+                                kimiBinary: paths.kimiBinary,
+                                refreshViaCLI: kimiRefresher) },
+                        provider: .kimi(model: cfg?.managed_model ?? "k3"))
+                    return LaneSelectingAdapter(engineer: .kimi, native: native,
+                                                managed: managed,
+                                                laneObserver: laneObserver)
                 case .deepseek:
-                    return DeepSeekAdapter(
-                        sessionsDir: home + "/sessions/deepseek",
-                        model: engineersConfig.engineer(.deepseek)?.model_selection
-                            ?? DeepSeekAdapter.defaultModel,
+                    let cfg = engineersConfig.engineer(.deepseek)
+                    let managed = managedAdapter(
+                        .deepseek,
                         keyReader: { try DeepSeekAdapter.readCredential() },
-                        toolExecutor: { _, _ in "{}" }) // rebound after service init
+                        provider: .deepseek(
+                            model: cfg?.managed_model ?? cfg?.model_selection
+                                ?? DeepSeekAdapter.defaultModel))
+                    return LaneSelectingAdapter(engineer: .deepseek, native: nil,
+                                                managed: managed,
+                                                laneObserver: laneObserver)
                 }
             } catch {
                 Self.log("live adapter \(engineer.rawValue) setup failed: "
@@ -198,17 +372,16 @@ public final class DaemonRuntime: @unchecked Sendable {
             }
         }
 
-        let built: [EngineerAdapter] = EngineerID.allCases.map {
-            isFake($0) ? FakeAdapter(engineer: $0) as EngineerAdapter
-                : (liveAdapter($0, worktreeHint: home + "/worktrees/_default")
-                    ?? UnconfiguredAdapter(engineer: $0))
+        let built: [EngineerAdapter] = EngineerID.allCases.map { engineer in
+            isFake(engineer) ? { () -> EngineerAdapter in
+                let fake = FakeAdapter(engineer: engineer)
+                fakeConfigurator?(fake)
+                return fake
+            }()
+                : (liveAdapter(engineer, worktreeHint: home + "/worktrees/_default")
+                    ?? UnconfiguredAdapter(engineer: engineer))
         }
         self.adapters = built
-        let fakeNames = EngineerID.allCases.filter { isFake($0) }.map(\.rawValue)
-        if !fakeNames.isEmpty {
-            Self.log("WARNING: fake adapters active for [\(fakeNames.joined(separator: ", "))] "
-                + "(WORKSHOP_ADAPTERS=\(adaptersMode)); their turns are marked '[FAKE ADAPTER]' in the journal")
-        }
         self.adaptersModeLive = Set(EngineerID.allCases.filter { !isFake($0) })
 
         let dbPath = home + "/db/workshop.sqlite"
@@ -226,6 +399,7 @@ public final class DaemonRuntime: @unchecked Sendable {
                                                adapters: built, homeDir: home,
                                                capacityPolicies: policies)
         self.service = service
+        serviceBox.service = service
         Self.log("opened database at \(dbPath)")
         service.deepLinkHandlerVerified = Self.deepLinkRegistered()
         self.buildID = Self.buildID(executable: ownExecutable)
@@ -237,39 +411,20 @@ public final class DaemonRuntime: @unchecked Sendable {
         }
         self.pendingHome = home
 
-        // DeepSeek executes Workshop tools directly against the service.
-        if !isFake(.deepseek) {
-            let bound = DeepSeekAdapter(
-                sessionsDir: home + "/sessions/deepseek",
-                model: engineersConfig.engineer(.deepseek)?.model_selection
-                    ?? DeepSeekAdapter.defaultModel,
-                keyReader: { try DeepSeekAdapter.readCredential() },
-                toolExecutor: { name, args in
-                    guard WorkshopToolCatalog.method(for: name) != nil else {
-                        return #"{"error":"unknown tool"}"#
-                    }
-                    do {
-                        let result = try await service.callTool(
-                            name, args: args, principal: .engineer(.deepseek))
-                        let data = try? JSONEncoder().encode(result)
-                        return data.map { String(decoding: $0, as: UTF8.self) } ?? "{}"
-                    } catch let error as WorkshopRPCError {
-                        return #"{"error":"\#(error.message)"}"#
-                    }
-                })
-            // Managed-history compaction summary comes from the latest valid
-            // checkpoint — no model call.
-            bound.checkpointSummary = { taskID in
-                guard let cp = try? await service.loadValidCheckpoint(
-                    taskID: taskID, engineerID: .deepseek) else { return nil }
-                return cp.content
-            }
-            // Rebind without blocking init; the caller awaits readiness.
-            self.deepseekRebind = bound
-        }
-
         let server = try IPCServer(socketPath: socket)
         self.server = server
+        // A successful session open means the CLI just touched its grant;
+        // refresh that engineer's canary immediately instead of waiting for
+        // the 30-minute sweep.
+        service.sessionOpenedHook = { [weak self] engineer in
+            guard let self else { return }
+            let (state, detail) = await CredentialCanary.check(
+                engineer: engineer, home: self.home)
+            await service.recordCredentialStatus(engineer: engineer,
+                                                 state: state.rawValue,
+                                                 detail: detail)
+        }
+        applyCapabilities()
         let userTokenPath = runtime + "/user.token"
         guard (try? fm.destinationOfSymbolicLink(atPath: userTokenPath)) == nil else {
             throw WorkshopError.invalidRequest("User token path is a symlink")
@@ -301,6 +456,10 @@ public final class DaemonRuntime: @unchecked Sendable {
                 try await service.promoteWriterSnapshot(id: params?["writer_id"]?.stringValue ?? "",
                     verifiedDigest: params?["verified_digest"]?.stringValue ?? "", principal: principal)
                 return .object(["accepted": .bool(true)])
+            case "workshop.reloadCapabilities":
+                self.capabilityStore.reload()
+                self.applyCapabilities()
+                return .object(["ok": .bool(true)])
             case WorkshopProtocol.health:
                 return .object([
                     "status": .string("ok"),
@@ -343,12 +502,17 @@ public final class DaemonRuntime: @unchecked Sendable {
                 let afterSeq = params?["after_seq"]?.intValue ?? 0
                 let limit = Int(params?["limit"]?.intValue ?? 500)
                 return try .from(try await service.readMessages(id, afterSeq: afterSeq,
-                                                              limit: limit))
+                    limit: limit,
+                    includeSummaries: params?["include_summaries"].flatMap {
+                        if case .bool(let b) = $0 { return b }
+                        return nil
+                    } ?? false))
             case WorkshopProtocol.postMessage:
                 let id = TaskID(params?["task_id"]?.stringValue ?? "")
                 let body = params?["body"]?.stringValue ?? ""
-                return try .from(try await service.postMessage(taskID: id, body: body,
-                                                               principal: principal))
+                return try .from(try await service.postMessage(
+                    taskID: id, body: body, principal: principal,
+                    idempotencyKey: params?["idempotency_key"]?.stringValue))
             case WorkshopProtocol.listEngineers:
                 return try .from(await service.listEngineers())
             case WorkshopProtocol.listProposals:
@@ -424,7 +588,11 @@ public final class DaemonRuntime: @unchecked Sendable {
                 let beforeSeq = params?["before_seq"]?.intValue
                 let limit = Int(params?["limit"]?.intValue ?? 500)
                 return try .from(try await service.readMessagePage(
-                    id, beforeSeq: beforeSeq, limit: limit))
+                    id, beforeSeq: beforeSeq, limit: limit,
+                    includeSummaries: params?["include_summaries"].flatMap {
+                        if case .bool(let b) = $0 { return b }
+                        return nil
+                    } ?? false))
             case WorkshopProtocol.recoverySummary:
                 let id = TaskID(params?["task_id"]?.stringValue ?? "")
                 return try await service.recoverySummary(taskID: id)
@@ -472,9 +640,6 @@ public final class DaemonRuntime: @unchecked Sendable {
         }
     }
 
-    /// DeepSeek adapter needing a bound service reference, applied in `start()`.
-    private var deepseekRebind: DeepSeekAdapter?
-
     /// Build identity reported by workshop.health — the bundle's
     /// CFBundleVersion when running packaged ("bundle:<ver>"), else the
     /// executable's mtime+size ("bin:<mtime>-<size>"). The app compares its own
@@ -504,22 +669,29 @@ public final class DaemonRuntime: @unchecked Sendable {
         return handler == "ai.maapu.workshop"
     }
 
-    /// <home>/bin/workshop-mcp → sibling of this executable.
-    static func installBridgeSymlink(home: String, ownExecutable: String) {
+    /// Atomically refresh the stable MCP executable used by Codex and peers.
+    static func installBridgeCopy(home: String, env: [String: String],
+                                  ownExecutable: String) -> String? {
         let fm = FileManager.default
-        let target = (ownExecutable as NSString).deletingLastPathComponent
-            + "/workshop-mcp"
-        guard fm.fileExists(atPath: target) else { return }
+        guard let source = resolveMCPBridge(env: env, ownExecutable: ownExecutable) else {
+            return nil
+        }
         let binDir = home + "/bin"
-        try? fm.createDirectory(atPath: binDir, withIntermediateDirectories: true)
-        let link = binDir + "/workshop-mcp"
-        if (try? fm.destinationOfSymbolicLink(atPath: link)) == target { return }
-        try? fm.removeItem(atPath: link)
+        let destination = binDir + "/workshop-mcp"
+        let staging = binDir + "/.workshop-mcp-\(UUID().uuidString)"
         do {
-            try fm.createSymbolicLink(atPath: link, withDestinationPath: target)
-            Self.log("bridge symlink \(link) -> \(target)")
+            try fm.createDirectory(atPath: binDir, withIntermediateDirectories: true)
+            try fm.copyItem(atPath: source, toPath: staging)
+            guard chmod(staging, 0o755) == 0,
+                  rename(staging, destination) == 0 else {
+                throw WorkshopError.invalidRequest("Cannot install Workshop MCP bridge")
+            }
+            Self.log("bridge copy \(destination) from \(source)")
+            return destination
         } catch {
-            Self.log("bridge symlink failed: \(error.localizedDescription)")
+            try? fm.removeItem(atPath: staging)
+            Self.log("bridge copy failed: \(error.localizedDescription)")
+            return nil
         }
     }
 
@@ -550,16 +722,39 @@ public final class DaemonRuntime: @unchecked Sendable {
         return nil
     }
 
-    /// Listen on the socket, bind the DeepSeek adapter, broadcast events, and
+    /// G-E5: inject the capability-record lookup into live lanes and flag
+    /// binary drift (advisory — the recorded qualification still stands).
+    private func applyCapabilities() {
+        for subject in adapters.compactMap({ $0 as? CapabilityAwareAdapter })
+                               .flatMap(\.capabilitySubjects)
+            where adaptersModeLive.contains(subject.engineer) {
+            subject.capabilityLookup = { [capabilityStore] identity in
+                capabilityStore.record(for: identity)
+            }
+            if let identity = subject.qualificationIdentity,
+               let record = capabilityStore.record(for: identity),
+               let recorded = record.binarySHA256,
+               let binary = subject.qualificationBinaryPath,
+               CapabilityStore.sha256(file: binary) != recorded {
+                subject.binaryDriftNotice =
+                    "binary changed since qualification (UNTESTED)"
+                let engineer = subject.engineer
+                Task { await service.markBinaryDrifted(engineer) }
+            }
+        }
+    }
+
+    /// Listen on the socket, broadcast events, and
     /// start service recovery/dispatch.
     private var pendingHome: String?
     private var adaptersModeLive: Set<EngineerID> = []
+    /// Kimi's grant is refreshed only by the Kimi CLI itself (rotating
+    /// refresh token); the hook spawns `kimi acp` once, zero inference.
+    private var kimiRefreshHook: (@Sendable (String) async throws
+        -> KimiCLIRefresh.RefreshReport)?
+    private var kimiBinaryPath: String?
 
     public func start() async throws {
-        if let bound = deepseekRebind {
-            await service.registerAdapter(bound)
-            deepseekRebind = nil
-        }
         if let home = pendingHome {
             // Bounded balance probe (one GET /user/balance, ≤ every 10 min).
             await service.setBalanceProbe { engineer in
@@ -574,18 +769,80 @@ public final class DaemonRuntime: @unchecked Sendable {
             await service.refreshDeepSeekBalance()
         }
         try server.start()
+        try mcpServer.start()
+        let mcpInfo = String(decoding: try JSONEncoder().encode(JSONValue.object([
+            "url": .string(mcpServer.url),
+            "catalog_version": .number(Double(WorkshopToolCatalog.catalogVersion)),
+            "pid": .number(Double(ProcessInfo.processInfo.processIdentifier)),
+            "started_at": .string(WorkshopTime.string(Date())),
+        ])), as: UTF8.self)
+        let mcpInfoPath = runtimeDir + "/mcp.json"
+        try mcpInfo.write(toFile: mcpInfoPath, atomically: true, encoding: .utf8)
+        chmod(mcpInfoPath, 0o600)
+        Self.log("mcp endpoint \(mcpServer.url)")
         Self.log("listening on \(socketPath)")
         broadcastTask = Task.detached { [service, server] in
             for await event in await service.makeEventStream() {
                 server.broadcastEvent(event)
             }
         }
+        // G-E5: pick up qualification records written by `qualify` runs.
+        capabilityStore.reload()
+        applyCapabilities()
+        let qualified = capabilityStore.load()
+            .filter { $0.qualified }
+            .map { $0.engineer.rawValue + "/" + $0.lane }
+            .sorted().joined(separator: ", ")
+        Self.log("capabilities: \(capabilityStore.load().count) records"
+            + (qualified.isEmpty ? "" : "; qualified: \(qualified)"))
+        // G-D1: zero-inference credential canaries at start and every 30 min.
+        let liveEngineers = adaptersModeLive
+        await CredentialCanary.runAll(home: home, service: service,
+                                      only: liveEngineers)
+        canaryTask = Task.detached { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1800))
+                guard let self else { return }
+                await CredentialCanary.runAll(home: self.home,
+                                              service: self.service,
+                                              only: liveEngineers)
+            }
+        }
         await service.start()
+        // Generation retention sweep (decision D-e): once after recovery,
+        // then every ten minutes.
+        if let report = await service.pruneGenerations(),
+           report.deletedDirs > 0 {
+            Self.log("pruned \(report.deletedDirs) generation dirs "
+                     + "(\(report.bytes / 1_048_576) MB)")
+        }
+        pruneTask = Task.detached { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(600))
+                guard let self else { return }
+                if let report = await self.service.pruneGenerations(),
+                   report.deletedDirs > 0 {
+                    Self.log("pruned \(report.deletedDirs) generation dirs "
+                             + "(\(report.bytes / 1_048_576) MB)")
+                }
+            }
+        }
     }
 
     public func shutdown() async {
         broadcastTask?.cancel()
+        canaryTask?.cancel()
+        pruneTask?.cancel()
         await service.shutdown()
         server.stop()
+        mcpServer.stop()
+        try? FileManager.default.removeItem(atPath: runtimeDir + "/mcp.json")
     }
+}
+
+/// Late binding for the CollaborationService: the MCP HTTP server must bind
+/// before adapters are built (they embed its URL), but its auth closures call
+/// the service, which exists only after the adapters. Resolved per request.
+final class ServiceBox: @unchecked Sendable {
+    var service: CollaborationService?
 }

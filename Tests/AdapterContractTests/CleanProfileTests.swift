@@ -31,6 +31,18 @@ final class CleanProfileTests: XCTestCase {
         XCTAssertFalse(env["PATH"]!.contains("personal"))
     }
 
+    func testKimiHomeIsTheCleanProfile() {
+        let profile = "/tmp/workshop-clean-kimi"
+        let env = ProfileBuilder.kimiEnvironment(profile: profile, source: [
+            "HOME": "/test-home", "PATH": "/test-home/bin",
+            "BASH_ENV": "/test-home/hook", "USER": "test",
+        ])
+        XCTAssertEqual(env["HOME"], profile)
+        XCTAssertEqual(env["KIMI_CODE_HOME"], profile)
+        XCTAssertNil(env["BASH_ENV"])
+        XCTAssertFalse(env["PATH"]!.contains("test-home"))
+    }
+
     func testKimiProfileDriftIsRejectedWithoutDeletion() throws {
         let home = NSTemporaryDirectory() + "clean-profile-" + UUID().uuidString
         let profile = try ProfileBuilder.kimiProfile(home: home)
@@ -40,20 +52,69 @@ final class CleanProfileTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker))
     }
 
-    /// The pre-repair profile symlinked credentials into the user's real
-    /// ~/.kimi-code store, letting a sandboxed refresh wipe it. The profile
-    /// must hold a real directory instead — the symlink is migrated away.
-    func testKimiCredentialsSymlinkMigratesToOwnedDirectory() throws {
-        let home = NSTemporaryDirectory() + "clean-creds-" + UUID().uuidString
-        let profile = try ProfileBuilder.kimiProfile(home: home)
-        let credDir = profile + "/credentials"
-        try FileManager.default.removeItem(atPath: credDir)
-        try FileManager.default.createSymbolicLink(atPath: credDir, withDestinationPath: "/tmp")
-        _ = try ProfileBuilder.kimiProfile(home: home)
-        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: credDir))
-        var isDir: ObjCBool = false
-        XCTAssertTrue(FileManager.default.fileExists(atPath: credDir, isDirectory: &isDir))
-        XCTAssertTrue(isDir.boolValue)
+    func testLegacyKimiCredentialDirectoryIsBackedUpAndLinked() throws {
+        let home = NSTemporaryDirectory() + "clean-kimi-credentials-" + UUID().uuidString
+        let fm = FileManager.default
+        let profile = home + "/profiles/clean-v2/kimi"
+        let canonical = home + "/canonical/credentials"
+        try fm.createDirectory(atPath: profile + "/credentials", withIntermediateDirectories: true)
+        try fm.createDirectory(atPath: canonical, withIntermediateDirectories: true)
+        try "OLD".write(toFile: profile + "/credentials/old.json", atomically: true, encoding: .utf8)
+        try "NEW".write(toFile: canonical + "/current.json", atomically: true, encoding: .utf8)
+
+        try ProfileBuilder.reconcileKimiCredentialLink(home: home, profile: profile, target: canonical)
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: profile + "/credentials"), canonical)
+        XCTAssertEqual(try String(contentsOfFile: profile + "/credentials/current.json", encoding: .utf8), "NEW")
+        let backups = try fm.contentsOfDirectory(atPath: home + "/backups")
+        XCTAssertEqual(backups.count, 1)
+        XCTAssertEqual(try String(contentsOfFile: home + "/backups/" + backups[0] + "/old.json", encoding: .utf8), "OLD")
+
+        try ProfileBuilder.reconcileKimiCredentialLink(home: home, profile: profile, target: canonical)
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: home + "/backups").count, 1)
+    }
+
+    func testKimiCredentialLinkDriftIsRejected() throws {
+        let home = NSTemporaryDirectory() + "clean-kimi-drift-" + UUID().uuidString
+        let fm = FileManager.default
+        let profile = home + "/profiles/clean-v2/kimi"
+        let canonical = home + "/canonical/credentials"
+        try fm.createDirectory(atPath: profile, withIntermediateDirectories: true)
+        try fm.createDirectory(atPath: canonical, withIntermediateDirectories: true)
+        try fm.createSymbolicLink(atPath: profile + "/credentials", withDestinationPath: home + "/wrong")
+        XCTAssertThrowsError(try ProfileBuilder.reconcileKimiCredentialLink(
+            home: home, profile: profile, target: canonical))
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: profile + "/credentials"), home + "/wrong")
+    }
+
+    func testKimiOAuthReferenceUsesCurrentRegionAndCredentialKey() throws {
+        let root = NSTemporaryDirectory() + "clean-kimi-oauth-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        let path = root + "/config.toml"
+        try """
+        [providers."managed:kimi-code"]
+        type = "kimi"
+        api_key = ""
+        base_url = "https://api.kimi.ai/coding/v1"
+        [providers."managed:kimi-code".oauth]
+        storage = "file"
+        key = "oauth/kimi-code-env-0123abcd"
+        oauth_host = "https://auth.kimi.ai"
+        [providers.deepseek]
+        type = "openai"
+        """.write(toFile: path, atomically: true, encoding: .utf8)
+        let ref = try ProfileBuilder.kimiOAuthReference(path: path)
+        XCTAssertEqual(ref.baseURL, "https://api.kimi.ai/coding/v1")
+        XCTAssertEqual(ref.key, "oauth/kimi-code-env-0123abcd")
+        XCTAssertEqual(ref.oauthHost, "https://auth.kimi.ai")
+
+        try """
+        [providers."managed:kimi-code"]
+        base_url = "https://untrusted.example/coding/v1"
+        [providers."managed:kimi-code".oauth]
+        key = "oauth/kimi-code-env-0123abcd"
+        oauth_host = "https://auth.kimi.ai"
+        """.write(toFile: path, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try ProfileBuilder.kimiOAuthReference(path: path))
     }
 
     func testSandboxBlocksInstructionCanariesButAllowsSourceAndNativeSkill() throws {

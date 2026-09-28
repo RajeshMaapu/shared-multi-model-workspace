@@ -1,14 +1,14 @@
 # Phase 5 evidence index
 
 - Codex transcripts (raw evidence retained privately, see
-  `docs/evidence/README.md`): run 1 created `<redacted-task-id>`
-  via workshop_create_task (committed_seq 2, queued, deep
+  `docs/evidence/README.md`): run 1 created task_<id>
+  b59c-1880081b72c0 via workshop_create_task (committed_seq 2, queued, deep
   link present; model gpt-5.6-luna — configured gpt-6-astra needed a newer
   CLI); run 2 re-sent the same brief but the model used the untruncated
   64-char sha → distinct key → second task (fixed by key normalization,
   ADR 0015); run 3 posted the follow-up (seq 6, author user + via=codex,
   owner wakeup dispatched).
-- `deeplink-task.png` — `open workshop://task/<redacted-task-id>` selected the
+- `deeplink-task.png` — `open workshop://task/task_<id>…` selected the
   Codex-created task in the packaged app. Re-captured on the rc1 rebuild:
   the tool-only DeepSeek turn no longer leaves an empty row and via=codex
   messages no longer show a "via codex" structured card.

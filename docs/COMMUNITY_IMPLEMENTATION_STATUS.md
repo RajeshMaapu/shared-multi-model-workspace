@@ -2,22 +2,20 @@
 
 Status: partial implementation, not production qualification. Recorded September 16, 2026.
 
-This is a historical community milestone. See [native generation repair](NATIVE_GENERATION_REPAIR.md) for the later writer-isolation and authentication changes; the remaining limitations below are not a production-readiness claim.
-
 ## Source and runnable deliverables
 
-- Historical development checkout: `<development-checkout>`.
+- Worktree: `~/projects/Workshop-community`.
 - Branch: `devin/workshop-community`, based on `66c1d28` (preserves `94baa5c` clean-profile work).
-- At this milestone the changes were uncommitted. This public snapshot includes that source; publication does not install, deploy, restart services, or migrate live data.
+- Changes remain uncommitted. No merge, push, deployment, installed-app replacement, production service restart, or live-data migration performed.
 - Current Electron bundle: `dist/desktop-preview-1789572817370/Workshop Preview-darwin-arm64/Workshop Preview.app`.
 - Electron runtime 42.9.1; packager 20.3.0. Separate preview bundle ID and user-data directory; installed Workshop URL registration unchanged.
-- Current isolated development home/runtime: `<isolated-runtime>`; fake adapters only.
+- Current isolated development home/runtime: `/private/tmp/workshop-final.svo2GQ`; fake adapters only.
 - Current web preview: `http://127.0.0.1:4177`.
 
-To launch a separately built preview, set `WORKSHOP_PREVIEW_APP` to its bundle path and `WORKSHOP_RUNTIME_DIR` to the runtime directory of an isolated fake-adapter daemon:
+Launch the built preview against the running isolated daemon:
 
 ```sh
-"$WORKSHOP_PREVIEW_APP/Contents/MacOS/Workshop Preview" --workshop-socket "$WORKSHOP_RUNTIME_DIR/service.sock"
+"~/projects/Workshop-community/dist/desktop-preview-1789572817370/Workshop Preview-darwin-arm64/Workshop Preview.app/Contents/MacOS/Workshop Preview" --workshop-socket /private/tmp/workshop-final.svo2GQ/service.sock
 ```
 
 The preview requires an explicit socket. It does not automatically start the installed daemon or migrate its data. Quitting the UI does not stop the separately running daemon. The earlier test instance at port 4176 remains separate from the latest instance.
@@ -73,8 +71,8 @@ Managed installed files:
 
 Backups:
 
-1. `~/.codex/workshop-skill-backups/<first-backup>` — original skill before first installation, before metadata was added to the installer.
-2. `~/.codex/workshop-skill-backups/<second-backup>` — immediately before the metadata-inclusive update; contains the old UI prompt plus the first installed skill/helper.
+1. `~/.codex/workshop-skill-backups/team.20260916T151234Z-f96b0529` — original skill before first installation, before metadata was added to the installer.
+2. `~/.codex/workshop-skill-backups/team.20260916T151650Z-0e15f7e9` — immediately before the metadata-inclusive update; contains the old UI prompt plus the first installed skill/helper.
 
 To undo both stages, run the installer with `--rollback` on backup 2, then backup 1, in that order. Add `--dry-run` to inspect first. The script refuses to overwrite later user edits and reports newly introduced files that remain rather than deleting them blindly. The backup directories are outside Codex skill discovery, avoiding duplicate skills. Existing Codex sessions may need a new session/reload; fresh-session discovery was verified.
 

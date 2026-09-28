@@ -27,6 +27,7 @@
         "path": "~/.kimi-code/config.toml",
         "toml_path": "providers.kimi.api_key"
       },
+      "managed_fallback": true,
       "notes": "KIMI_CODE_HOME minimal config, empty skills dir, agentsMdPaths=[].",
       "executable": "~/.kimi-code/bin/kimi"
     },
@@ -44,6 +45,7 @@
         "path": "~/.kimi-code/config.toml",
         "toml_path": "providers.deepseek.api_key"
       },
+      "managed_fallback": true,
       "notes": "API credential reference only; adapter-managed session memory, no native subagents."
     }
   ],

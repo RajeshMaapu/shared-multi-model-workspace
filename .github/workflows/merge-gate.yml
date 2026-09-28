@@ -1,0 +1,49 @@
+name: merge-gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  merge-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base ref
+        run: git fetch --no-tags origin main
+
+      - name: Diff hygiene
+        run: git diff --check origin/main...HEAD
+
+      - name: Publication guard over PR history
+        run: |
+          echo "refs/heads/${{ github.head_ref }} ${{ github.event.pull_request.head.sha }} refs/heads/main $(git rev-parse origin/main)" \
+            | python3 .devin/security/publication_guard.py pre-push
+
+      - name: Skill tests
+        run: python3 -m unittest discover -s Tests/SkillTests
+
+      - name: Publication guard tests
+        run: python3 -m unittest discover -s Tests/SecurityTests
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Web and desktop unit tests
+        # The web-validation live-manifest test requires local
+        # .build/web-qa evidence artifacts that are intentionally
+        # gitignored; it is the only environmental test and is skipped
+        # by name pattern. The full Swift suite runs locally as the
+        # real CI gate (see docs/evidence/connection-redesign/).
+        run: >
+          node --test
+          --test-skip-pattern 'web validation gate accepts the live repo manifest'
+          Web/tests/*.test.mjs Desktop/tests/*.test.mjs

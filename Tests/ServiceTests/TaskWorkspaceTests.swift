@@ -53,6 +53,26 @@ final class TaskWorkspaceTests: XCTestCase {
         XCTAssertEqual(first.baseRevision, second.baseRevision)
     }
 
+    func testRegisteredProjectAcceptsAnotherGitWorktreeReference() throws {
+        let checkout = root + "/codex-checkout"
+        _ = try git(repository, ["worktree", "add", "--detach", checkout, "HEAD"])
+        let prepared = try WorkspaceManager.prepareTaskWorkspace(
+            homeDir: home, taskID: TaskID("task_codex"), workspaceRef: checkout)
+        XCTAssertEqual(prepared.repositoryPath, repository)
+        XCTAssertEqual(try git(prepared.path, ["symbolic-ref", "--short", "HEAD"]),
+                       "workshop/task_codex")
+        XCTAssertNotEqual(prepared.path, checkout)
+    }
+
+    func testUnregisteredRepositoryStillRejected() throws {
+        let unrelated = root + "/unrelated"
+        try FileManager.default.createDirectory(atPath: unrelated, withIntermediateDirectories: true)
+        _ = try git(unrelated, ["init"])
+        XCTAssertThrowsError(try WorkspaceManager.prepareTaskWorkspace(
+            homeDir: home, taskID: TaskID("task_unrelated"), workspaceRef: unrelated))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home + "/worktrees/task_unrelated"))
+    }
+
     func testInvalidReferenceAndExistingScratchFailClosed() throws {
         XCTAssertThrowsError(try WorkspaceManager.prepareTaskWorkspace(homeDir: home, taskID: TaskID("task_unknown"), workspaceRef: "missing"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: home + "/worktrees/task_unknown"))
@@ -117,6 +137,82 @@ final class TaskWorkspaceTests: XCTestCase {
         let detail = try await service.getTask(receipt.taskID)
         XCTAssertEqual(detail.task.state, .blocked)
         XCTAssertNil(detail.workspace)
+        await service.shutdown()
+    }
+
+    func testChangeRequestKeepsWriterAuthorityWhenCoalescedWithMention() async throws {
+        let adapter = FakeAdapter(engineer: .devin, delayPerDelta: .zero)
+        let databasePath = home + "/coalesced-writer.sqlite"
+        let service = try CollaborationService(databasePath: databasePath,
+            adapters: [adapter], dispatcherEnabled: false,
+            homeDir: home, wakeupCoalescence: .zero)
+        let receipt = try await service.createTask(CreateTaskRequest(
+            schemaVersion: 2, idempotencyKey: "coalesced-writer", title: "Revise",
+            objective: "Revise reviewed files", phase: .execution,
+            participants: [], workspaceRef: "project", collaborationMode: .ownerOnly))
+        let repo = WorkshopRepository(db: try Database(path: databasePath))
+        let now = Date()
+        try repo.insertSubtask(Subtask(id: SubtaskID("sub_coalesced_writer"),
+            taskID: receipt.taskID, title: "Revise", ownerID: .devin,
+            generation: 1, state: .working, verification: "changes_requested",
+            createdAt: now, updatedAt: now))
+        try repo.updateTaskState(receipt.taskID, .working, at: now)
+        try repo.insertWakeup(taskID: receipt.taskID, engineerID: .devin,
+                              reason: "changes_requested", triggerSeq: nil, at: now)
+        try repo.insertWakeup(taskID: receipt.taskID, engineerID: .devin,
+                              reason: "mention", triggerSeq: nil, at: now)
+        await service.start()
+        for _ in 0..<100 where adapter.receivedContexts.isEmpty {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(adapter.receivedContexts.first?.workspace?.state, "writer")
+        await service.shutdown()
+    }
+
+    func testBlockedWorkspaceCanRetryAfterRegistryRepair() async throws {
+        let adapter = FakeAdapter(engineer: .devin, delayPerDelta: .zero)
+        let service = try CollaborationService(databasePath: home + "/retry.sqlite",
+            adapters: [adapter], homeDir: home, wakeupCoalescence: .zero)
+        adapter.toolRunner = { [weak service] name, args, principal in
+            guard let service else { return .null }
+            return try await service.callTool(name, args: args, principal: principal)
+        }
+        adapter.script = { context in
+            guard let sub = context.subtask else { return [.text("ok")] }
+            return [.toolCall("workshop_report_result", .object([
+                "task_id": .string(context.task.id.rawValue),
+                "subtask_id": .string(sub.id.rawValue),
+                "summary": .string("done"),
+                "generation": .number(Double(sub.generation))]))]
+        }
+        let receipt = try await service.createTask(CreateTaskRequest(
+            schemaVersion: 2, idempotencyKey: "retry-workspace", title: "Workspace",
+            objective: "Test workspace", phase: .execution, participants: [],
+            workspaceRef: "late-project"))
+        await service.start()
+        await service.awaitIdle()
+        let blocked = try await service.getTask(receipt.taskID)
+        XCTAssertEqual(blocked.task.state, .blocked)
+        XCTAssertEqual(adapter.turnCount, 0)
+        let store = WorkshopRepository(db: try Database(path: home + "/retry.sqlite"))
+        let subtask = try XCTUnwrap(blocked.subtasks.first)
+        try store.updateSubtaskState(subtask.id, .blocked, at: Date())
+
+        let config: JSONValue = .object(["projects": .array([.object([
+            "id": .string("late-project"), "path": .string(repository)])])])
+        try JSONEncoder().encode(config).write(to:
+            URL(fileURLWithPath: home + "/config/projects.json"))
+        try await service.resumeTask(taskID: receipt.taskID, principal: .user)
+        var resumed = try await service.getTask(receipt.taskID)
+        for _ in 0..<100 where resumed.task.state != .verifying {
+            try await Task.sleep(for: .milliseconds(20))
+            resumed = try await service.getTask(receipt.taskID)
+        }
+        await service.awaitIdle()
+        resumed = try await service.getTask(receipt.taskID)
+        XCTAssertEqual(resumed.task.state, .verifying)
+        XCTAssertEqual(resumed.subtasks.first?.state, .review)
+        XCTAssertGreaterThan(adapter.turnCount, 0)
         await service.shutdown()
     }
 }

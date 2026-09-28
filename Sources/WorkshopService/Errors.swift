@@ -25,10 +25,14 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
     case blockedByDependency(SubtaskID)
     /// Report revision no longer current (-32008, T08).
     case staleRevision(expected: Int, actual: Int?)
+    /// Review targeted a superseded result message (-32008).
+    case staleResult(latestMessageID: String, latestRevision: Int)
     /// Stale ownership generation fenced at the tool boundary (-32004, T05).
     case staleGeneration(engineer: EngineerID, supplied: Int, current: Int)
     /// Free disk below the storage-guard threshold (-32010, T30).
     case storageLow(freeBytes: Int64)
+    /// Too many concurrent wait_for_events waiters for this principal kind.
+    case tooManyWaiters
 
     /// JSON-RPC error code for this failure.
     public var rpcCode: Int {
@@ -47,6 +51,8 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
             return WorkshopProtocol.ErrorCode.notOwner
         case .storageLow:
             return WorkshopProtocol.ErrorCode.storageLow
+        case .tooManyWaiters:
+            return WorkshopProtocol.ErrorCode.tooManyWaiters
         case .workspaceEscape:
             return WorkshopProtocol.ErrorCode.invalidParams
         case .phaseNotImplemented:
@@ -57,7 +63,7 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
             return WorkshopProtocol.ErrorCode.approvalRequired
         case .blockedByDependency:
             return WorkshopProtocol.ErrorCode.blockedByDependency
-        case .staleRevision:
+        case .staleRevision, .staleResult:
             return WorkshopProtocol.ErrorCode.staleRevision
         case .illegalTransition, .adapterUnavailable:
             return WorkshopProtocol.ErrorCode.internalError
@@ -94,10 +100,14 @@ public enum WorkshopError: WorkshopRPCError, Equatable {
             return "Subtask \(sub.rawValue) has unfinished dependencies"
         case .staleRevision(let expected, let actual):
             return "Stale report revision \(expected); current is \(actual.map(String.init) ?? "none")"
+        case .staleResult(let latestMessageID, let latestRevision):
+            return "result superseded; review the latest result \(latestMessageID) (revision \(latestRevision))"
         case .staleGeneration(let engineer, let supplied, let current):
             return "Stale ownership generation \(supplied) from \(engineer.rawValue); current is \(current)"
         case .storageLow(let freeBytes):
             return "Storage critically low (\(freeBytes / 1_048_576) MiB free); write refused"
+        case .tooManyWaiters:
+            return "Too many concurrent wait_for_events waiters"
         }
     }
 }
@@ -116,4 +126,45 @@ public func workshopErrorDescription(_ error: Error) -> String {
        let detail = localized.errorDescription { return detail }
     if error is CancellationError { return "cancelled" }
     return String(describing: error)
+}
+
+/// Coarse classification of a turn-startup failure (G-D2): decides whether a
+/// retry can help (timeout/transport) or must stop (auth) and what remedy to
+/// surface on the engineer card.
+public enum StartupFailureClass: String, Sendable {
+    case auth, timeout, transport, sandbox, `internal`, unknown
+
+    public static func classify(_ description: String) -> StartupFailureClass {
+        let d = description.lowercased()
+        if ["authentication required", "-32000", "oauthunauthorized",
+            "authorization grant", "login required"].contains(where: d.contains) {
+            return .auth
+        }
+        if ["timed out", "timeout", "no response after"].contains(where: d.contains) {
+            return .timeout
+        }
+        if ["broken pipe", "filehandle", "connection closed", "eof",
+            "cancelled"].contains(where: d.contains) {
+            return .transport
+        }
+        if ["eperm", "operation not permitted", "sandbox"].contains(where: d.contains) {
+            return .sandbox
+        }
+        if ["-32603", "internal error"].contains(where: d.contains) {
+            return .internal
+        }
+        return .unknown
+    }
+
+    /// User-facing remedy for an auth-class failure, per engineer.
+    public static func loginRemedy(for engineer: EngineerID) -> String {
+        switch engineer {
+        case .devin:
+            return "run `devin` once in a terminal to refresh credentials"
+        case .kimi:
+            return "run `kimi acp --login` (or `kimi --login`) in a terminal"
+        case .deepseek:
+            return "check the DeepSeek API key reference in the Kimi config"
+        }
+    }
 }

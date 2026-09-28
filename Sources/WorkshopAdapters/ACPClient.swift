@@ -1,6 +1,7 @@
 import Foundation
 import os
 import WorkshopCore
+import WorkshopService
 
 /// Line-oriented transport for an ACP agent process.
 public protocol ACPTransport: Sendable {
@@ -125,29 +126,34 @@ public actor ACPClient {
         case sessionUpdate(JSONValue)
         case permissionRequested(title: String, chosen: String)
         case permissionDenied(String)
-        case permissionDecision(ACPPermissionDecision)
     }
 
     private let transport: ACPTransport
-    private let permissionPolicy: ACPPermissionPolicy
+    private var capabilities: TurnCapabilityManifest = .writer
     private var nextID: Int64 = 1
     private var pending: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
+    private var toolCalls: [String: JSONValue] = [:]
     private var eventContinuations: [UUID: AsyncStream<ServerEvent>.Continuation] = [:]
     /// Synchronous sink invoked inside the read loop — events emitted while a
     /// `call` is in flight are guaranteed delivered before that call resumes.
     private var eventSink: (@Sendable (ServerEvent) -> Void)?
     private var readerTask: Task<Void, Never>?
-    private var toolCalls: [String: JSONValue] = [:]
-    private var toolCallOrder: [String] = []
     private let log = Logger(subsystem: "ai.maapu.workshop", category: "acp")
 
-    public init(transport: ACPTransport,
-                permissionPolicy: ACPPermissionPolicy = ACPPermissionPolicy()) {
+    public init(transport: ACPTransport) {
         self.transport = transport
-        self.permissionPolicy = permissionPolicy
         let t = transport
         readerTask = Task { await self.readLoop(t.lines) }
     }
+
+    /// Residual permission policy for the current turn; the per-generation
+    /// sandbox is the enforcement boundary.
+    public func setCapabilities(_ manifest: TurnCapabilityManifest) {
+        capabilities = manifest
+    }
+
+    /// Current manifest — exposed for adapter tests.
+    public var currentCapabilities: TurnCapabilityManifest { capabilities }
 
     public func events() -> AsyncStream<ServerEvent> {
         let id = UUID()
@@ -163,9 +169,16 @@ public actor ACPClient {
 
     /// Send a request and await its correlated response.
     @discardableResult
-    public func call(_ method: String, params: JSONValue? = nil) async throws -> JSONValue {
+    public func call(_ method: String, params: JSONValue? = nil,
+                     timeout: Duration? = nil) async throws -> JSONValue {
         let id = nextID
         nextID += 1
+        if let timeout {
+            Task {
+                try? await Task.sleep(for: timeout)
+                self.expireRequest(id, method: method)
+            }
+        }
         return try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
             var request: [String: JSONValue] = [
@@ -182,6 +195,12 @@ public actor ACPClient {
                 continuation.resume(throwing: error)
             }
         }
+    }
+
+    private func expireRequest(_ id: Int64, method: String) {
+        guard let continuation = pending.removeValue(forKey: id) else { return }
+        continuation.resume(throwing: ACPError.timeout(method))
+        close()
     }
 
     /// JSON-RPC notification: intentionally no id and no response waiter.
@@ -244,111 +263,86 @@ public actor ACPClient {
         // Notification.
         if msg["method"]?.stringValue == "session/update",
            let update = msg["params"]?["update"] {
-            if update["sessionUpdate"]?.stringValue == "tool_call"
-                || update["sessionUpdate"]?.stringValue == "tool_call_update" {
-                rememberToolCall(sessionID: msg["params"]?["sessionId"]?.stringValue,
-                                 update: update)
+            if update["sessionUpdate"]?.stringValue == "tool_call",
+               let callID = update["toolCallId"]?.stringValue {
+                toolCalls[callID] = update
             }
             emit(.sessionUpdate(update))
         }
     }
 
-    // Some ACP servers (Devin) send only toolCallId in `toolCall`; the
-    // permission request may carry no typed fields at all.
-    // Structured identity must come from the matching session/update.
-    private func rememberToolCall(sessionID: String?, update: JSONValue) {
-        guard let sessionID, let callID = update["toolCallId"]?.stringValue,
-              !sessionID.isEmpty, !callID.isEmpty,
-              sessionID.count <= 256, callID.count <= 256,
-              !sessionID.contains("\0"), !callID.contains("\0") else { return }
-        let key = sessionID + "\0" + callID
-        var stored = toolCalls[key]?.objectValue ?? [:]
-        let identity = ACPPermissionPolicy.identity(update)
-        if identity.conflict { stored["_workshopIdentityConflict"] = .bool(true) }
-        if !identity.name.isEmpty {
-            if let old = stored["_meta"]?["cognition.ai/toolName"]?.stringValue, old != identity.name {
-                stored["_workshopIdentityConflict"] = .bool(true)
-            }
-            stored["_meta"] = .object(["cognition.ai/toolName": .string(identity.name)])
-        }
-        if let kind = update["kind"]?.stringValue {
-            if let old = stored["kind"]?.stringValue, old != kind {
-                stored["_workshopIdentityConflict"] = .bool(true)
-            }
-            stored["kind"] = .string(kind)
-        }
-        if let raw = update["rawInput"] {
-            if let data = try? JSONEncoder().encode(raw), data.count <= 64 * 1024 {
-                stored["rawInput"] = raw
-            } else {
-                stored["_workshopIdentityConflict"] = .bool(true)
-                stored.removeValue(forKey: "rawInput")
-            }
-        }
-        stored["toolCallId"] = .string(callID)
-        if toolCalls[key] == nil {
-            toolCallOrder.append(key)
-            while toolCallOrder.count > 256 {
-                let oldest = toolCallOrder.removeFirst()
-                toolCalls.removeValue(forKey: oldest)
-            }
-        }
-        toolCalls[key] = .object(stored)
-    }
-
-    private func resolvedToolCall(_ params: JSONValue?) -> (JSONValue, Bool) {
-        let request = params?["toolCall"] ?? .object([:])
-        var requestFields = request.objectValue ?? [:]
-        let identity = ACPPermissionPolicy.identity(request)
-        if identity.name.isEmpty { requestFields.removeValue(forKey: "_meta") }
-        else { requestFields["_meta"] = .object(["cognition.ai/toolName": .string(identity.name)]) }
-        guard let sessionID = params?["sessionId"]?.stringValue,
-              let callID = requestFields["toolCallId"]?.stringValue,
-              !sessionID.isEmpty, !callID.isEmpty,
-              sessionID.count <= 256, callID.count <= 256,
-              !sessionID.contains("\0"), !callID.contains("\0"),
-              var remembered = toolCalls[sessionID + "\0" + callID]?.objectValue else {
-            return (request, false)
-        }
-        var conflicting = identity.conflict || remembered["_workshopIdentityConflict"] != nil
-        remembered.removeValue(forKey: "_workshopIdentityConflict")
-        for field in ["_meta", "kind"] {
-            guard let old = remembered[field], let new = requestFields[field] else { continue }
-            if field == "_meta" {
-                let oldName = old["cognition.ai/toolName"]?.stringValue
-                let newName = new["cognition.ai/toolName"]?.stringValue
-                if let oldName, let newName, oldName != newName { conflicting = true }
-            } else if let oldKind = old.stringValue, let newKind = new.stringValue,
-                      oldKind != newKind {
-                conflicting = true
-            }
-        }
-        var merged = remembered
-        for field in ["_meta", "kind", "rawInput", "toolCallId"] where requestFields[field] != nil {
-            merged[field] = requestFields[field]
-        }
-        return (.object(merged), conflicting)
-    }
-
-    /// Permission policy: allow_once for typed tools and explicit scoped
-    /// commands; everything else selects a reject option or cancels.
+    /// Permission policy: decided by the ACP tool `kind` against the turn's
+    /// capability manifest — never by title/label string matching. The
+    /// per-generation sandbox is the enforcement boundary; this only shapes
+    /// the residual prompts.
     private func respondToPermission(id: JSONValue, params: JSONValue?) {
-        let (toolCall, conflicting) = resolvedToolCall(params)
-        var decision = permissionPolicy.decide(toolCall: toolCall)
-        if conflicting { decision.allowed = false; decision.reason = "conflicting_tool_update" }
+        // Diagnostic: append the raw request to <WORKSHOP_DIAG_DIR>/
+        // permission-requests.log when the env var is set (never secrets —
+        // tool titles and option kinds only).
+        if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"],
+           let data = try? JSONEncoder().encode(params ?? .null) {
+            let path = dir + "/permission-requests.log"
+            let line = String(decoding: data, as: UTF8.self) + "\n"
+            if let fh = FileHandle(forWritingAtPath: path) {
+                fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
+            } else {
+                FileManager.default.createFile(atPath: path,
+                                               contents: Data(line.utf8))
+            }
+        }
         let options = params?["options"]?.arrayValue ?? []
-        let valid = options.filter { !($0["optionId"]?.stringValue ?? "").isEmpty }
-        let allow = valid.first { $0["kind"]?.stringValue == "allow_once" }
-        if decision.allowed && allow == nil { decision.allowed = false; decision.reason = "allow_once_unavailable" }
-        let chosen = decision.allowed ? allow : valid.first { $0["kind"]?.stringValue == "reject_once" }
-            ?? valid.first { $0["kind"]?.stringValue == "reject_always" }
-        let outcome: JSONValue = chosen.map {
-            .object(["outcome": .string("selected"), "optionId": $0["optionId"]!])
-        } ?? .object(["outcome": .string("cancelled")])
-        sendRaw(["jsonrpc": .string("2.0"), "id": id, "result": .object(["outcome": outcome])])
-        emit(.permissionDecision(decision))
-        if decision.allowed { emit(.permissionRequested(title: decision.title, chosen: "allow_once")) }
-        else { emit(.permissionDenied(decision.title)) }
+        let call = params?["toolCall"]
+        let prior = call?["toolCallId"]?.stringValue.flatMap { toolCalls[$0] }
+        let title = call?["title"]?.stringValue ?? prior?["title"]?.stringValue ?? ""
+        switch ACPPermissionPolicy.decide(request: params ?? .null,
+                                          priorToolCall: prior,
+                                          capabilities: capabilities) {
+        case .allow(let optionID):
+            let chosen = options.first { $0["optionId"] == optionID }
+            sendRaw(["jsonrpc": .string("2.0"), "id": id,
+                     "result": .object(["outcome": .object([
+                        "outcome": .string("selected"),
+                        "optionId": optionID])])])
+            emit(.permissionRequested(title: title,
+                                      chosen: chosen?["name"]?.stringValue ?? "allow"))
+        case .reject(let optionID):
+            // Redacted denial shape for post-mortem diagnosis (field names
+            // and lengths only — no titles, commands, or arguments).
+            if let dir = ProcessInfo.processInfo.environment["WORKSHOP_DIAG_DIR"] {
+                func fieldNames(_ value: JSONValue?) -> String {
+                    if case .object(let fields) = value {
+                        return fields.keys.sorted().joined(separator: ",")
+                    }
+                    return "none"
+                }
+                let line = "permission declined shape: call=\(fieldNames(call))"
+                    + " prior=\(fieldNames(prior)) options=\(options.count)"
+                    + " titleLength=\(title.count)\n"
+                let path = dir + "/permission-requests.log"
+                if let fh = FileHandle(forWritingAtPath: path) {
+                    fh.seekToEndOfFile(); fh.write(Data(line.utf8)); fh.closeFile()
+                } else {
+                    FileManager.default.createFile(atPath: path,
+                                                   contents: Data(line.utf8))
+                }
+            }
+            if let optionID {
+                sendRaw(["jsonrpc": .string("2.0"), "id": id,
+                         "result": .object(["outcome": .object([
+                            "outcome": .string("selected"),
+                            "optionId": optionID])])])
+            } else {
+                sendRaw(["jsonrpc": .string("2.0"), "id": id,
+                         "error": .object(["code": .number(-32601),
+                                           "message": .string("no option")])])
+            }
+            emit(.permissionDenied(title))
+        case .noOption:
+            sendRaw(["jsonrpc": .string("2.0"), "id": id,
+                     "error": .object(["code": .number(-32601),
+                                       "message": .string("no option")])])
+            emit(.permissionDenied(title))
+        }
     }
 
     private func sendRaw(_ object: [String: JSONValue]) {
@@ -363,6 +357,7 @@ public actor ACPClient {
 
     public enum ACPError: Error, Equatable {
         case remote(Int, String)
+        case timeout(String)
     }
 
     /// Redacted tail of the child's stderr, when the transport captures it —
@@ -370,11 +365,59 @@ public actor ACPClient {
     public nonisolated var transportStderrText: String { transport.stderrText }
 }
 
+/// Residual ACP permission policy: decided by the structured tool `kind`
+/// against the turn's capability manifest. No title/label string matching —
+/// the sandbox is the enforcement boundary.
+public enum ACPPermissionPolicy {
+    public enum Decision: Sendable, Equatable {
+        case allow(optionID: JSONValue)
+        case reject(optionID: JSONValue?)
+        case noOption
+    }
+
+    /// Decide one `session/request_permission` request.
+    /// - `request`: the request's `params` object.
+    /// - `priorToolCall`: the correlated `session/update` tool_call, when the
+    ///   request carried only a `toolCallId`.
+    public static func decide(request: JSONValue, priorToolCall: JSONValue?,
+                              capabilities: TurnCapabilityManifest) -> Decision {
+        let call = request["toolCall"]
+        let options = request["options"]?.arrayValue ?? []
+        let kind = call?["kind"]?.stringValue ?? priorToolCall?["kind"]?.stringValue
+        let toolName = call?["_meta"]?["cognition.ai/inferenceToolName"]?.stringValue
+            ?? call?["_meta"]?["cognition.ai/toolName"]?.stringValue
+            ?? priorToolCall?["_meta"]?["cognition.ai/inferenceToolName"]?.stringValue
+            ?? priorToolCall?["_meta"]?["cognition.ai/toolName"]?.stringValue
+            ?? priorToolCall?["title"]?.stringValue ?? ""
+        func option(matching prefix: String) -> JSONValue? {
+            options.first { $0["kind"]?.stringValue?.hasPrefix(prefix) == true }
+        }
+        // Workshop never expands the sandbox scope from a prompt.
+        let denied = toolName == "request_scope"
+            || (["edit", "delete", "move"].contains(kind) && !capabilities.edit)
+            || (kind == "execute" && !capabilities.execute)
+            || (kind == "fetch" && !capabilities.fetch)
+        if denied {
+            let reject = option(matching: "reject") ?? options.first
+            guard let reject else { return .noOption }
+            return .reject(optionID: reject["optionId"])
+        }
+        if let allow = options.first(where: {
+            $0["kind"]?.stringValue == "allow_once"
+        }) ?? option(matching: "allow") {
+            return .allow(optionID: allow["optionId"] ?? .null)
+        }
+        return .noOption
+    }
+}
+
 extension ACPClient.ACPError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .remote(let code, let message):
             return "ACP remote error \(code): \(message)"
+        case .timeout(let method):
+            return "ACP \(method) timed out"
         }
     }
 }

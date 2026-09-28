@@ -64,10 +64,15 @@ params. Engineer principals may only read/post on tasks where they are
 participants → `-32003 notAParticipant`; `workshop_report_result` additionally
 requires current ownership → `-32004 notOwner`.
 
-**workshop-mcp bridge.** A stdio MCP server (pinned protocolVersion
-2025-06-18) that forwards `tools/call` to the daemon over the UDS with the
-engineer's token. Devin finds it via `<worktree>/.devin/mcp_config.local.json`
-(ADR 0006); Kimi via ACP `session/new.mcpServers`.
+**MCP endpoint.** The daemon hosts a Streamable HTTP MCP server on 127.0.0.1
+(port 47831 for the installed home, ephemeral otherwise; `<runtime>/mcp.json`
+records the URL). Every request carries `Authorization: Bearer <token>`; the
+token is authenticated per request so revocation takes effect immediately.
+Sessions are in-memory only — a daemon restart invalidates them, so clients
+re-initialize. Devin finds the URL via `<worktree>/.devin/mcp_config.local.json`
+(ADR 0006); Kimi via ACP `session/new.mcpServers` (`type: "http"`). The
+`workshop-mcp` executable is retained as a stateless stdio shim (token file
+re-read per call) for clients that only speak stdio.
 
 **Adapters** (`WorkshopAdapters`): `ACPClient` + `ACPHarnessAdapter` shared by
 Devin and Kimi (per-harness `HarnessLaunchSpec`, `MCPInjection` mode, warm
@@ -85,9 +90,24 @@ Adapter registration is `WORKSHOP_ADAPTERS=fake|live|mixed:<eng>=fake,…`;
 messages — the current owner. A coalescer (500 ms, 0 in tests) batches pending
 rows per (task, engineer) into one turn carrying a "you were mentioned"
 context. Engineer↔engineer messages with no mention wake nobody; system
-events never wake. Loop bound: 6 consecutive engineer wakeups without a user
-message → further rows `suppressed` + one "Discussion round limit reached"
-system event.
+events never wake. User @mentions wake the mentioned participants
+(`user_mention`); an unaddressed user message wakes the owner. Launch failures
+and unavailable probes re-queue the wakeup with 30 s / 2 min / 10 min backoff
+(3 attempts, visible as "Waiting for …" events) instead of dropping it; the
+version probe is advisory. Loop bound: 6 completed substantive engineer turns
+without an intervening user message → further rows `suppressed` + one
+"Discussion round limit reached" event; silent turns and failed launches do
+not count.
+
+**Task memory (Phase 2).** Workshop keeps a per-(task, engineer) ring of the
+last 8 turn records (`task_memory`) plus the latest valid checkpoint and
+renders them into every turn packet ("## Your memory for this task"), so a
+cold native session does not lose the engineer's own history. Owner wakes
+while a revision is open (subtask claimed/working) run as authoritative
+writer turns rather than read-only discussion copies. Startup failures are
+classified (auth/timeout/transport/sandbox/internal); authentication
+failures stop after one retry and surface a login remedy on the engineer
+card via `listEngineers`.
 
 **Consumed cursor.** `participants.last_read_seq` bounds the turn context to
 unseen messages (≤60, oldest truncated with a note) and advances only when a
@@ -99,13 +119,17 @@ turn completes — never on send.
 setup, capability-token generation, `engineers.json` loading, adapter
 registration, the IPC server, event forwarding, and service lifecycle — so the
 `workshop-daemon` executable is a thin shell (start + SIGTERM + park) and live
-tests run the identical wiring in-process. `workshop-mcp` resolves via
+tests run the identical wiring in-process. Adapter mode defaults to live for
+the installed home and fake elsewhere; fake adapters refuse to start against
+the installed home unless `WORKSHOP_ALLOW_FAKE_ON_INSTALLED_HOME=1`.
+`workshop-mcp` resolves via
 `WORKSHOP_MCP_PATH` then a sibling of the daemon executable; a missing bridge
 probes as `unavailable: workshop-mcp not found`.
 
 **Live findings baked in.** Devin's `session/request_permission` carries only
-`toolCallId` — the tool name appears in option labels, so the permission
-policy falls back to scanning option names for the workshop marker.
+`toolCallId`. Permission prompts are decided by the ACP tool `kind` against
+the turn's capability manifest; the per-generation sandbox is the enforcement
+boundary, and Devin/Kimi are launched so routine tools do not prompt at all.
 `workshop-mcp`'s tool-call closure is built nonisolated (top-level `main.swift`
 is `@MainActor`; awaiting a main-actor closure would deadlock against the
 blocking stdio loop). The turn packet states the literal `task_id` for tool
@@ -179,7 +203,11 @@ wakes Devin.
 or any substantial task picks a verifier ≠ owner (preferring Devin) via a
 `verify_result` wakeup; `agree` marks the subtask done/`verification=passed`,
 `needs_changes` returns it to the owner. Task-level completion waits for the
-user's `workshop.acceptTask`.
+user's `workshop.acceptTask`. Results are revisioned per subtask: re-reporting
+after changes creates revision N+1 (an identical retry returns the existing
+revision); reviews must target the latest revision (-32008 otherwise); a turn
+that ends without `workshop_report_result` leaves the task working and nudges
+the owner once with `report_requested`.
 
 **Task actions.** Pause cancels the in-flight turn and suppresses pending
 wakeups (requested/acknowledged system events); resume re-dispatches; cancel
@@ -191,7 +219,62 @@ research path (ADR 0010).
 `seq ≥ 1_000_000_000` so they sort last while streaming and are excluded from
 context packets and cursor advancement; at commit the row is reassigned
 `nextMessageSeq`, so a tool-posted message mid-turn ends up *before* the
-streamed reply.
+streamed reply. The streamed native reply of a turn that also posted
+through Workshop tools is stored as `turn_summary`: excluded from packets,
+cursors, wakeups and default reads (`include_summaries` opts in).
+`work.activity` outbox rows are pruned to the newest 200 per task after
+each turn and once at startup; `workshop.readActivity` serves that ring.
+Catalog 2 adds `include_summaries` to `workshop_read_messages`.
+
+**Managed runtime lane (Phase 3).** `ManagedRuntimeAdapter` generalizes the
+DeepSeek adapter into a Workshop-owned chat-completions tool loop
+(`ManagedProvider` presets for DeepSeek and Kimi) with lane-local
+`read_file`/`list_dir`/`write_file`/`exec` tools confined to the turn's
+fenced generation — `exec` runs under a per-generation `sandbox-exec`
+profile and refuses to run without one. Kimi keeps its native ACP lane and
+falls back to the managed lane (coding API authenticated with the CLI's
+OAuth grant) after classified native startup failures — `auth` immediately,
+other classes after two consecutive failures on the task. DeepSeek runs on
+the managed lane exclusively and now receives a fenced generation copy for
+file-level review. Devin has no managed lane because the Fusion relay
+exposes no completions route. Every message posted on the managed lane
+carries `"lane":"managed"` in its structured card; peers see the
+"(managed lane)" author tag and `getTask` reports the last recorded lane.
+
+**Codex return path (Phase 3).** `workshop_wait_for_events` is a bounded
+long-poll for committed task events (default 50 s, max 120 s, capped at 32
+concurrent waiters per principal kind): it returns immediately when events
+after `after_seq` exist and otherwise resumes when a `message.committed` or
+`task.state_changed` outbox row lands — no push into a Codex thread is
+claimed. Every Codex read (`wait_for_events` and `read_messages`) advances
+the task's `task_ingress.last_acknowledged_seq` cursor, surfaced as
+`acknowledgedSeq` in `getTask`. `workshop_post_message` and
+`workshop_request_review` accept an optional `idempotency_key` enforced
+server-side through the `operations` table, scoped per principal, so an
+uncertain append can be retried verbatim; a mismatched replay is -32009.
+Catalog 3 adds the tool and the optional `idempotency_key` fields.
+
+**Qualification as data (Phase 3).** `config/capabilities.json` records, per
+(engineer, lane, model), whether the isolated-writer recipe passed — the
+`workshop-daemon qualify --engineer <id> [--lane native|managed]` subcommand
+runs the phase-2 `hello.txt` recipe in a temporary home with the real adapter
+for that engineer (all others fake), checks the sealed snapshot contents and
+the harness log for permission rejections, then writes the record with the
+binary's SHA-256 and an evidence path; the live database is never opened.
+DaemonRuntime injects `CapabilityStore` lookups into every live lane, so an
+authoritative v2 turn runs only while a qualified record exists; a binary
+hash drift is advisory (probe detail plus one system event per daemon
+lifetime), and `workshop.reloadCapabilities` re-reads the file without a
+restart. The hardcoded relay path and model literal are gone.
+
+**Credential canaries (Phase 3).** At daemon start and every 30 minutes a
+zero-inference check per engineer reports `ok | missing | expired |
+unreadable`: Devin's `data/devin/credentials.toml` symlink must resolve to a
+readable file, Kimi's OAuth grant must read and be unexpired, DeepSeek's
+credential file must parse. Results prefix the engineer's `listEngineers`
+detail as `credentials: <state>` and downgrade health to `loginRequired`
+with the Phase 2a remedy before a wake is attempted; token values are never
+logged. See docs/credential-ownership.md.
 
 **Recovery wording (F2).** `recoverInterruptedStreams` reports what actually
 happened: "task blocked pending reconciliation" only when the transition was

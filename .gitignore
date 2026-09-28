@@ -25,6 +25,7 @@ __pycache__/
 /.devin/skills/*
 !/.devin/skills/team/
 
+# Public-line ignore rules (secret/credential safety net)
 .env
 .env.*
 !.env.example

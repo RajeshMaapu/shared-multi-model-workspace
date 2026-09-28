@@ -4,6 +4,12 @@ import WorkshopCore
 /// Schema catalog for the Workshop collaboration tools (§8.3). Shared by the
 /// MCP bridge (tools/list) and the DeepSeek adapter (tools param).
 public enum WorkshopToolCatalog {
+    /// Increment when any tool schema changes; additive/optional changes only.
+    /// 2: `workshop_read_messages` gains optional `include_summaries`.
+    /// 3: new `workshop_wait_for_events`; `workshop_post_message` and
+    ///    `workshop_request_review` gain optional `idempotency_key`.
+    public static let catalogVersion = 3
+
     public struct Tool: Sendable {
         public let name: String
         public let description: String
@@ -18,6 +24,7 @@ public enum WorkshopToolCatalog {
 
     private static var s: JSONValue { .object(["type": .string("string")]) }
     private static var i: JSONValue { .object(["type": .string("integer")]) }
+    private static var b: JSONValue { .object(["type": .string("boolean")]) }
 
     public static let tools: [Tool] = [
         Tool(name: "workshop_create_task",
@@ -57,22 +64,39 @@ public enum WorkshopToolCatalog {
              inputSchema: obj(["task_id": s], required: ["task_id"])),
         Tool(name: "workshop_read_messages",
              description: "Read committed messages in a task after a seq.",
-             inputSchema: obj(["task_id": s, "after_seq": i, "limit": i],
+             inputSchema: obj(["task_id": s, "after_seq": i, "limit": i,
+                               "include_summaries": b],
                               required: ["task_id"])),
         Tool(name: "workshop_post_message",
              description: "Post a message to a task. Mention @devin/@kimi/@deepseek to wake a peer.",
-             inputSchema: obj(["task_id": s, "body": s, "kind": s],
+             inputSchema: obj(["task_id": s, "body": s, "kind": s,
+                               "idempotency_key": s],
                               required: ["task_id", "body"])),
+        Tool(name: "workshop_wait_for_events",
+             description: "Bounded long-poll for new committed events on a task. Returns immediately when events after `after_seq` exist, otherwise waits up to `timeout_seconds` (default 50, max 120). For Codex callers, advances the task's acknowledged cursor to the last returned seq.",
+             inputSchema: obj(["task_id": s, "after_seq": i,
+                               "timeout_seconds": i],
+                              required: ["task_id", "after_seq"])),
         Tool(name: "workshop_request_review",
              description: "Ask a participant engineer to review work on a task.",
-             inputSchema: obj(["task_id": s, "reviewer": s, "message": s],
+             inputSchema: obj(["task_id": s, "reviewer": s, "message": s,
+                               "idempotency_key": s],
                               required: ["task_id", "reviewer", "message"])),
+        Tool(name: "workshop_select_review_seed",
+             description: "Select a digest-verified owner discussion snapshot as the next fenced review/revision seed. Codex may select only for a task it originated. Does not promote the snapshot.",
+             inputSchema: obj(["task_id": s, "engineer": s,
+                               "generation_id": s, "verified_digest": s],
+                              required: ["task_id", "engineer", "generation_id", "verified_digest"])),
+        Tool(name: "workshop_read_review_file",
+             description: "Read one UTF-8 file from the digest-verified, unpromoted owner review seed. Task participants and the originating Codex principal may inspect bounded proposal changes; path is relative to the snapshot.",
+             inputSchema: obj(["task_id": s, "path": s],
+                              required: ["task_id", "path"])),
         Tool(name: "workshop_publish_artifact",
              description: "Publish a file from the task workspace as a content-addressed artifact. Pass ownership_generation from the packet as generation; stale generations are fenced.",
              inputSchema: obj(["task_id": s, "path": s, "description": s, "generation": i],
                               required: ["task_id", "path", "description"])),
         Tool(name: "workshop_report_result",
-             description: "Owner only: report a subtask result with artifacts and validation. generation (ownership_generation from the packet) is required; stale generations are fenced.",
+             description: "Owner only: report a subtask result with artifacts and validation. generation (ownership_generation from the packet) is required; stale generations are fenced. Re-reporting after changes creates the next result revision; an identical retry returns the existing revision.",
              inputSchema: obj(["task_id": s, "subtask_id": s, "summary": s,
                                "generation": i,
                                "artifact_ids": .object(["type": .string("array"),
@@ -103,7 +127,7 @@ public enum WorkshopToolCatalog {
              description: "Read published proposals (and your own draft) for a research task.",
              inputSchema: obj(["task_id": s], required: ["task_id"])),
         Tool(name: "workshop_submit_review",
-             description: "Submit a review of a published proposal or a result message.",
+             description: "Submit a review of a published proposal or a result message. For results, proposal_id must be the latest result message id (see workshop_get_task).",
              inputSchema: obj(["task_id": s, "proposal_id": s, "severity": s,
                                "disposition": s, "body": s, "evidence": s],
                               required: ["task_id", "proposal_id", "severity",

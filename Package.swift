@@ -29,7 +29,7 @@ let package = Package(
         .target(
             name: "WorkshopDaemonKit",
             dependencies: ["WorkshopCore", "WorkshopStore", "WorkshopService",
-                           "WorkshopIPC", "WorkshopAdapters"]
+                           "WorkshopIPC", "WorkshopAdapters", "WorkshopMCP"]
         ),
         .executableTarget(
             name: "workshop-daemon",
@@ -47,7 +47,7 @@ let package = Package(
         .testTarget(name: "StoreTests", dependencies: ["WorkshopStore", "WorkshopCore"]),
         .testTarget(name: "ServiceTests", dependencies: ["WorkshopService", "WorkshopStore", "WorkshopCore"]),
         .testTarget(name: "IPCTests", dependencies: ["WorkshopIPC", "WorkshopService", "WorkshopStore", "WorkshopCore"]),
-        .testTarget(name: "MCPTests", dependencies: ["WorkshopMCP", "WorkshopIPC", "WorkshopService", "WorkshopStore", "WorkshopCore"]),
+        .testTarget(name: "MCPTests", dependencies: ["WorkshopMCP", "WorkshopIPC", "WorkshopService", "WorkshopStore", "WorkshopCore", "WorkshopDaemonKit"]),
         .testTarget(name: "AdapterContractTests",
                     dependencies: ["WorkshopAdapters", "WorkshopService", "WorkshopCore"]),
         .testTarget(name: "LiveSmokeTests",

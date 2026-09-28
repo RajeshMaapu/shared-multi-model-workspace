@@ -282,5 +282,38 @@ public enum Migrations {
         CREATE UNIQUE INDEX one_current_writer ON writer_generations(task_id)
             WHERE state IN ('writing','sealed');
         """)
-    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7])
+    /// A specific immutable discussion snapshot may be selected as the next
+    /// review/revision seed without granting it promotion authority.
+    public static let v8 = Migrator.Migration(version: 8, sql: """
+        CREATE TABLE writer_seed_pins(
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+            engineer TEXT NOT NULL,
+            generation_id TEXT NOT NULL REFERENCES writer_generations(id),
+            digest TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """)
+    /// Schema v9: wakeup retry metadata — deferred re-queue (`not_before`)
+    /// and launch attempt counting (`attempt`) for bounded backoff retries.
+    public static let v9 = Migrator.Migration(version: 9, sql: """
+        ALTER TABLE wakeups ADD COLUMN not_before TEXT;
+        ALTER TABLE wakeups ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
+        """)
+    /// Schema v10: per-(task, engineer) ring of recent turn records rendered
+    /// into turn packets so a cold native session keeps its own history.
+    public static let v10 = Migrator.Migration(version: 10, sql: """
+        CREATE TABLE task_memory(
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            engineer_id TEXT NOT NULL,
+            turn_records TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(task_id, engineer_id)
+        );
+        """)
+    /// Schema v11: generation retention (decision D-e) — rows whose run
+    /// and snapshot directories were deleted by the sweep are stamped.
+    public static let v11 = Migrator.Migration(version: 11, sql: """
+        ALTER TABLE writer_generations ADD COLUMN pruned_at TEXT;
+        """)
+    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11])
 }

@@ -1,10 +1,10 @@
 {
   "passed": true,
-  "root": "<isolated-runtime>",
-  "task_id": "<fixture-task-id>",
+  "root": "/private/tmp/wn-a31_m601",
+  "task_id": "task_<id>",
   "schema_v2": true,
   "retry_same_task": true,
   "native_mcp": true,
-  "sealed_file": "<isolated-runtime>/home/writer-snapshots/<fixture-writer-id>/probe.txt",
+  "sealed_file": "/private/tmp/wn-a31_m601/home/writer-snapshots/34ecb462-dd78-4f18-a38e-7ccc18d48da3/probe.txt",
   "task_state": "verifying"
 }

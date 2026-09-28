@@ -1,7 +1,8 @@
 # ADR 0013: Fencing at the tool boundary; fenced artifact quarantine
 
 ## Status
-Accepted
+Accepted — Revision 2026-09-28: enforcement moved to the sandbox per
+ADR 0018; the tool-boundary CAS remains.
 
 ## Context
 

@@ -21,7 +21,13 @@ the authority the spec keeps in the app (§9.3).
 - `CollaborationService.authenticate` resolves the Codex token to `.codex`.
 - `callTool` enforces a Codex allowlist — `workshop_create_task`,
   `workshop_list_tasks`, `workshop_get_task`, `workshop_read_messages`,
-  `workshop_post_message`. Every other tool returns `-32005`
+  `workshop_post_message`, `workshop_select_review_seed`, and
+  `workshop_read_review_file`. The two review-seed tools are limited to tasks
+  whose recorded ingress source is `codex`. Selection requires the exact
+  immutable owner snapshot generation and its verified digest; it only seeds
+  fenced review and revision turns. Reading is limited to changed, regular
+  UTF-8 files under 64 KiB. Neither operation promotes files or accepts work.
+  Every other tool returns `-32005`
   (`userAuthorityRequired`).
 - The user-authority RPC methods (`approveArchitecture`, `requestChanges`,
   `chooseAlternative`, `acceptTask`, `pauseTask`, `resumeTask`, `cancelTask`,
@@ -44,6 +50,10 @@ the authority the spec keeps in the app (§9.3).
   bounded.
 - Token file theft grants task-creation and read access, not approvals —
   still reason to keep the file 0600 and the socket 0700.
+- For Codex-origin tasks, token access can also choose which already sealed
+  owner discussion snapshot peers review. The selection is recorded as a
+  task-visible system event. User-only architecture approval, assignment,
+  promotion, and acceptance remain unchanged.
 - Prompt-level idempotency (`codex-<sha256[:32]>`) depends on the model
   following the skill; run 2 of the live smoke emitted the untruncated hash
   and created a second task. Service-side dedupe is exact-key only — callers
@@ -58,3 +68,26 @@ only, any key matching `codex-<33-64 hex>` to `codex-` + the first 32 hex
 characters before hashing and storing it — both spellings of the same brief
 dedupe to one task. Keys outside that shape are used verbatim; user-principal
 keys are never rewritten. Covered by `CodexBridgeTests.testCreateTaskKeyNormalization`.
+
+## Revision 2026-09-28
+
+The allowlist now stands at, verbatim:
+
+- `workshop_create_task` — task entry (§8.4); idempotent by invocation key.
+- `workshop_list_tasks` — read-only task inventory.
+- `workshop_get_task` — read-only task detail.
+- `workshop_read_messages` — read-only committed history; advances the
+  task's acknowledged cursor.
+- `workshop_post_message` — follow-up appends as `user` with
+  `{"via": "codex"}`; server-side `idempotency_key` dedupe since Phase 3.
+- `workshop_select_review_seed` — added in the sealed-snapshot hot fixes;
+  chooses a digest-verified owner discussion snapshot for fenced review on
+  Codex-originated tasks only.
+- `workshop_read_review_file` — added with it; bounded read of changed
+  regular files inside that snapshot for adapters without a filesystem.
+- `workshop_wait_for_events` — added in Phase 3 (G-A3): bounded read-only
+  long-poll (≤120 s) so a Codex turn can wait for replies without a push
+  channel; also advances the acknowledged cursor.
+
+The allowlist is pinned by `CodexBridgeTests.testCodexAllowlistMatchesADR0015`;
+any change requires a revision of this ADR.

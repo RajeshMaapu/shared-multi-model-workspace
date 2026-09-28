@@ -31,7 +31,7 @@ The branch implements stronger clean-profile boundaries and preserves explicit p
 
 ## Validation performed
 
-Command: `swift test`, run in `<isolated-checkout>` with access to Swift compiler caches.
+Command: `swift test`, run in `/private/tmp/workshop-clean-start-20260915` with access to Swift compiler caches.
 
 Result: **126 tests executed, 7 skipped, 0 failures**. The seven skipped tests are the opt-in live provider tests; they are not counted as demonstrated live compatibility. Existing Swift 6 concurrency warnings remain.
 

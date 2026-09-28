@@ -35,7 +35,7 @@ final class StoreTests: XCTestCase {
             try Migrations.all.migrate(db)
             let count = try db.query("SELECT COUNT(*) AS c FROM schema_migrations")
                 .first?["c"]?.int
-            XCTAssertEqual(count, 7)
+            XCTAssertEqual(count, Int64(Migrations.all.migrations.count))
         }
     }
 
@@ -179,5 +179,114 @@ final class MigrationV2Tests: XCTestCase {
             // artifacts.generation added.
             _ = try db.query("SELECT generation FROM artifacts")
         }
+    }
+
+    /// A v8 database gains wakeup retry columns at v9; deferred rows are
+    /// hidden from pendingWakeups until their backoff expires.
+    func testV8ToV9AddsWakeupRetryColumns() throws {
+        let path = dir + "/mig89.sqlite"
+        do {
+            let db = try Database(path: path)
+            try Migrator(migrations: [Migrations.v1, Migrations.v2,
+                                      Migrations.v3, Migrations.v4,
+                                      Migrations.v5, Migrations.v6,
+                                      Migrations.v7, Migrations.v8]).migrate(db)
+            try db.execute("""
+                INSERT INTO tasks(id, channel, title, brief, phase, state,
+                                  created_at, updated_at)
+                VALUES('task_v8', 'main', 'old task', 'brief', 'execution',
+                       'queued', 't0', 't0')
+                """)
+            try db.execute("""
+                INSERT INTO wakeups(task_id, engineer_id, reason, state,
+                                    created_at, updated_at)
+                VALUES('task_v8', 'kimi', 'mention', 'pending', 't0', 't0')
+                """)
+        }
+        do {
+            let db = try Database(path: path)
+            try Migrations.all.migrate(db)
+            let row = try db.query(
+                "SELECT attempt, not_before FROM wakeups").first
+            XCTAssertEqual(row?["attempt"]?.int, 0)
+            XCTAssertEqual(row?["not_before"], .null)
+
+            let repo = WorkshopRepository(db: db)
+            // The migrated row is immediately due.
+            let due = try repo.pendingWakeups()
+            XCTAssertEqual(due.count, 1)
+            // A deferred row is hidden until not_before passes.
+            try repo.insertWakeup(taskID: TaskID("task_v8"), engineerID: .kimi,
+                                  reason: "mention", triggerSeq: nil,
+                                  notBefore: Date().addingTimeInterval(3600),
+                                  attempt: 1, at: Date())
+            XCTAssertEqual(try repo.pendingWakeups().count, 1)
+            let next = try repo.earliestDeferredWakeup(at: Date())
+            XCTAssertNotNil(next)
+        }
+    }
+
+    /// A v9 database gains task_memory at v10; appendTurnRecord keeps only
+    /// the newest records per (task, engineer).
+    func testV9ToV10AddsTaskMemoryRing() throws {
+        let path = dir + "/mig910.sqlite"
+        do {
+            let db = try Database(path: path)
+            try Migrator(migrations: Migrations.all.migrations
+                .filter { $0.version <= 9 }).migrate(db)
+            try db.execute("""
+                INSERT INTO tasks(id, channel, title, brief, phase, state,
+                                  created_at, updated_at)
+                VALUES('task_v9', 'main', 'old task', 'brief', 'execution',
+                       'queued', 't0', 't0')
+                """)
+        }
+        let db = try Database(path: path)
+        try Migrations.all.migrate(db)
+        XCTAssertTrue(try db.query("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='task_memory'
+            """).count == 1)
+
+        let repo = WorkshopRepository(db: db)
+        for i in 0..<10 {
+            try repo.appendTurnRecord(
+                taskID: TaskID("task_v9"), engineerID: .kimi,
+                TurnRecord(turnID: "t\(i)", endedAt: Date(), reason: "mention",
+                           outcome: "completed", postedSeqs: [Int64(i)]))
+        }
+        let records = try repo.taskMemory(taskID: TaskID("task_v9"),
+                                          engineerID: .kimi)
+        XCTAssertEqual(records.count, 8)
+        XCTAssertEqual(records.first?.turnID, "t2")
+        XCTAssertEqual(records.last?.turnID, "t9")
+        // Independent key per engineer.
+        XCTAssertTrue(try repo.taskMemory(taskID: TaskID("task_v9"),
+                                          engineerID: .devin).isEmpty)
+        try repo.appendTurnRecord(taskID: TaskID("task_v9"), engineerID: .devin,
+                                  TurnRecord(turnID: "d0", endedAt: Date(),
+                                             outcome: "silent"))
+        XCTAssertEqual(try repo.taskMemory(taskID: TaskID("task_v9"),
+                                           engineerID: .devin).count, 1)
+        XCTAssertEqual(try repo.taskMemory(taskID: TaskID("task_v9"),
+                                           engineerID: .kimi).count, 8)
+    }
+
+    /// A v10 database gains writer_generations.pruned_at at v11 (decision
+    /// D-e: the retention sweep stamps rows whose directories are gone).
+    func testV10ToV11AddsPrunedAt() throws {
+        let path = dir + "/mig1011.sqlite"
+        do {
+            let db = try Database(path: path)
+            try Migrator(migrations: Migrations.all.migrations
+                .filter { $0.version <= 10 }).migrate(db)
+            let columns = try db.query(
+                "PRAGMA table_info(writer_generations)")
+            XCTAssertNil(columns.first { $0["name"]?.text == "pruned_at" })
+        }
+        let db = try Database(path: path)
+        try Migrations.all.migrate(db)
+        let columns = try db.query("PRAGMA table_info(writer_generations)")
+        XCTAssertNotNil(columns.first { $0["name"]?.text == "pruned_at" })
     }
 }

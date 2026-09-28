@@ -203,7 +203,11 @@ final class Phase3ServiceTests: XCTestCase {
         let consolidate = try await svc.wakeupsForTest(taskID)
             .filter { $0.reason == "consolidate" }
         XCTAssertEqual(consolidate.map(\.engineerID), [.devin])
-        XCTAssertEqual(consolidate[0].state, "suppressed")
+        // The probe is advisory: the wakeup is deferred for a bounded retry,
+        // not dropped (G-D4/G-D5).
+        XCTAssertEqual(consolidate[0].state, "pending")
+        XCTAssertEqual(consolidate[0].attempt, 1)
+        XCTAssertNotNil(consolidate[0].notBefore)
         await svc.shutdown()
     }
 
@@ -558,7 +562,12 @@ final class Phase3ServiceTests: XCTestCase {
             researchDeadline: 0, reviewDeadline: 0)
         let devin = adapters[0]
         devin.script = { context in
-            [.toolCall("workshop_post_message", .object([
+            [.toolCall("workshop_report_result", .object([
+                "task_id": .string(context.task.id.rawValue),
+                "subtask_id": .string(context.subtask!.id.rawValue),
+                "summary": .string("done"),
+                "generation": .number(Double(context.subtask!.generation))])),
+             .toolCall("workshop_post_message", .object([
                 "task_id": .string(context.task.id.rawValue),
                 "body": .string("TOOL_POSTED_MARKER")])),
              .text("STREAMED_REPLY_MARKER")]
@@ -574,7 +583,9 @@ final class Phase3ServiceTests: XCTestCase {
             try await svc.getTask(receipt.taskID).task.state == .verifying
         }
         XCTAssertTrue(done)
-        let messages = try await svc.readMessages(receipt.taskID)
+        // The streamed reply commits as turn_summary (E3): opt in to see it.
+        let messages = try await svc.readMessages(receipt.taskID,
+                                                  includeSummaries: true)
         let tool = messages.first { $0.body == "TOOL_POSTED_MARKER" }
         let reply = messages.first { $0.body == "STREAMED_REPLY_MARKER" }
         XCTAssertNotNil(tool); XCTAssertNotNil(reply)
@@ -595,7 +606,12 @@ final class Phase3ServiceTests: XCTestCase {
         adapters[0].script = { context in
             [.toolCall("workshop_post_message", .object([
                 "task_id": .string(context.task.id.rawValue),
-                "body": .string("TOOL_ONLY_MARKER")]))]
+                "body": .string("TOOL_ONLY_MARKER")])),
+             .toolCall("workshop_report_result", .object([
+                "task_id": .string(context.task.id.rawValue),
+                "subtask_id": .string(context.subtask!.id.rawValue),
+                "summary": .string("done"),
+                "generation": .number(Double(context.subtask!.generation))]))]
         }
         adapters[0].toolRunner = { name, args, principal in
             try await svc.callTool(name, args: args, principal: principal)
