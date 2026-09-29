@@ -13,7 +13,9 @@ export function installedPaths(resourcesPath, tempDir, userHome = os.homedir()) 
     daemon: path.join(resourcesPath, 'workshop-daemon') };
 }
 
-export async function ensureDaemon(paths, probe, launch, { attempts = 50, wait = () => new Promise(r => setTimeout(r, 100)) } = {}) {
+// 300×100 ms = 30 s budget: the daemon listens before its slow start-up
+// work, but a cold machine may still need more than the old 5 s window.
+export async function ensureDaemon(paths, probe, launch, { attempts = 300, wait = () => new Promise(r => setTimeout(r, 100)) } = {}) {
   try { await probe(); return { started: false }; } catch {}
   // Only startup is retried. Never send or replay a user mutation here.
   await launch(paths);

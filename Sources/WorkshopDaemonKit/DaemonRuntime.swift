@@ -80,6 +80,19 @@ public final class DaemonRuntime: @unchecked Sendable {
         self.home = home
         let fm = FileManager.default
 
+        // Monotonic per-step timings logged once by `start()` (one summary
+        // line plus any step over 500 ms) so slow-start regressions are
+        // visible in the daemon log.
+        var marks: [(name: String, ms: Int64)] = []
+        var lapAt = ContinuousClock.now
+        func lap(_ name: String) {
+            let now = ContinuousClock.now
+            let d = now - lapAt
+            marks.append((name, Int64(Double(d.components.seconds) * 1000
+                + Double(d.components.attoseconds) / 1e15)))
+            lapAt = now
+        }
+
         for sub in ["db", "profiles", "sessions/deepseek", "sessions/kimi", "worktrees",
                     "artifacts", "diagnostics", "config"] {
             try fm.createDirectory(atPath: home + "/" + sub,
@@ -119,8 +132,10 @@ public final class DaemonRuntime: @unchecked Sendable {
 
         // Keep the bridge at a stable, executable path outside the app bundle.
         // Launching a nested app resource can stall in dyld after a bundle swap.
+        lap("dirs+tokens")
         let bridgePath = Self.installBridgeCopy(home: home, env: env,
                                                 ownExecutable: ownExecutable)
+        lap("bridgeCopy")
 
         let runtime = runtimeDir ?? IPCServer.defaultRuntimeDir()
         self.runtimeDir = runtime
@@ -226,6 +241,7 @@ public final class DaemonRuntime: @unchecked Sendable {
         try mcpServer.bind()
         self.mcpServer = mcpServer
         Self.log("mcp endpoint bound at \(mcpServer.url)")
+        lap("mcpBind")
 
         let paths = ProfileBuilder.Paths(
             home: home,
@@ -383,6 +399,7 @@ public final class DaemonRuntime: @unchecked Sendable {
         }
         self.adapters = built
         self.adaptersModeLive = Set(EngineerID.allCases.filter { !isFake($0) })
+        lap("adapters")
 
         let dbPath = home + "/db/workshop.sqlite"
         var policies: [EngineerID: CapacityPolicy] = [:]
@@ -401,8 +418,10 @@ public final class DaemonRuntime: @unchecked Sendable {
         self.service = service
         serviceBox.service = service
         Self.log("opened database at \(dbPath)")
+        lap("serviceInit")
         service.deepLinkHandlerVerified = Self.deepLinkRegistered()
         self.buildID = Self.buildID(executable: ownExecutable)
+        lap("reg+buildID")
 
         // Register the resolved DeepSeek key with the Redactor (compare-only;
         // never logged).
@@ -425,6 +444,7 @@ public final class DaemonRuntime: @unchecked Sendable {
                                                  detail: detail)
         }
         applyCapabilities()
+        lap("applyCapabilities")
         let userTokenPath = runtime + "/user.token"
         guard (try? fm.destinationOfSymbolicLink(atPath: userTokenPath)) == nil else {
             throw WorkshopError.invalidRequest("User token path is a symlink")
@@ -638,6 +658,10 @@ public final class DaemonRuntime: @unchecked Sendable {
             }
             return result
         }
+        lap("ipcHandlers")
+        self.startupMarks = marks
+        self.startupLast = lapAt
+        self.startupInitMs = Self.msSince(startupT0)
     }
 
     /// Build identity reported by workshop.health — the bundle's
@@ -645,6 +669,33 @@ public final class DaemonRuntime: @unchecked Sendable {
     /// executable's mtime+size ("bin:<mtime>-<size>"). The app compares its own
     /// value and only warns when both sides carry a bundle version.
     private var buildID: String?
+
+    /// Start-up timing state (see the `startup:` log line written by start()).
+    private let startupT0 = ContinuousClock.now
+    private var startupLast = ContinuousClock.now
+    private var startupMarks: [(name: String, ms: Int64)] = []
+    private var startupInitMs: Int64 = 0
+    private var startupListenMs: Int64 = 0
+
+    /// Test seam: replaces the post-listen DeepSeek balance refresh.
+    var balanceRefresh: (@Sendable () async -> Void)?
+    /// Test seam: replaces the credential canary sweep on start.
+    var canarySweep: (@Sendable (String, CollaborationService,
+                               Set<EngineerID>) async -> Void)?
+
+    private func lap(_ name: String) {
+        let now = ContinuousClock.now
+        let d = now - startupLast
+        startupMarks.append((name, Int64(Double(d.components.seconds) * 1000
+            + Double(d.components.attoseconds) / 1e15)))
+        startupLast = now
+    }
+
+    private static func msSince(_ t: ContinuousClock.Instant) -> Int64 {
+        let d = ContinuousClock.now - t
+        return Int64(Double(d.components.seconds) * 1000
+            + Double(d.components.attoseconds) / 1e15)
+    }
 
     public static func buildID(executable: String) -> String {
         let plist = (executable as NSString).deletingLastPathComponent
@@ -755,21 +806,13 @@ public final class DaemonRuntime: @unchecked Sendable {
     private var kimiBinaryPath: String?
 
     public func start() async throws {
-        if let home = pendingHome {
-            // Bounded balance probe (one GET /user/balance, ≤ every 10 min).
-            await service.setBalanceProbe { engineer in
-                guard engineer == .deepseek else { return nil }
-                return await DeepSeekAdapter.balanceProbe(home: home,
-                                                        observedAt: Date())
-            }
-            pendingHome = nil
-        }
-        await service.installSleepWakeHooks()
-        if adaptersModeLive.contains(.deepseek) {
-            await service.refreshDeepSeekBalance()
-        }
+        // Listen first: the desktop app only probes the socket for a few
+        // seconds after launch, so all slow work runs after the UDS is
+        // accepting connections.
         try server.start()
         try mcpServer.start()
+        lap("listen")
+        startupListenMs = Self.msSince(startupT0)
         let mcpInfo = String(decoding: try JSONEncoder().encode(JSONValue.object([
             "url": .string(mcpServer.url),
             "catalog_version": .number(Double(WorkshopToolCatalog.catalogVersion)),
@@ -781,6 +824,25 @@ public final class DaemonRuntime: @unchecked Sendable {
         chmod(mcpInfoPath, 0o600)
         Self.log("mcp endpoint \(mcpServer.url)")
         Self.log("listening on \(socketPath)")
+        if let home = pendingHome {
+            // Bounded balance probe (one GET /user/balance, ≤ every 10 min).
+            await service.setBalanceProbe { engineer in
+                guard engineer == .deepseek else { return nil }
+                return await DeepSeekAdapter.balanceProbe(home: home,
+                                                        observedAt: Date())
+            }
+            pendingHome = nil
+        }
+        await service.installSleepWakeHooks()
+        lap("probes+hooks")
+        if let refresh = balanceRefresh {
+            Task.detached { await refresh() }
+        } else if adaptersModeLive.contains(.deepseek) {
+            // Network call (≤10 s) — must not block the listener.
+            Task.detached { [service] in
+                await service.refreshDeepSeekBalance()
+            }
+        }
         broadcastTask = Task.detached { [service, server] in
             for await event in await service.makeEventStream() {
                 server.broadcastEvent(event)
@@ -795,20 +857,25 @@ public final class DaemonRuntime: @unchecked Sendable {
             .sorted().joined(separator: ", ")
         Self.log("capabilities: \(capabilityStore.load().count) records"
             + (qualified.isEmpty ? "" : "; qualified: \(qualified)"))
+        lap("capabilities")
         // G-D1: zero-inference credential canaries at start and every 30 min.
+        // The first sweep is detached too: CLI canary checks are slow.
         let liveEngineers = adaptersModeLive
-        await CredentialCanary.runAll(home: home, service: service,
-                                      only: liveEngineers)
+        let sweep = canarySweep ?? { home, service, only in
+            await CredentialCanary.runAll(home: home, service: service,
+                                          only: only)
+        }
         canaryTask = Task.detached { [weak self] in
+            guard let self else { return }
+            await sweep(self.home, self.service, liveEngineers)
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1800))
-                guard let self else { return }
-                await CredentialCanary.runAll(home: self.home,
-                                              service: self.service,
-                                              only: liveEngineers)
+                guard !Task.isCancelled else { return }
+                await sweep(self.home, self.service, liveEngineers)
             }
         }
         await service.start()
+        lap("serviceStart")
         // Generation retention sweep (decision D-e): once after recovery,
         // then every ten minutes.
         if let report = await service.pruneGenerations(),
@@ -816,6 +883,7 @@ public final class DaemonRuntime: @unchecked Sendable {
             Self.log("pruned \(report.deletedDirs) generation dirs "
                      + "(\(report.bytes / 1_048_576) MB)")
         }
+        lap("prune")
         pruneTask = Task.detached { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(600))
@@ -826,6 +894,12 @@ public final class DaemonRuntime: @unchecked Sendable {
                              + "(\(report.bytes / 1_048_576) MB)")
                 }
             }
+        }
+        Self.log("startup: init \(startupInitMs) ms, listen after "
+                 + "\(startupListenMs) ms, ready after "
+                 + "\(Self.msSince(startupT0)) ms")
+        for mark in startupMarks where mark.ms > 500 {
+            Self.log("startup step \(mark.name): \(mark.ms) ms")
         }
     }
 
