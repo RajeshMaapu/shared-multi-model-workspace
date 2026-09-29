@@ -25,8 +25,9 @@ final class WorkActivityTests: XCTestCase {
         XCTAssertEqual(all.map(\.seq), all.map(\.seq).sorted())
         XCTAssertEqual(Set(all.map(\.seq)).count, all.count)
         let tools = all.filter { $0.kind == "tool" }
-        XCTAssertEqual(tools.count, 4) // two correlated ACP events plus legacy adapter start/finish
-        XCTAssertEqual(tools.filter { $0.callID == nil }.count, 2)
+        // Two turns ran: the initial dispatch and the report_requested nudge.
+        XCTAssertEqual(tools.count, 8)
+        XCTAssertEqual(tools.filter { $0.callID == nil }.count, 4)
         XCTAssertEqual(tools[0].callID, tools[1].callID)
         XCTAssertNotEqual(tools[0].callID, "opaque-one")
         XCTAssertFalse(tools[0].title.contains("synthetic-secret"))
