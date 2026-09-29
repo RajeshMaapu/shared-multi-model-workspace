@@ -91,3 +91,17 @@ The allowlist now stands at, verbatim:
 
 The allowlist is pinned by `CodexBridgeTests.testCodexAllowlistMatchesADR0015`;
 any change requires a revision of this ADR.
+
+## Revision 2026-09-29
+
+The allowlist gains `workshop_resume_task`, origin-bound (a `task_ingress`
+record with `principal=codex` is required; otherwise -32005). Resume-only:
+it restarts a paused or recoverably-blocked execution task and re-wakes
+the owner; it does not accept, promote, cancel or reassign — those remain
+user-only. A call on a task that is not paused/blocked returns
+`resumed:false` with a reason rather than an error, and an optional
+`idempotency_key` replays the stored receipt through the `operations`
+table. The resume system event is recorded as "Task resumed by You (via
+Codex)". Rationale: the Codex monitor observes the task lifecycle and
+should be able to restart a paused/blocked task it submitted without a
+human relay; accepting results stays a human decision. Catalog version 4.

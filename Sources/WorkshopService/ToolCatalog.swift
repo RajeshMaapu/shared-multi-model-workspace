@@ -8,7 +8,8 @@ public enum WorkshopToolCatalog {
     /// 2: `workshop_read_messages` gains optional `include_summaries`.
     /// 3: new `workshop_wait_for_events`; `workshop_post_message` and
     ///    `workshop_request_review` gain optional `idempotency_key`.
-    public static let catalogVersion = 3
+    /// 4: new `workshop_resume_task` (origin-bound resume for Codex).
+    public static let catalogVersion = 4
 
     public struct Tool: Sendable {
         public let name: String
@@ -77,6 +78,10 @@ public enum WorkshopToolCatalog {
              inputSchema: obj(["task_id": s, "after_seq": i,
                                "timeout_seconds": i],
                               required: ["task_id", "after_seq"])),
+        Tool(name: "workshop_resume_task",
+             description: "Resume a paused or blocked task you submitted. Codex principals may resume only tasks with a Codex ingress record (origin-bound); user principals may resume any task. Does not accept, promote, cancel or reassign.",
+             inputSchema: obj(["task_id": s, "idempotency_key": s],
+                              required: ["task_id"])),
         Tool(name: "workshop_request_review",
              description: "Ask a participant engineer to review work on a task.",
              inputSchema: obj(["task_id": s, "reviewer": s, "message": s,
