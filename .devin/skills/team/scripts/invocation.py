@@ -86,6 +86,10 @@ def validate_request(request):
             raise ValueError('Invalid origin binding')
 
 
+# Cursor spaces: the receipt's `committed_seq` is an ingress/outbox sequence.
+# `workshop_read_messages`/`workshop_wait_for_events` `after_seq` are task
+# MESSAGE seqs (start at 0, or the last message seq observed) — never pass a
+# receipt committed_seq as a message cursor.
 def validate_receipt(receipt):
     if not isinstance(receipt, dict):
         raise ValueError('Invalid receipt')

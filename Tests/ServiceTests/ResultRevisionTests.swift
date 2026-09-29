@@ -237,6 +237,74 @@ final class ResultRevisionTests: XCTestCase {
         await svc.shutdown()
     }
 
+    /// Typed result↔snapshot binding: the report receipt carries the
+    /// producing generation's id and a null digest while it is still
+    /// writing; getTask exposes the sealed digest after the turn seals;
+    /// one system event is posted per sealed revision.
+    func testResultSnapshotBindingAndSealEvent() async throws {
+        let adapters = [FakeAdapter(engineer: .devin, delayPerDelta: .zero)]
+        let svc = try makeService(adapters: adapters, dispatcher: true)
+        var receiptCard: JSONValue?
+        adapters[0].toolRunner = { [weak svc] name, args, principal in
+            guard let svc else { return .null }
+            let result = try await svc.callTool(name, args: args, principal: principal)
+            if name == "workshop_report_result",
+               let message = try? result.decode(as: Message.self),
+               let text = message.structured {
+                receiptCard = try? JSONDecoder().decode(JSONValue.self,
+                                                        from: Data(text.utf8))
+            }
+            return result
+        }
+        adapters[0].script = { context in
+            guard let sub = context.subtask else { return [.text("no subtask")] }
+            return [.toolCall("workshop_report_result", .object([
+                "task_id": .string(context.task.id.rawValue),
+                "subtask_id": .string(sub.id.rawValue),
+                "summary": .string("done"),
+                "generation": .number(Double(sub.generation))]))]
+        }
+        // Writer leases exist only for schema-v2 tasks.
+        let taskID = (try await svc.createTask(CreateTaskRequest(
+            schemaVersion: 2, idempotencyKey: UUID().uuidString,
+            title: "T", objective: "do X", phase: .execution,
+            participants: [.devin]))).taskID
+        // A task workspace is required for a writer lease to seal.
+        let prepared = try WorkspaceManager.prepareTaskWorkspace(
+            homeDir: dir, taskID: taskID, workspaceRef: nil)
+        try svc.repoForTests.insertTaskWorkspace(prepared)
+        await svc.start()
+        let sealed = await waitFor {
+            try await svc.readMessages(taskID).contains {
+                $0.kind == .systemEvent && $0.body.contains("sealed as snapshot") }
+        }
+        XCTAssertTrue(sealed)
+
+        // Receipt: generation_id known, digest null while writing.
+        let receipt = try XCTUnwrap(receiptCard)
+        let generationID = try XCTUnwrap(receipt["generation_id"]?.stringValue)
+        XCTAssertEqual(receipt["snapshot_digest"], .null)
+        XCTAssertEqual(receipt["revision"]?.intValue, 1)
+
+        // Task detail binds the sealed generation and its digest.
+        let sub = try await svc.getTask(taskID).subtasks[0]
+        let afterSeal = try await svc.getTask(taskID)
+        let status = try XCTUnwrap(afterSeal.subtaskResults?[sub.id.rawValue])
+        XCTAssertEqual(status.resultRevision, 1)
+        XCTAssertEqual(status.generationID, generationID)
+        XCTAssertNotNil(status.snapshotDigest)
+
+        // Exactly one seal event per sealed revision, naming both ids.
+        let sealEvents = try await svc.readMessages(taskID).filter {
+            $0.kind == .systemEvent && $0.body.hasPrefix("Result revision ")
+                && $0.body.contains("sealed as snapshot") }
+        XCTAssertEqual(sealEvents.count, 1)
+        XCTAssertTrue(sealEvents[0].body.contains(
+            "Result revision 1 sealed as snapshot " + String(generationID.prefix(8))
+            + " digest"), sealEvents[0].body)
+        await svc.shutdown()
+    }
+
     func testScriptedReportTurnVerifiesOnce() async throws {
         let adapters = [FakeAdapter(engineer: .devin, delayPerDelta: .zero)]
         let svc = try makeService(adapters: adapters, dispatcher: true)

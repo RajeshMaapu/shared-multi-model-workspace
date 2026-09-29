@@ -109,7 +109,13 @@ public final class WriterGenerations {
             seed = pin
             source = .pin
         } else {
-            for candidate in [newestAuthoritative, newestReviewOnly] {
+            // Once any authoritative snapshot exists, a review_only snapshot
+            // is a seed only through the pin above; the newest review_only
+            // fallback applies only to tasks with no authoritative row.
+            let candidates: [Row?] = newestAuthoritative != nil
+                ? [newestAuthoritative]
+                : [newestReviewOnly]
+            for candidate in candidates {
                 guard let candidate,
                       let rowid = candidate["rowid"]?.int,
                       rowid > (seed?["rowid"]?.int ?? seed?["growid"]?.int ?? 0)

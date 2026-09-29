@@ -235,6 +235,26 @@ final class Phase2ServiceTests: XCTestCase {
         XCTAssertEqual(try artifact.decode(as: Artifact.self).producer, "devin")
     }
 
+    /// Regression (fresh-thread run): a path that resolves inside the
+    /// workspace but does not exist there fails with a requirement-stating
+    /// error, not a raw Foundation read error.
+    func testPublishArtifactMissingFileStatesRequirement() async throws {
+        let (svc, taskID) = try await service(participants: [.devin])
+        do {
+            _ = try await svc.callTool("workshop_publish_artifact",
+                args: .object([
+                    "task_id": .string(taskID.rawValue),
+                    "path": .string("acceptance-report.md"),
+                    "description": .string("x")]),
+                principal: .engineer(.devin))
+            XCTFail("expected invalidRequest")
+        } catch WorkshopError.invalidRequest(let why) {
+            XCTAssertTrue(why.contains("inside the task workspace"), why)
+            XCTAssertTrue(why.contains("relative"), why)
+            XCTAssertTrue(why.contains("workshop_report_result"), why)
+        }
+    }
+
     // MARK: - capacity
 
     func testCapacityReportsUnknown() async throws {

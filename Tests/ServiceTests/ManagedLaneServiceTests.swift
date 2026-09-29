@@ -72,11 +72,14 @@ final class ManagedLaneServiceTests: XCTestCase {
                        "managed")
         XCTAssertNil(detail.participants.first { $0.engineerID == .devin }?.lane)
 
-        // A native-lane message keeps old structured content unchanged.
+        // A native-lane engineer message is labeled "native" too.
         await svc.recordLane(taskID: taskID, engineer: .devin, lane: "native")
         let plain = try await svc.toolPostMessage(
             taskID: taskID, body: "plain", kind: "text", replyTo: nil,
             principal: .engineer(.devin))
-        XCTAssertNil(plain.structured)
+        let nativeCard = try XCTUnwrap(plain.structured)
+        let nativeFields = try JSONDecoder().decode(JSONValue.self,
+                                                    from: Data(nativeCard.utf8))
+        XCTAssertEqual(nativeFields["lane"]?.stringValue, "native")
     }
 }

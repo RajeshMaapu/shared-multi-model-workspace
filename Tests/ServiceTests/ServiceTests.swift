@@ -93,6 +93,89 @@ final class ServiceTests: XCTestCase {
         await resumed.shutdown()
     }
 
+    /// After two consecutive native session/load timeouts Kimi skips the
+    /// bounded load and opens fresh, with the note posted exactly once.
+    func testKimiSessionReloadSkippedAfterTwoTimeouts() async throws {
+        let adapters = fakes()
+        let kimi = try XCTUnwrap(adapters.first { $0.engineer == .kimi })
+        let svc = try service(adapters: adapters, dispatcher: false)
+        let receipt = try await svc.createTask(request())
+        let taskID = receipt.taskID
+        try svc.repoForTests.db.execute("""
+            INSERT INTO session_bindings(task_id,engineer_id,role,worker_id,
+                native_session_id,profile_revision,model_selection,
+                recovery_state,load_timeout_count)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            """, [.text(taskID.rawValue), .text("kimi"), .text("owner"),
+                  .text("main"), .text("session-stale"), .integer(2),
+                  .text("k3"), .text("bound"), .integer(2)])
+        await svc.runTurnForTest(engineer: .kimi, taskID: taskID,
+                                 wakeReason: "mention")
+        XCTAssertNil(kimi.receivedBindings.last?.nativeSessionID)
+        var notes = try await svc.readMessages(taskID).filter {
+            $0.kind == .systemEvent
+                && $0.body.contains("Kimi native session reload skipped")
+        }
+        XCTAssertEqual(notes.count, 1)
+        // The skip stays armed and the note is not repeated.
+        await svc.runTurnForTest(engineer: .kimi, taskID: taskID,
+                                 wakeReason: "mention")
+        XCTAssertNil(kimi.receivedBindings.last?.nativeSessionID)
+        notes = try await svc.readMessages(taskID).filter {
+            $0.kind == .systemEvent
+                && $0.body.contains("Kimi native session reload skipped")
+        }
+        XCTAssertEqual(notes.count, 1)
+        await svc.shutdown()
+    }
+
+    /// A load-timeout note bumps the binding's counter; a successful load
+    /// (returned session equals the stored one) resets it.
+    func testKimiLoadTimeoutCountedAndResetOnSuccess() async throws {
+        let adapters = fakes()
+        let kimi = try XCTUnwrap(adapters.first { $0.engineer == .kimi })
+        let svc = try service(adapters: adapters, dispatcher: false)
+        let receipt = try await svc.createTask(request())
+        let taskID = receipt.taskID
+        let bindingRow = "SELECT load_timeout_count FROM session_bindings "
+            + "WHERE task_id=? AND engineer_id='kimi'"
+        func count() throws -> Int64? {
+            try svc.repoForTests.db.query(bindingRow,
+                                          [.text(taskID.rawValue)])
+                .first?["load_timeout_count"]?.int
+        }
+        try svc.repoForTests.db.execute("""
+            INSERT INTO session_bindings(task_id,engineer_id,role,worker_id,
+                native_session_id,profile_revision,model_selection,
+                recovery_state,load_timeout_count)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            """, [.text(taskID.rawValue), .text("kimi"), .text("owner"),
+                  .text("main"), .text("session-a"), .integer(2),
+                  .text("k3"), .text("bound"), .integer(0)])
+        kimi.script = { _ in
+            [.event(.uncertain(
+                "Native session for kimi could not be loaded "
+                + "(ACP session/load timed out); started a new session "
+                + "(no checkpoint available yet)"))]
+        }
+        await svc.runTurnForTest(engineer: .kimi, taskID: taskID,
+                                 wakeReason: "mention")
+        XCTAssertEqual(try count(), 1)
+
+        // A successful session/load (adapter returns the stored id) resets.
+        kimi.script = nil
+        try svc.repoForTests.db.execute("""
+            UPDATE session_bindings SET native_session_id=?,
+                load_timeout_count=1
+            WHERE task_id=? AND engineer_id='kimi'
+            """, [.text("fake-session-" + taskID.rawValue),
+                  .text(taskID.rawValue)])
+        await svc.runTurnForTest(engineer: .kimi, taskID: taskID,
+                                 wakeReason: "mention")
+        XCTAssertEqual(try count(), 0)
+        await svc.shutdown()
+    }
+
     func testT02IdempotencyConflict() async throws {
         let svc = try service(adapters: fakes())
         _ = try await svc.createTask(request())

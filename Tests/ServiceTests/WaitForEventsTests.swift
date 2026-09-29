@@ -94,14 +94,71 @@ final class WaitForEventsTests: XCTestCase {
     func testWaitForEventsTimeout() async throws {
         let svc = try makeService("c")
         let taskID = try await task(svc)
-        let result = try await svc.waitForEvents(taskID: taskID, afterSeq: 99,
+        let result = try await svc.waitForEvents(taskID: taskID, afterSeq: 1,
                                                  timeoutSeconds: 1,
                                                  principal: .user)
         XCTAssertEqual(result["events"]?.arrayValue?.count, 0)
         XCTAssertEqual(result["timed_out"], .bool(true))
-        XCTAssertEqual(result["last_seq"]?.intValue, 99)
+        XCTAssertEqual(result["last_seq"]?.intValue, 1)
         let count = await svc.waiterCount
         XCTAssertEqual(count, 0)
+    }
+
+    /// c2. after_seq is a task-message cursor: an out-of-range value (e.g. a
+    /// receipt committed_seq) is rejected as -32602 naming both numbers.
+    func testOverRangeAfterSeqRejected() async throws {
+        let svc = try makeService("c2")
+        let taskID = try await task(svc)
+        let latest = try svc.repoForTests.maxCommittedMessageSeq(taskID)
+        await XCTAssertThrowsErrorAsync(
+            try await svc.waitForEvents(taskID: taskID, afterSeq: 5000,
+                                        timeoutSeconds: 1,
+                                        principal: .user)) { error in
+            guard case WorkshopError.invalidRequest(let why) = error else {
+                return XCTFail("expected invalidRequest, got \(error)")
+            }
+            XCTAssertEqual((error as? WorkshopError)?.rpcCode, -32602)
+            XCTAssertTrue(why.contains("after_seq 5000"), why)
+            XCTAssertTrue(why.contains("seq \(latest)"), why)
+            XCTAssertTrue(why.contains("committed_seq"), why)
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await svc.toolReadMessages(taskID: taskID, afterSeq: 5000, limit: 50,
+                                     principal: .codex)) { error in
+            XCTAssertEqual((error as? WorkshopError)?.rpcCode, -32602)
+        }
+    }
+
+    /// c3. An inflated stored acknowledgement (a receipt committed_seq) is
+    /// repaired to the task's latest message seq on the next read.
+    func testInflatedAckRepairedOnRead() async throws {
+        let svc = try makeService("c3")
+        let taskID = try await task(svc, participants: [.devin, .kimi],
+                                    principal: .codex)
+        try await svc.postMessage(taskID: taskID, body: "m")
+        let maxSeq = try svc.repoForTests.maxCommittedMessageSeq(taskID)
+        try svc.repoForTests.db.execute(
+            "UPDATE task_ingress SET last_acknowledged_seq=44598 WHERE task_id=?",
+            [.text(taskID.rawValue)])
+        _ = try await svc.waitForEvents(taskID: taskID, afterSeq: 0,
+                                        timeoutSeconds: 1, principal: .codex)
+        let detail = try await svc.getTask(taskID)
+        XCTAssertEqual(detail.acknowledgedSeq, maxSeq)
+    }
+
+    /// c4. Daemon startup repairs every inflated acknowledgement row.
+    func testStartupRepairsInflatedAck() async throws {
+        let svc = try makeService("c4")
+        let taskID = try await task(svc, participants: [.devin, .kimi],
+                                    principal: .codex)
+        try await svc.postMessage(taskID: taskID, body: "m")
+        let maxSeq = try svc.repoForTests.maxCommittedMessageSeq(taskID)
+        try svc.repoForTests.db.execute(
+            "UPDATE task_ingress SET last_acknowledged_seq=44598 WHERE task_id=?",
+            [.text(taskID.rawValue)])
+        await svc.start()
+        let detail = try await svc.getTask(taskID)
+        XCTAssertEqual(detail.acknowledgedSeq, maxSeq)
     }
 
     /// d. Codex reads advance task_ingress.last_acknowledged_seq.
