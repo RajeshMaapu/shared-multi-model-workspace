@@ -1510,7 +1510,7 @@ public actor CollaborationService {
         "workshop_create_task", "workshop_list_tasks", "workshop_get_task",
         "workshop_read_messages", "workshop_post_message",
         "workshop_select_review_seed", "workshop_read_review_file",
-        "workshop_wait_for_events",
+        "workshop_wait_for_events", "workshop_resume_task",
     ]
 
     /// Set by the daemon after verifying `workshop://` is registered to
@@ -1591,6 +1591,15 @@ public actor CollaborationService {
             return try await waitForEvents(
                 taskID: id, afterSeq: args["after_seq"]?.intValue ?? 0,
                 timeoutSeconds: args["timeout_seconds"]?.intValue.map { Int($0) },
+                principal: principal)
+        case "workshop_resume_task":
+            let id = TaskID(args["task_id"]?.stringValue ?? "")
+            guard args["task_id"]?.stringValue != nil else {
+                throw WorkshopError.invalidRequest("task_id required")
+            }
+            return try await toolResumeTask(
+                taskID: id,
+                idempotencyKey: args["idempotency_key"]?.stringValue,
                 principal: principal)
         case "workshop_request_review":
             let id = TaskID(args["task_id"]?.stringValue ?? "")
@@ -4321,6 +4330,75 @@ public actor CollaborationService {
     /// and re-wake the owner / participants.
     public func resumeTask(taskID: TaskID, principal: Principal) async throws {
         try requireUser(principal, "resume task")
+        try await performResume(taskID: taskID, actorLabel: "user")
+    }
+
+    /// §8.3 `workshop_resume_task`: resume-only, origin-bound for Codex.
+    /// Returns a receipt; a task that is not paused/blocked yields
+    /// `resumed:false` rather than an error.
+    private func toolResumeTask(taskID: TaskID, idempotencyKey: String?,
+                                principal: Principal) async throws -> JSONValue {
+        guard principal == .user || principal == .codex else {
+            throw WorkshopError.userAuthorityRequired("resume task")
+        }
+        let task = try loadTask(taskID)
+        if principal == .codex {
+            guard try repo.taskIngress(taskID)?.source == "codex" else {
+                throw WorkshopError.userAuthorityRequired(
+                    "Codex may resume only tasks it submitted")
+            }
+        }
+        struct ResumePayload: Codable { let task_id: String }
+        var operationKey: String?
+        var operationScope = ""
+        var payloadHash = ""
+        if let key = idempotencyKey,
+           !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let scope = principal.kind
+            let opKey = scope + ":" + key
+            payloadHash = try canonicalJSONHash(of: ResumePayload(
+                task_id: taskID.rawValue))
+            if let existing = try repo.operation(opKey) {
+                guard existing.principal == scope,
+                      existing.payloadHash == payloadHash,
+                      let stored = try? JSONDecoder().decode(
+                        JSONValue.self, from: Data(existing.resultJSON.utf8)) else {
+                    throw WorkshopError.idempotencyConflict
+                }
+                return stored
+            }
+            operationKey = opKey
+            operationScope = scope
+        }
+        guard task.state == .paused || task.state == .blocked else {
+            return .object([
+                "task_id": .string(taskID.rawValue),
+                "resumed": .bool(false),
+                "state": .string(task.state.rawValue),
+                "reason": .string("task is not paused or blocked"),
+            ])
+        }
+        try await performResume(
+            taskID: taskID,
+            actorLabel: principal == .codex ? "You (via Codex)" : "user")
+        let newState = try repo.task(taskID)?.state ?? task.state
+        let result = JSONValue.object([
+            "task_id": .string(taskID.rawValue),
+            "resumed": .bool(true),
+            "state": .string(newState.rawValue),
+        ])
+        if let opKey = operationKey {
+            try repo.insertOperation(
+                key: opKey, principal: operationScope,
+                payloadHash: payloadHash,
+                resultJSON: String(decoding: try JSONEncoder().encode(result),
+                                   as: UTF8.self),
+                at: now())
+        }
+        return result
+    }
+
+    private func performResume(taskID: TaskID, actorLabel: String) async throws {
         let task = try loadTask(taskID)
         let workspaceRetry: Bool
         if task.state == .blocked && task.phase == .execution {
@@ -4390,7 +4468,7 @@ public actor CollaborationService {
             try repo.insertMessage(Message(
                 id: MessageID(newID("msg")), taskID: taskID,
                 seq: try repo.nextMessageSeq(taskID), author: .system,
-                kind: .systemEvent, body: "Task resumed by user",
+                kind: .systemEvent, body: "Task resumed by \(actorLabel)",
                 deliveryState: .committed, createdAt: timestamp, updatedAt: timestamp))
         }
         publishCommitted()

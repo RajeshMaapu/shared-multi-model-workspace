@@ -251,11 +251,108 @@ final class CodexBridgeTests: XCTestCase {
             "workshop_create_task", "workshop_list_tasks", "workshop_get_task",
             "workshop_read_messages", "workshop_post_message",
             "workshop_select_review_seed", "workshop_read_review_file",
-            "workshop_wait_for_events",
+            "workshop_wait_for_events", "workshop_resume_task",
         ]))
-        // Catalog 3: the new tool is advertised to Codex sessions.
-        XCTAssertEqual(WorkshopToolCatalog.catalogVersion, 3)
+        // Catalog 4: the new tool is advertised to Codex sessions.
+        XCTAssertEqual(WorkshopToolCatalog.catalogVersion, 4)
         XCTAssertTrue(WorkshopToolCatalog.tools.contains {
-            $0.name == "workshop_wait_for_events" })
+            $0.name == "workshop_resume_task" })
+    }
+
+    /// ADR 0015 rev 2026-09-29: Codex resumes an origin-bound paused task.
+    func testCodexResumePausedOriginBoundTask() async throws {
+        let created = try await service.callTool(
+            "workshop_create_task", args: createArgs(key: "codex-resume-1"),
+            principal: codex)
+        let taskID = TaskID(created["task_id"]!.stringValue!)
+        let detail = try await service.getTask(taskID)
+        // An owner claim exists so resume wakes the owner.
+        let sub = try XCTUnwrap(detail.subtasks.first)
+        try service.repoForTests.db.execute(
+            "UPDATE subtasks SET owner_id='deepseek', state='claimed' WHERE id=?",
+            [.text(sub.id.rawValue)])
+        try service.repoForTests.updateTaskState(taskID, .paused, at: Date())
+        let receipt = try await service.callTool(
+            "workshop_resume_task",
+            args: .object(["task_id": .string(taskID.rawValue)]),
+            principal: codex)
+        XCTAssertEqual(receipt["resumed"], .bool(true))
+        XCTAssertEqual(receipt["state"]?.stringValue, "ready")
+        let messages = try service.repoForTests.messages(taskID)
+        XCTAssertTrue(messages.contains {
+            $0.kind == .systemEvent
+                && $0.body == "Task resumed by You (via Codex)" })
+        let wakeups = try service.repoForTests.db.query(
+            "SELECT * FROM wakeups WHERE task_id=? AND reason='resumed'",
+            [.text(taskID.rawValue)])
+        XCTAssertEqual(wakeups.count, 1)
+    }
+
+    /// No ingress row (user-created task) → forbidden.
+    func testCodexResumeWithoutIngressForbidden() async throws {
+        let receipt = try await service.createTask(CreateTaskRequest(
+            idempotencyKey: "user-task", title: "T", objective: "o",
+            phase: .execution, participants: [.deepseek]),
+            principal: .user)
+        do {
+            _ = try await service.callTool(
+                "workshop_resume_task",
+                args: .object(["task_id": .string(receipt.taskID.rawValue)]),
+                principal: codex)
+            XCTFail("expected forbidden")
+        } catch let error as WorkshopRPCError {
+            XCTAssertEqual(error.rpcCode, -32005)
+        }
+    }
+
+    /// A task that is not paused/blocked reports resumed:false (no error).
+    func testCodexResumeNonPausedTaskReportsFalse() async throws {
+        let created = try await service.callTool(
+            "workshop_create_task", args: createArgs(key: "codex-resume-2"),
+            principal: codex)
+        let taskID = created["task_id"]!.stringValue!
+        // Tasks start `ready` — not resumable.
+        let receipt = try await service.callTool(
+            "workshop_resume_task",
+            args: .object(["task_id": .string(taskID)]),
+            principal: codex)
+        XCTAssertEqual(receipt["resumed"], .bool(false))
+        XCTAssertEqual(receipt["reason"]?.stringValue,
+                       "task is not paused or blocked")
+    }
+
+    /// Same idempotency key replays the stored receipt; a second resume does
+    /// not re-fire the wakeup or event.
+    func testCodexResumeIdempotentRepeat() async throws {
+        let created = try await service.callTool(
+            "workshop_create_task", args: createArgs(key: "codex-resume-3"),
+            principal: codex)
+        let taskID = TaskID(created["task_id"]!.stringValue!)
+        try service.repoForTests.updateTaskState(taskID, .paused, at: Date())
+        let args = JSONValue.object([
+            "task_id": .string(taskID.rawValue),
+            "idempotency_key": .string("resume-key-1")])
+        let first = try await service.callTool(
+            "workshop_resume_task", args: args, principal: codex)
+        // Task is now ready; a repeat with the same key returns the receipt.
+        let second = try await service.callTool(
+            "workshop_resume_task", args: args, principal: codex)
+        XCTAssertEqual(first, second)
+        let events = try service.repoForTests.messages(taskID).filter {
+            $0.kind == .systemEvent && $0.body.hasPrefix("Task resumed by") }
+        XCTAssertEqual(events.count, 1)
+    }
+
+    /// The user path is unchanged: resume via the UDS method still works.
+    func testUserResumeUnaffected() async throws {
+        let receipt = try await service.createTask(CreateTaskRequest(
+            idempotencyKey: "user-resume", title: "T", objective: "o",
+            phase: .execution, participants: [.deepseek]),
+            principal: .user)
+        try service.repoForTests.updateTaskState(receipt.taskID, .paused,
+                                                 at: Date())
+        try await service.resumeTask(taskID: receipt.taskID, principal: .user)
+        let detail = try await service.getTask(receipt.taskID)
+        XCTAssertEqual(detail.task.state, .ready)
     }
 }

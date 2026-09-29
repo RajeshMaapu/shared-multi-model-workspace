@@ -127,7 +127,7 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertNotNil(sid)
         XCTAssertEqual(json?["result"]?["protocolVersion"]?.stringValue, "2025-11-25")
         XCTAssertTrue(json?["result"]?["serverInfo"]?["version"]?.stringValue?
-                        .contains("+catalog3") ?? false)
+                        .contains("+catalog4") ?? false)
         (_, json, sid) = try await initialize(version: "2099-01-01")
         XCTAssertEqual(json?["result"]?["protocolVersion"]?.stringValue, "2025-06-18")
         XCTAssertNotNil(sid)
@@ -191,7 +191,7 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertEqual(resp.statusCode, 200)
         let tools = json?["result"]?["tools"]?.arrayValue
         XCTAssertEqual(tools?.count, WorkshopToolCatalog.tools.count)
-        XCTAssertEqual(json?["result"]?["_meta"]?["workshop_catalog_version"]?.intValue, 3)
+        XCTAssertEqual(json?["result"]?["_meta"]?["workshop_catalog_version"]?.intValue, 4)
         // Catalog 2: workshop_read_messages accepts include_summaries.
         let readSchema = tools?.first {
             $0["name"]?.stringValue == "workshop_read_messages" }

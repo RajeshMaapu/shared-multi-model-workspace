@@ -253,6 +253,11 @@ the task's `task_ingress.last_acknowledged_seq` cursor, surfaced as
 server-side through the `operations` table, scoped per principal, so an
 uncertain append can be retried verbatim; a mismatched replay is -32009.
 Catalog 3 adds the tool and the optional `idempotency_key` fields.
+Catalog 4 adds `workshop_resume_task`, an origin-bound resume for the
+Codex principal (ADR 0015 rev 2026-09-29): it restarts a paused or
+blocked task that carries a Codex ingress record and records the resume
+as "Task resumed by You (via Codex)"; acceptance, promotion, cancel and
+reassignment stay user-only.
 
 **Qualification as data (Phase 3).** `config/capabilities.json` records, per
 (engineer, lane, model), whether the isolated-writer recipe passed — the
