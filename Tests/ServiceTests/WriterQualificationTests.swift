@@ -69,7 +69,10 @@ final class WriterQualificationTests: XCTestCase {
                     XCTFail("Unqualified transfer must fail")
                 } catch WorkshopError.invalidRequest {}
             } else {
-                XCTAssertEqual(fake.turnCount, 1)
+                // awaitIdle now drains the wakeup coalescer too: the
+                // report_requested wakeup runs a second real turn. Legacy
+                // routing is asserted by the owner turn running at all.
+                XCTAssertGreaterThanOrEqual(fake.turnCount, 1)
             }
             await service.shutdown()
         }
@@ -245,7 +248,20 @@ final class WriterQualificationTests: XCTestCase {
             $0.workspace?.state == "discussion" })
         let db = try Database(path: root + "/db.sqlite")
         let states = try db.query("SELECT DISTINCT state FROM writer_generations")
-        XCTAssertTrue(states.allSatisfy { $0["state"]?.text == "review_only" })
+        // Failure context: an in-flight coalesced turn leaves its generation
+        // in `discussion`; the dumps show which wakeup/turn raced awaitIdle.
+        let genRows = (try? db.query(
+            "SELECT id||':'||state||':'||engineer s FROM writer_generations"))?
+            .compactMap { $0["s"]?.text }.joined(separator: "; ") ?? ""
+        let wakeRows = (try? db.query(
+            "SELECT engineer_id||':'||reason||':'||state s FROM wakeups"))?
+            .compactMap { $0["s"]?.text }.joined(separator: "; ") ?? ""
+        let ctxs = kimi.receivedContexts.map {
+            "\($0.wakeReason ?? "-"):\($0.workspace?.state ?? "-")"
+        }.joined(separator: "; ")
+        let failureContext = "gens=\(genRows) wakeups=\(wakeRows) contexts=\(ctxs)"
+        XCTAssertTrue(states.allSatisfy { $0["state"]?.text == "review_only" },
+                      failureContext)
         await service.shutdown()
     }
 }

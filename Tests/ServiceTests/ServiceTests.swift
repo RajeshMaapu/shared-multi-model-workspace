@@ -47,7 +47,8 @@ final class ServiceTests: XCTestCase {
         // Root message only existed once before dispatch; engineer reply + system events added.
         XCTAssertEqual(messages.filter { $0.seq == 1 }.count, 1)
         XCTAssertEqual(messages.first?.body, "Do the thing")
-        XCTAssertEqual(adapters[0].turnCount, 1)
+        // The owner's report_requested nudge may add a follow-up turn.
+        XCTAssertGreaterThanOrEqual(adapters[0].turnCount, 1)
     }
 
     func testExplicitCollaborationKeepsExistingPeersAndCleanInstructions() async throws {
@@ -226,8 +227,10 @@ final class ServiceTests: XCTestCase {
         await svc.start()
         await svc.awaitIdle()
         let counts = adapters.map(\.turnCount)
-        XCTAssertEqual(counts.reduce(0, +), 1)
-        XCTAssertEqual(adapters[0].turnCount, 1) // devin first in order
+        // The owner's report_requested nudge may add a follow-up turn;
+        // peers still run none.
+        XCTAssertEqual(counts[1] + counts[2], 0)
+        XCTAssertGreaterThanOrEqual(adapters[0].turnCount, 1) // devin first in order
         let detail = try await svc.getTask(receipt.taskID)
         XCTAssertEqual(Set(detail.participants.map(\.engineerID)), Set(EngineerID.allCases))
         let messages = try await svc.readMessages(receipt.taskID)
@@ -245,7 +248,9 @@ final class ServiceTests: XCTestCase {
         let svc2 = try service(adapters: adapters, file: path)
         await svc2.start()
         await svc2.awaitIdle()
-        XCTAssertEqual(adapters.map(\.turnCount).reduce(0, +), 1)
+        // The owner's report_requested nudge may add a follow-up turn.
+        XCTAssertGreaterThanOrEqual(adapters[0].turnCount, 1)
+        XCTAssertEqual(adapters[1].turnCount + adapters[2].turnCount, 0)
         let pending = try await svc2.outboxEvents(afterSeq: 0)
             .filter { $0.eventType == CollaborationService.dispatchRequested }
         XCTAssertTrue(pending.allSatisfy { $0.deliveryState == "delivered" })

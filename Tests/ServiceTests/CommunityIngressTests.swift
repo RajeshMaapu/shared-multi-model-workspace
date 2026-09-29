@@ -122,7 +122,8 @@ final class CommunityIngressTests: XCTestCase {
         await svc.awaitIdle()
         let detail = try await svc.getTask(receipt.taskID)
         XCTAssertEqual(Set(detail.participants.map(\.engineerID)), Set([.devin, .kimi]))
-        XCTAssertEqual(adapters[0].turnCount, 1)
+        // The owner's report_requested nudge may add a follow-up turn.
+        XCTAssertGreaterThanOrEqual(adapters[0].turnCount, 1)
         XCTAssertEqual(adapters[1].turnCount, 1)
         XCTAssertEqual(adapters[2].turnCount, 0)
         let kimiContext = try XCTUnwrap(adapters[1].receivedContexts.first)

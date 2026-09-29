@@ -470,9 +470,15 @@ public actor CollaborationService {
         eventContinuations.removeAll()
     }
 
-    /// Wait until the dispatcher has no pending work. For tests.
+    /// Wait until the dispatcher and wakeup coalescer have no pending or
+    /// in-flight work. For tests. Coalescer-launched turns count toward
+    /// `inflightTurns`; a due-but-not-yet-consumed wakeup keeps the wait
+    /// alive so no turn can start after this returns.
     public func awaitIdle() async {
-        while dispatcherScheduled || inflightTurns > 0 {
+        while dispatcherScheduled || inflightTurns > 0
+                || (attempt("pendingWakeups", {
+                    try repo.pendingWakeups()
+                }) ?? []).isEmpty == false {
             try? await Task.sleep(for: .milliseconds(5))
         }
         if let pending = attempt("pendingOutbox", { try repo.pendingOutbox(eventType: Self.dispatchRequested) }),
@@ -1905,6 +1911,10 @@ public actor CollaborationService {
                                  reasons: group.reasons, eventPrefix: prefix)
                     continue
                 }
+                // Count the turn from before its wakeups leave 'pending'
+                // until runTurn finishes so awaitIdle cannot return between
+                // dequeue and dispatch or while the coalesced turn streams.
+                inflightTurns += 1
                 for row in group.rows {
                     _ = attempt("wakeupRunning",
                                 { try repo.setWakeupState(row.id, "running", at: now()) })
@@ -1973,6 +1983,7 @@ public actor CollaborationService {
                                                               at: now()) })
                     }
                 }
+                inflightTurns -= 1
             }
             // Another batch may have arrived while we ran turns; loop if so.
             if !anyPending {
