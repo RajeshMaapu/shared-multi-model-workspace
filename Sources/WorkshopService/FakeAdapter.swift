@@ -76,6 +76,7 @@ public final class FakeAdapter: CapabilityAwareAdapter, @unchecked Sendable {
         var openAttempts = 0
         var contexts: [TurnContext] = []
         var cancelledTurns: [String] = []
+        var bindings: [SessionBinding] = []
     }
     private let state = Locked(State())
 
@@ -95,6 +96,9 @@ public final class FakeAdapter: CapabilityAwareAdapter, @unchecked Sendable {
 
     public var openAttempts: Int { state.with { $0.openAttempts } }
 
+    /// Bindings passed to openTaskSession, in order (session policy tests).
+    public var receivedBindings: [SessionBinding] { state.with { $0.bindings } }
+
     public func probe() async -> AdapterProbe {
         state.with { $0.probeCount += 1 }
         return AdapterProbe(
@@ -107,7 +111,7 @@ public final class FakeAdapter: CapabilityAwareAdapter, @unchecked Sendable {
     }
 
     public func openTaskSession(binding: SessionBinding) async throws -> SessionRef {
-        state.with { $0.openAttempts += 1 }
+        state.with { $0.openAttempts += 1; $0.bindings.append(binding) }
         if let openSessionError { throw openSessionError }
         return SessionRef(engineer: engineer,
                           nativeSessionID: reportsFreshSession

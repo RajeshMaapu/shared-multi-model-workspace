@@ -133,7 +133,7 @@ public final class ACPHarnessAdapter: CapabilityAwareAdapter, @unchecked Sendabl
                 versionProbe: @escaping @Sendable (String) -> String?
                     = ACPHarnessAdapter.defaultVersionProbe,
                 cancellationTimeout: Duration = .seconds(10),
-                sessionLoadTimeout: Duration = .seconds(20)) {
+                sessionLoadTimeout: Duration = .seconds(15)) {
         self.cancellationTimeout = cancellationTimeout
         self.sessionLoadTimeout = sessionLoadTimeout
         self.engineer = spec.engineer

@@ -86,9 +86,11 @@ final class WriterGenerationTests: XCTestCase {
         let reviewOnly = try store.seal(discussion)
         XCTAssertThrowsError(try store.promote(reviewOnly, verifiedDigest: reviewOnly.digest))
 
+        // With an authoritative snapshot on record, an unpinned
+        // review_only proposal is NOT the seed — the sealed revision is.
         let peer = try store.begin(task: base, engineer: .kimi,
                                    authoritative: false, seedEngineer: .devin)
-        XCTAssertEqual(try String(contentsOfFile: peer.path + "/sub/file"), "revised")
+        XCTAssertEqual(try String(contentsOfFile: peer.path + "/sub/file"), "first")
         _ = try store.seal(peer)
         let staleDiscussion = try store.begin(task: base, engineer: .devin,
                                               authoritative: false, seedEngineer: .devin)
@@ -251,6 +253,30 @@ final class WriterGenerationTests: XCTestCase {
                 XCTAssertEqual(error.rpcCode, -32005)
             }
         }
+    }
+
+    /// Regression (fresh-thread run): with an authoritative snapshot on
+    /// record, a later unpinned owner discussion snapshot must not become
+    /// the review seed — the sealed revision stays the seed.
+    func testSealedRevisionOutranksLaterUnpinnedOwnerDiscussion() async throws {
+        let (home, db, base) = try await fixture()
+        let store = WriterGenerations(db: db, home: home)
+        let authoritative = try store.begin(task: base, engineer: .devin)
+        try "sealed bytes".write(toFile: authoritative.path + "/sub/file",
+                                 atomically: true, encoding: .utf8)
+        let sealed = try store.seal(authoritative)
+        let discussion = try store.begin(task: base, engineer: .devin,
+                                         authoritative: false,
+                                         seedEngineer: .devin)
+        try "discussion".write(toFile: discussion.path + "/sub/file",
+                               atomically: true, encoding: .utf8)
+        _ = try store.seal(discussion)
+        let seed = try XCTUnwrap(
+            try store.currentReviewSeed(taskID: base.taskID, requester: .devin,
+                                        seedEngineer: .devin))
+        XCTAssertEqual(seed.generationID, authoritative.id)
+        XCTAssertEqual(seed.digest, sealed.digest)
+        XCTAssertEqual(seed.source, .authoritative)
     }
 
     func testOlderOwnerDiscussionCannotReplaceNewerReviewSeed() async throws {

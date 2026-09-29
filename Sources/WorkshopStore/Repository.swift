@@ -529,12 +529,48 @@ public final class WorkshopRepository {
                            lastAcknowledgedSeq: row["last_acknowledged_seq"]!.int ?? 0)
     }
 
-    /// Advance the caller-acknowledged cursor; never moves backwards.
+    /// Advance the caller-acknowledged cursor; never moves backwards and
+    /// never past the task's latest committed message seq.
     public func acknowledgeIngressSeq(_ taskID: TaskID, seq: Int64) throws {
+        let maxSeq = try maxCommittedMessageSeq(taskID)
         try db.execute("""
-            UPDATE task_ingress SET last_acknowledged_seq=MAX(last_acknowledged_seq, ?)
+            UPDATE task_ingress SET last_acknowledged_seq=MIN(MAX(last_acknowledged_seq, ?), ?)
             WHERE task_id=?
-            """, [.integer(seq), .text(taskID.rawValue)])
+            """, [.integer(seq), .integer(maxSeq), .text(taskID.rawValue)])
+    }
+
+    /// Latest committed task-message seq (provisional streaming seqs and
+    /// in-flight rows excluded). Ingress/outbox seqs are a different space.
+    public func maxCommittedMessageSeq(_ taskID: TaskID) throws -> Int64 {
+        try db.query("""
+            SELECT MAX(seq) AS m FROM messages
+            WHERE task_id=? AND delivery_state='committed' AND seq < ?
+            """, [.text(taskID.rawValue),
+                  .integer(Self.provisionalSeqBase)]).first?["m"]?.int ?? 0
+    }
+
+    /// Self-repair: clamp a stored acknowledgement that exceeds the task's
+    /// current latest message seq (e.g. a receipt committed_seq was recorded
+    /// as a message cursor). Returns true when the row was corrected.
+    @discardableResult
+    public func repairIngressAck(_ taskID: TaskID) throws -> Bool {
+        let maxSeq = try maxCommittedMessageSeq(taskID)
+        try db.execute("""
+            UPDATE task_ingress SET last_acknowledged_seq=?
+            WHERE task_id=? AND last_acknowledged_seq>?
+            """, [.integer(maxSeq), .text(taskID.rawValue), .integer(maxSeq)])
+        return db.changes() > 0
+    }
+
+    /// One-shot startup sweep over every ingress row.
+    public func repairAllIngressAcks() throws -> Int {
+        let taskIDs = try db.query("SELECT task_id FROM task_ingress", [])
+            .compactMap { $0["task_id"]?.text }
+        var repaired = 0
+        for raw in taskIDs where try repairIngressAck(TaskID(raw)) {
+            repaired += 1
+        }
+        return repaired
     }
 
     public func taskIDForOrigin(principal: String, sourceTaskID: String,
@@ -1005,10 +1041,13 @@ public final class WorkshopRepository {
         public var profileRevision: Int
         public var modelSelection: String?
         public var recoveryState: String
+        /// Consecutive native `session/load` timeouts for this binding.
+        public var loadTimeoutCount: Int
 
         public init(taskID: TaskID, engineerID: EngineerID, role: String, workerID: String,
                     nativeSessionID: String? = nil, profileRevision: Int = 1,
-                    modelSelection: String? = nil, recoveryState: String = "new") {
+                    modelSelection: String? = nil, recoveryState: String = "new",
+                    loadTimeoutCount: Int = 0) {
             self.taskID = taskID
             self.engineerID = engineerID
             self.role = role
@@ -1017,6 +1056,7 @@ public final class WorkshopRepository {
             self.profileRevision = profileRevision
             self.modelSelection = modelSelection
             self.recoveryState = recoveryState
+            self.loadTimeoutCount = loadTimeoutCount
         }
     }
 
@@ -1025,17 +1065,19 @@ public final class WorkshopRepository {
         try db.execute("""
             INSERT INTO session_bindings(task_id, engineer_id, role, worker_id,
                                          native_session_id, profile_revision,
-                                         model_selection, recovery_state)
-            VALUES(?,?,?,?,?,?,?,?)
+                                         model_selection, recovery_state,
+                                         load_timeout_count)
+            VALUES(?,?,?,?,?,?,?,?,?)
             ON CONFLICT(task_id, engineer_id, role, worker_id) DO UPDATE SET
                 native_session_id=excluded.native_session_id,
                 profile_revision=excluded.profile_revision,
                 model_selection=excluded.model_selection,
-                recovery_state=excluded.recovery_state
+                recovery_state=excluded.recovery_state,
+                load_timeout_count=excluded.load_timeout_count
             """, [.text(b.taskID.rawValue), .text(b.engineerID.rawValue), .text(b.role),
                   .text(b.workerID), b.nativeSessionID.map(SQLiteValue.text),
                   .integer(Int64(b.profileRevision)), b.modelSelection.map(SQLiteValue.text),
-                  .text(b.recoveryState)])
+                  .text(b.recoveryState), .integer(Int64(b.loadTimeoutCount))])
     }
 
     public func sessionBinding(taskID: TaskID, engineerID: EngineerID, role: String,
@@ -1052,7 +1094,8 @@ public final class WorkshopRepository {
                 nativeSessionID: r["native_session_id"]?.text,
                 profileRevision: Int(r["profile_revision"]!.int ?? 1),
                 modelSelection: r["model_selection"]?.text,
-                recoveryState: r["recovery_state"]!.text!)
+                recoveryState: r["recovery_state"]!.text!,
+                loadTimeoutCount: Int(r["load_timeout_count"]?.int ?? 0))
         }
     }
 

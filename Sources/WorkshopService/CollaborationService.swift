@@ -386,6 +386,11 @@ public actor CollaborationService {
         }), pruned > 0 {
             log.notice("pruned \(pruned) delivered work.activity rows at startup")
         }
+        if let repaired = attempt("repairIngressAcks", {
+            try repo.repairAllIngressAcks()
+        }), repaired > 0 {
+            log.notice("repaired \(repaired) inflated acknowledged-seq cursor(s) at startup")
+        }
         if let homeDir {
             _ = attempt("recoverWriters") { try WriterGenerations(db: repo.db, home: homeDir).recover() }
         }
@@ -430,15 +435,16 @@ public actor CollaborationService {
         credentialStatus[engineer] = (state, detail)
     }
 
-    /// Merge `"lane":"managed"` into a message/proposal structured object
-    /// when the author's recorded lane is managed; nil-safe for old messages.
+    /// Merge `"lane":"<recorded>"` into a message/proposal structured object
+    /// for every engineer message once a lane is recorded (native or
+    /// managed); nil-safe for old messages.
     private func laneFields(_ fields: [String: JSONValue], taskID: TaskID,
                             engineer: EngineerID?) -> [String: JSONValue] {
         guard let engineer,
-              activeLane[taskID.rawValue + ":" + engineer.rawValue] == "managed"
+              let lane = activeLane[taskID.rawValue + ":" + engineer.rawValue]
         else { return fields }
         var merged = fields
-        merged["lane"] = .string("managed")
+        merged["lane"] = .string(lane)
         return merged
     }
 
@@ -506,6 +512,9 @@ public actor CollaborationService {
     /// Test-only: outstanding wait_for_events waiters (leak detection).
     var waiterCount: Int { eventWaiters.count }
 
+    /// Test-only handle for store-level cursor/binding assertions.
+    nonisolated var repoForTests: WorkshopRepository { repo }
+
     /// Bounded long-poll for committed task events after `afterSeq`. Returns
     /// immediately when events exist, otherwise waits up to `timeoutSeconds`
     /// (clamped 1...120, default 50). Codex callers advance the task's
@@ -517,6 +526,13 @@ public actor CollaborationService {
         if let engineer = principal.engineerID {
             try requireParticipant(engineer, taskID: taskID)
         }
+        let maxSeq = try repo.maxCommittedMessageSeq(taskID)
+        guard afterSeq <= maxSeq else {
+            throw WorkshopError.invalidRequest(
+                "after_seq \(afterSeq) exceeds the task's latest message seq \(maxSeq); "
+                + "use a message seq (start at 0), not a receipt committed_seq")
+        }
+        try repo.repairIngressAck(taskID)
         let timeout = TimeInterval(min(max(timeoutSeconds ?? 50, 1), 120))
         let deadline = now().addingTimeInterval(timeout)
         let group = UUID()
@@ -645,9 +661,15 @@ public actor CollaborationService {
         var subtaskResults: [String: SubtaskResultStatus] = [:]
         for sub in subtasks {
             let results = try repo.resultMessages(taskID: id, subtaskID: sub.id)
-            subtaskResults[sub.id.rawValue] = SubtaskResultStatus(
+            var status = SubtaskResultStatus(
                 latestResultMessageID: results.last?.id.rawValue,
                 resultRevision: results.count)
+            if results.last != nil, let owner = sub.ownerID {
+                let binding = try resultBinding(taskID: id, owner: owner)
+                status.generationID = binding.generationID
+                status.snapshotDigest = binding.digest
+            }
+            subtaskResults[sub.id.rawValue] = status
         }
         let participants = try repo.participants(id).map { p -> Participant in
             var p = p
@@ -671,6 +693,20 @@ public actor CollaborationService {
                           subtaskResults: subtaskResults,
                           acknowledgedSeq: ingress?.lastAcknowledgedSeq,
                           reviewSeed: reviewSeed)
+    }
+
+    /// The writer generation that produced an owner's latest result: the
+    /// newest non-discussion writer_generations row for (task, owner). Its
+    /// digest is present once sealed and null while still writing.
+    private func resultBinding(taskID: TaskID, owner: EngineerID)
+        throws -> (generationID: String?, digest: String?) {
+        let row = try repo.db.query("""
+            SELECT id,digest FROM writer_generations
+            WHERE task_id=? AND engineer=?
+              AND state IN ('writing','sealed','superseded','accepted','interrupted')
+            ORDER BY rowid DESC LIMIT 1
+            """, [.text(taskID.rawValue), .text(owner.rawValue)]).first
+        return (row?["id"]?.text, row?["digest"]?.text)
     }
 
     /// Artifact rows for a task (workshop.listArtifacts).
@@ -1068,6 +1104,13 @@ public actor CollaborationService {
         if let engineer = principal.engineerID {
             try requireParticipant(engineer, taskID: taskID)
         }
+        let maxSeq = try repo.maxCommittedMessageSeq(taskID)
+        guard afterSeq <= maxSeq else {
+            throw WorkshopError.invalidRequest(
+                "after_seq \(afterSeq) exceeds the task's latest message seq \(maxSeq); "
+                + "use a message seq (start at 0), not a receipt committed_seq")
+        }
+        try repo.repairIngressAck(taskID)
         // Provisional-seq rows are still streaming; engineers never see them.
         let found = try repo.messages(taskID, afterSeq: afterSeq, limit: limit,
                                       includeSummaries: includeSummaries)
@@ -1229,7 +1272,18 @@ public actor CollaborationService {
                 .compactMap { $0.stringValue } == artifactIDs
             let sameValidation = s?["validation"]?.arrayValue == validation
             if latestForGeneration.body == summary && sameArtifacts && sameValidation {
-                return latestForGeneration
+                // The generation may have sealed since the first report;
+                // the retry receipt carries its digest when known.
+                let binding = try resultBinding(taskID: taskID, owner: engineer)
+                var retried = latestForGeneration
+                if var card = retried.structured.flatMap({
+                        try? JSONDecoder().decode([String: JSONValue].self,
+                                                  from: Data($0.utf8)) }) {
+                    card["generation_id"] = binding.generationID.map { .string($0) } ?? .null
+                    card["snapshot_digest"] = binding.digest.map { .string($0) } ?? .null
+                    retried.structured = String(decoding: (try? JSONEncoder().encode(card)) ?? Data(), as: UTF8.self)
+                }
+                return retried
             }
         }
         guard let subtask = try repo.subtask(subtaskID), subtask.taskID == taskID,
@@ -1248,6 +1302,9 @@ public actor CollaborationService {
         let timestamp = now()
         let revision = results.count + 1
         let superseded = results.last
+        // The producing writer generation is still writing at report time;
+        // its snapshot digest becomes visible in workshop_get_task after seal.
+        let binding = try resultBinding(taskID: taskID, owner: engineer)
         let structured = String(
             decoding: try JSONEncoder().encode(JSONValue.object(laneFields([
                 "type": .string("result"),
@@ -1257,6 +1314,8 @@ public actor CollaborationService {
                 "validation": .array(validation),
                 "revision": .number(Double(revision)),
                 "supersedes": superseded.map { .string($0.id.rawValue) } ?? .null,
+                "generation_id": binding.generationID.map { .string($0) } ?? .null,
+                "snapshot_digest": binding.digest.map { .string($0) } ?? .null,
             ], taskID: taskID, engineer: engineer))), as: UTF8.self)
         var committed: Message?
         try repo.db.transaction {
@@ -1361,6 +1420,15 @@ public actor CollaborationService {
         }
         let workspace = try WorkspaceManager.worktreePath(homeDir: homeDir, taskID: taskID)
         let source = try WorkspaceManager.resolveInsideWorkspace(workspace, path)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: source, isDirectory: &isDirectory),
+              !isDirectory.boolValue else {
+            throw WorkshopError.invalidRequest(
+                "publish_artifact path '\(path)' is not a file inside the task workspace; "
+                + "pass a path relative to the task worktree — files in your private "
+                + "writer-run directory are not in it; report them through "
+                + "workshop_report_result artifact_ids instead")
+        }
         let data = try Data(contentsOf: URL(fileURLWithPath: source))
         let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         let baseName = (source as NSString).lastPathComponent
@@ -2704,6 +2772,7 @@ public actor CollaborationService {
         // Reuse a persisted native session binding when present (§6.2).
         var bound = binding
         var storedModelSelection: String?
+        var storedLoadTimeouts = 0
         if let stored: WorkshopRepository.SessionBindingRecord =
             attempt("sessionBinding", {
                 try repo.sessionBinding(taskID: task.id, engineerID: engineer,
@@ -2728,6 +2797,7 @@ public actor CollaborationService {
             bound.modelSelection = stored.modelSelection
             bound.recoveryState = stored.recoveryState
             storedModelSelection = stored.modelSelection
+            storedLoadTimeouts = stored.loadTimeoutCount
         }
         if engineer == .kimi, bound.nativeSessionID != nil {
             bound.allowedSessionWorkspaces =
@@ -2739,6 +2809,16 @@ public actor CollaborationService {
             // bytes through eight verify rounds before this unification.
             bound.reviewSeedPath = (try? reviewSeedForTask(task.id))?.snapshotPath
         }
+        // Kimi reload-skip policy: after two consecutive session/load
+        // timeouts the stored native session is presumed unreachable (e.g.
+        // it belonged to a previous daemon lifetime); open a fresh session
+        // and say so once instead of paying the bounded wait every turn.
+        var skippedKimiLoad = false
+        if engineer == .kimi, bound.nativeSessionID != nil,
+           storedLoadTimeouts >= 2 {
+            bound.nativeSessionID = nil
+            skippedKimiLoad = true
+        }
         // The native session id the adapter was asked to resume (nil → fresh).
         let requestedNativeSessionID = bound.nativeSessionID
         let ref: SessionRef
@@ -2748,6 +2828,30 @@ public actor CollaborationService {
             if let sessionOpenedHook { await sessionOpenedHook(engineer) }
             if bound.modelSelection == nil {
                 bound.modelSelection = adapter.modelSelection
+            }
+            // A successful session/load resets the timeout counter; a fresh
+            // session keeps it so the skip policy stays armed.
+            if requestedNativeSessionID != nil,
+               ref.nativeSessionID == requestedNativeSessionID {
+                storedLoadTimeouts = 0
+            }
+            if skippedKimiLoad {
+                let note = "Kimi native session reload skipped after repeated "
+                    + "timeouts; continuing from Workshop task memory"
+                let seen = (try? repo.db.query("""
+                    SELECT 1 FROM messages WHERE task_id=? AND kind='system_event'
+                      AND body LIKE ? LIMIT 1
+                    """, [.text(task.id.rawValue), .text(note + "%")]))?.isEmpty == false
+                if !seen {
+                    _ = attempt("kimiSkipNote") {
+                        let t = now()
+                        try repo.insertMessage(Message(
+                            id: MessageID(newID("msg")), taskID: task.id,
+                            seq: try repo.nextMessageSeq(task.id), author: .system,
+                            kind: .systemEvent, body: note,
+                            deliveryState: .committed, createdAt: t, updatedAt: t))
+                    }
+                }
             }
             if ref.nativeSessionID != bound.nativeSessionID
                 || bound.modelSelection != storedModelSelection {
@@ -2760,7 +2864,21 @@ public actor CollaborationService {
                         nativeSessionID: bound.nativeSessionID,
                         profileRevision: bound.profileRevision,
                         modelSelection: bound.modelSelection,
-                        recoveryState: bound.recoveryState))
+                        recoveryState: bound.recoveryState,
+                        loadTimeoutCount: storedLoadTimeouts))
+                }
+            } else if storedLoadTimeouts != (try? repo.sessionBinding(
+                        taskID: task.id, engineerID: engineer,
+                        role: "owner", workerID: "main"))?.loadTimeoutCount {
+                _ = attempt("saveSessionBinding") {
+                    try repo.saveSessionBinding(.init(
+                        taskID: bound.taskID, engineerID: bound.engineerID,
+                        role: bound.role, workerID: bound.workerID,
+                        nativeSessionID: bound.nativeSessionID,
+                        profileRevision: bound.profileRevision,
+                        modelSelection: bound.modelSelection,
+                        recoveryState: bound.recoveryState,
+                        loadTimeoutCount: storedLoadTimeouts))
                 }
             }
         } catch {
@@ -2958,6 +3076,17 @@ public actor CollaborationService {
                     sawUncertain = true
                     if note.localizedCaseInsensitiveContains("could not be loaded") {
                         sawSessionNotLoaded = true
+                        if note.localizedCaseInsensitiveContains("timed out") {
+                            _ = attempt("loadTimeoutCount") {
+                                try repo.db.execute("""
+                                    UPDATE session_bindings
+                                    SET load_timeout_count=load_timeout_count+1
+                                    WHERE task_id=? AND engineer_id=?
+                                      AND role='owner' AND worker_id='main'
+                                    """, [.text(task.id.rawValue),
+                                          .text(engineer.rawValue)])
+                            }
+                        }
                     }
                     _ = attempt("uncertainNote") {
                         let t = now()
@@ -2983,6 +3112,33 @@ public actor CollaborationService {
                 let candidate = try WriterGenerations(db: repo.db, home: homeDir).seal(writerLease)
                 body += "\n\nWriter proposal sealed for independent verification. No changes promoted. Snapshot: "
                     + candidate.path + "\nSHA-256: " + candidate.digest
+                // Typed result↔snapshot binding: one event per sealed
+                // result revision so readers can bind revision ↔ digest.
+                if (try? repo.db.query(
+                    "SELECT state FROM writer_generations WHERE id=?",
+                    [.text(writerLease.id)]).first?["state"]?.text) == "sealed",
+                   let ownerSubtask = (try? repo.subtasks(task.id))?
+                    .first(where: { $0.ownerID == engineer }),
+                   let results = try? repo.resultMessages(
+                    taskID: task.id, subtaskID: ownerSubtask.id),
+                   results.contains(where: { $0.seq > maxSeq }),
+                   let revision = Optional(results.count) {
+                    let gen8 = String(writerLease.id.prefix(8))
+                    let d12 = String(candidate.digest.prefix(12))
+                    let marker = "snapshot " + gen8
+                    let already = (try? repo.db.query("""
+                        SELECT 1 FROM messages WHERE task_id=? AND kind='system_event'
+                          AND body LIKE '%' || ? || '%' LIMIT 1
+                        """, [.text(task.id.rawValue), .text(marker)]))?.isEmpty == false
+                    if !already {
+                        try repo.insertMessage(Message(
+                            id: MessageID(newID("msg")), taskID: task.id,
+                            seq: try repo.nextMessageSeq(task.id), author: .system,
+                            kind: .systemEvent,
+                            body: "Result revision \(revision) sealed as \(marker) digest \(d12)",
+                            deliveryState: .committed, createdAt: now(), updatedAt: now()))
+                    }
+                }
                 if writerLease.reviewSeedOwner,
                    let selected = try repo.db.query(
                     "SELECT generation_id FROM writer_seed_pins WHERE task_id=?",

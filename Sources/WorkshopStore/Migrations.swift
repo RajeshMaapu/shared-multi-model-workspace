@@ -315,5 +315,10 @@ public enum Migrations {
     public static let v11 = Migrator.Migration(version: 11, sql: """
         ALTER TABLE writer_generations ADD COLUMN pruned_at TEXT;
         """)
-    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11])
+    /// Schema v12: consecutive native session/load timeout counter per
+    /// session binding (Kimi reload-skip policy).
+    public static let v12 = Migrator.Migration(version: 12, sql: """
+        ALTER TABLE session_bindings ADD COLUMN load_timeout_count INTEGER NOT NULL DEFAULT 0;
+        """)
+    public static let all = Migrator(migrations: [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12])
 }

@@ -260,15 +260,24 @@ public struct WakeupInfo: Codable, Equatable, Sendable {
 public struct SubtaskResultStatus: Codable, Equatable, Sendable {
     public var latestResultMessageID: String?
     public var resultRevision: Int
+    /// Writer generation that produced the latest result.
+    public var generationID: String?
+    /// Snapshot digest of that generation; null while it is still writing.
+    public var snapshotDigest: String?
 
-    public init(latestResultMessageID: String? = nil, resultRevision: Int = 0) {
+    public init(latestResultMessageID: String? = nil, resultRevision: Int = 0,
+                generationID: String? = nil, snapshotDigest: String? = nil) {
         self.latestResultMessageID = latestResultMessageID
         self.resultRevision = resultRevision
+        self.generationID = generationID
+        self.snapshotDigest = snapshotDigest
     }
 
     private enum CodingKeys: String, CodingKey {
         case latestResultMessageID = "latest_result_message_id"
         case resultRevision = "result_revision"
+        case generationID = "generation_id"
+        case snapshotDigest = "snapshot_digest"
     }
 }
 
